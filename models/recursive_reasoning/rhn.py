@@ -5,6 +5,8 @@ import torch
 import copy
 import torch.nn.functional as F
 from torch import nn
+import torch.profiler
+from torch.profiler import ProfilerActivity
 from pydantic import BaseModel
 import random
 from models.common import trunc_normal_init_
@@ -134,19 +136,18 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
         )
         self.norm_eps = config.rms_norm_eps
 
-    def set_dynamic_adapter(self, up, down, qkv, o, mlp_t_up=None, mlp_t_down=None):
+    def set_dynamic_adapter(self, attn_1, attn_2, up, down):
         A_up, B_up = up
         A_down, B_down = down
         self.mlp.set_dynamic_adapter(A_up, B_up, A_down, B_down)
 
+        A_attn_1, B_attn_1 = attn_1
+        A_attn_2, B_attn_2 = attn_2
+
         if self.config.mlp_t:
-            A_mlp_t_up, B_mlpt_up = mlp_t_up
-            A_mlp_t_down, B_mlp_t_down = mlp_t_down
-            self.mlp_t.set_dynamic_adapter(A_mlp_t_up, B_mlpt_up, A_mlp_t_down, B_mlp_t_down)
+            self.mlp_t.set_dynamic_adapter(A_attn_1, B_attn_1, A_attn_2, B_attn_2)
         else:
-            A_qkv, B_qkv = qkv
-            A_o, B_o = o
-            self.self_attn.set_dynamic_adapter(A_qkv, B_qkv, A_o, B_o)
+            self.self_attn.set_dynamic_adapter(A_attn_1, B_attn_1, A_attn_2, B_attn_2)
 
 
     def clear_dynamic_adapter(self):
@@ -176,6 +177,8 @@ class RHN_Hypernetwork(nn.Module):
     def __init__(self, config: RHN_ACTV1Config, layer_specs) -> None:
         super().__init__()
         self.config = config
+        self.forward_dtype = getattr(torch, self.config.forward_dtype)
+
         self.layer_specs = layer_specs
         self.total_chunks = 0
         chunks_per_layer = []
@@ -184,10 +187,14 @@ class RHN_Hypernetwork(nn.Module):
             chunks_per_layer.append(num_chunks)
             self.total_chunks += num_chunks
 
-        self.layer_embeddings = nn.Embedding(self.total_chunks, self.config.layer_emb_dim)
+        self.embed_scale = math.sqrt(self.config.hypernet_hidden_size)
+        embed_init_std = 1.0 / self.embed_scale
+
+        self.layer_embeddings = CastedEmbedding(self.total_chunks, self.config.layer_emb_dim, init_std=embed_init_std,
+                                            cast_to=self.forward_dtype)
 
         self.config_per_layer = []
-        self.input_size = self.config.hidden_size * self.config.num_layers
+        self.input_size = self.config.hidden_size * self.config.L_layers
         self.layer_ids = {"vector": [], "matrix": []}
         self.chunk_ids = {"vector": [], "matrix": []}
         chunk_idx = 0
@@ -351,16 +358,16 @@ class RHN_Hypernetwork(nn.Module):
             return True
 
 
-class RHN_ACTV1ReasoningModule(nn.Module):
-    def __init__(self, layers: List[RHN_ACTV1Block_Dynamic]):
-        super().__init__()
-        self.layers = torch.nn.ModuleList(layers)
-
-    def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs) -> torch.Tensor:
-        hidden_states = hidden_states + input_injection
-        for layer in self.layers:
-            hidden_states = layer(hidden_states=hidden_states, **kwargs)
-        return hidden_states
+# class RHN_ACTV1ReasoningModule(nn.Module):
+#     def __init__(self, layers: List[RHN_ACTV1Block_Dynamic]):
+#         super().__init__()
+#         self.layers = torch.nn.ModuleList(layers)
+#
+#     def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs) -> torch.Tensor:
+#         hidden_states = hidden_states + input_injection
+#         for layer in self.layers:
+#             hidden_states = layer(hidden_states=hidden_states, **kwargs)
+#         return hidden_states
 
 
 class RHN_ACTV1_Inner(nn.Module):
@@ -401,7 +408,7 @@ class RHN_ACTV1_Inner(nn.Module):
         self.layer_specs = []
         for name, param in self.named_parameters():
             name_tag = name.split(".")[0]
-            if name_tag != "layers":
+            if name_tag != "L_level":
                 continue
             self.layer_specs.append((name, param.shape))
 
@@ -471,27 +478,41 @@ class RHN_ACTV1_Inner(nn.Module):
                     hidden_states, hidden_states_prior = self._dynamic_forward(hidden_states=hidden_states,
                                                                                hidden_states_prior=hidden_states_prior,
                                                                                input_embeddings=input_embeddings,
-                                                                               **kwargs)
+                                                                               **seq_info)
                 z_L = hidden_states
                 hidden_states = hidden_states_prior = z_H + z_L
                 hidden_states, hidden_states_prior = self._dynamic_forward(hidden_states=hidden_states,
                                                                            hidden_states_prior=hidden_states_prior,
                                                                            input_embeddings=None,
-                                                                           **kwargs)
+                                                                           **seq_info)
                 z_H = hidden_states
         # 1 with grad
+
+        # torch.cuda.memory._record_memory_history(
+        #     max_entries=100000
+        # )
+
         for _L_step in range(self.config.L_cycles):
             hidden_states = z_L + z_H + input_embeddings
             hidden_states, hidden_states_prior = self._dynamic_forward(hidden_states=hidden_states,
                                                                        hidden_states_prior=hidden_states_prior,
                                                                        input_embeddings=input_embeddings,
-                                                                       **kwargs)
+                                                                       **seq_info)
+
+        # try:
+        #     torch.cuda.memory._dump_snapshot(f"mem_prof1.pickle")
+        # except Exception as e:
+        #     print(f"Failed to capture memory snapshot {e}")
+        #
+        # # Stop recording memory snapshot history.
+        # torch.cuda.memory._record_memory_history(enabled=None)
+
         z_L = hidden_states
         hidden_states = z_H + z_L
         hidden_states, hidden_states_prior = self._dynamic_forward(hidden_states=hidden_states,
                                                                    hidden_states_prior=hidden_states_prior,
                                                                    input_embeddings=None,
-                                                                   **kwargs)
+                                                                   **seq_info)
         z_H = hidden_states
 
         # LM Outputs
@@ -500,24 +521,25 @@ class RHN_ACTV1_Inner(nn.Module):
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
 
-    def _dynamic_forward(self, hidden_states, hidden_states_prior, input_embeddings=None, **kwargs):
-        hidden_states = hidden_states + input_embeddings if input_embeddings else hidden_states
+    def _dynamic_forward(self, hidden_states, hidden_states_prior, input_embeddings=None, **seq_info):
+        hidden_states = hidden_states + input_embeddings if input_embeddings is not None else hidden_states
         activations = torch.tensor([], dtype=hidden_states.dtype, device=hidden_states.device)
         # Base model output
-        for layer in self.layers:
+        for layer in self.L_level:
             layer.clear_dynamic_adapter()
-            hidden_states = layer(hidden_states=hidden_states, **kwargs)
+            hidden_states = layer(hidden_states=hidden_states, **seq_info)
             activations = torch.cat((activations, hidden_states.detach()),
                                     dim=2)  # TODO - Determine whether detaching is preferable here.
         base_out = hidden_states.clone()
+
         # Dynamic weight output
-        hidden_states = hidden_states_prior + input_embeddings if input_embeddings else hidden_states_prior
+        hidden_states = hidden_states_prior + input_embeddings if input_embeddings is not None else hidden_states_prior
         dynamic_weights = self.hypernet(activations)
-        for i, layer in enumerate(self.layers):
+        for i, layer in enumerate(self.L_level):
             layer_weights = [dynamic_weights[layer_name] for layer_name in dynamic_weights if
-                             f"layers.{i}" in layer_name]
+                             f"L_level.{i}" in layer_name]
             layer.set_dynamic_adapter(*layer_weights)
-            hidden_states = layer(hidden_states=hidden_states, **kwargs)
+            hidden_states = layer(hidden_states=hidden_states, **seq_info)
         dynamic_out = hidden_states
         hidden_states = base_out + dynamic_out
         hidden_states_prior = hidden_states.clone()
