@@ -6,7 +6,7 @@ import copy
 import torch.nn.functional as F
 from torch import nn
 import torch.profiler
-from torch.profiler import ProfilerActivity
+from torch.profiler import profile, record_function, ProfilerActivity, tensorboard_trace_handler
 from pydantic import BaseModel
 import random
 from models.common import trunc_normal_init_
