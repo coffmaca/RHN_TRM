@@ -4,11 +4,11 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-#try:
-#    from flash_attn_interface import flash_attn_func  # type: ignore[import]
-#except ImportError:
-#    # Fallback to FlashAttention 2
-#    from flash_attn import flash_attn_func  # type: ignore[import]
+try:
+   from flash_attn_interface import flash_attn_func  # type: ignore[import]
+except ImportError:
+   # Fallback to FlashAttention 2
+   from flash_attn import flash_attn_func  # type: ignore[import]
 from torch.nn.functional import scaled_dot_product_attention
 
 from models.common import trunc_normal_init_
@@ -177,8 +177,8 @@ class DynamicAttention(nn.Module):
             query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
         # Attention
-        query, key, value = map(lambda t: einops.rearrange(t, 'B S H D -> B H S D'),
-                                (query, key, value))  # needed for scaled_dot_product_attention but not flash_attn_func
+        # TODO - Reinstate flash-attn (optional)
+        query, key, value = map(lambda t: einops.rearrange(t, 'B S H D -> B H S D'), (query, key, value)) # needed for scaled_dot_product_attention but not flash_attn_func
         attn_output = scaled_dot_product_attention(query=query, key=key, value=value, is_causal=self.causal)
         attn_output = einops.rearrange(attn_output, 'B H S D -> B S H D')
         attn_output = attn_output.reshape(batch_size, seq_len, self.output_size)  # type: ignore
