@@ -182,10 +182,14 @@ class RHN_Hypernetwork(nn.Module):
         self.layer_specs = layer_specs
         self.total_chunks = 0
         chunks_per_layer = []
+        alt_dims = []
         for layer_spec in layer_specs:
-            num_chunks = self._calculate_chunks(layer_spec)
+            num_chunks, alt_dim = self._calculate_chunks(layer_spec)
             chunks_per_layer.append(num_chunks)
+            alt_dims += alt_dim
             self.total_chunks += num_chunks
+
+        alt_dims = list(set(alt_dims))
 
         self.embed_scale = math.sqrt(self.config.hypernet_hidden_size)
         embed_init_std = 1.0 / self.embed_scale
@@ -197,9 +201,15 @@ class RHN_Hypernetwork(nn.Module):
         self.input_size = self.config.hidden_size * self.config.L_layers
         self.layer_ids = {"vector": [], "matrix": []}
         self.chunk_ids = {"vector": [], "matrix": []}
+        for dim in alt_dims:
+            self.layer_ids[f"alt_dim_{dim}"] = []
+            self.chunk_ids[f"alt_dim_{dim}"] = []
         chunk_idx = 0
         for i, (name, shape) in enumerate(self.layer_specs):
-            if self._is_vector_like(shape):  # Vector-like parameters generated directly, without low rank matrices.
+            rows, cols = shape
+
+            # Vector-like parameters generated directly, without low rank matrices.
+            if self._is_vector_like(shape):
                 size = 1
                 for dim in shape:
                     size *= dim
@@ -222,8 +232,33 @@ class RHN_Hypernetwork(nn.Module):
                 self.chunk_ids["vector"] += ids.tolist()
                 self.layer_ids["vector"].append(i)
 
-            else:  # Matrix-like parameters generated via low rank matrices
-                rows, cols = shape
+            # Matrix-like parameters w/ alt dims, generated via low rank matrices
+            elif rows % self.config.hypernet_hidden_size != 0 or cols % self.config.hypernet_hidden_size != 0:
+                chunks_a = int(rows / self.config.hypernet_hidden_size) if rows % self.config.hypernet_hidden_size == 0 else 1
+                chunks_b = int(cols / self.config.hypernet_hidden_size) if cols % self.config.hypernet_hidden_size == 0 else 1
+
+                alt_dim = rows if chunks_a == 1 else cols
+
+                self.config_per_layer.append({
+                    "name": name,
+                    "type": f"alt_dim_{alt_dim}",
+                    "shape": shape,
+                    "size": None,
+                    "chunks": chunks_per_layer[i],
+                    "shape_a": (rows, self.config.hypernet_rank),
+                    "chunks_a": chunks_a,
+                    "shape_b": (self.config.hypernet_rank, cols),
+                    "chunks_b": chunks_b
+                })
+
+                ids = torch.arange(chunks_per_layer[i]) + chunk_idx
+                chunk_idx += chunks_per_layer[i]
+
+                self.chunk_ids[f"alt_dim_{alt_dim}"] += ids.tolist()
+                self.layer_ids[f"alt_dim_{alt_dim}"].append(i)
+
+            # Matrix-like parameters generated via low rank matrices
+            else:
                 chunks_a = int(rows / self.config.hypernet_hidden_size)
                 chunks_b = int(cols / self.config.hypernet_hidden_size)
 
@@ -265,6 +300,14 @@ class RHN_Hypernetwork(nn.Module):
                                    self.config.hypernet_hidden_size,  # Directly generates parameters
                                    bias=False)
         })
+        self.output_heads.update(
+            nn.ModuleDict({
+                f"alt_dim_{dim}" : CastedLinear(self.config.hypernet_hidden_size,
+                                                self.config.hypernet_rank * dim, # Generates LR matrices
+                                                bias=False)
+                          for dim in alt_dims
+            })
+        )
 
     def forward(self, activations: torch.Tensor) -> dict:
         batch_size, seq_len, _ = activations.shape
@@ -297,20 +340,7 @@ class RHN_Hypernetwork(nn.Module):
 
         configs = [self.config_per_layer[i] for i in self.layer_ids[layer_type]]
 
-        if layer_type == "matrix":
-            chunk_idx = 0
-            for layer in configs:
-                chunks = outputs_grouped[:, :, chunk_idx: chunk_idx + layer["chunks"]]
-                chunks_a = chunks[:, :, :layer["chunks_a"]]
-                chunks_b = chunks[:, :, layer["chunks_a"]:]
-
-                layer_a = chunks_a.view(batch_size, seq_len, *layer["shape_a"])
-                layer_b = chunks_b.view(batch_size, seq_len, *layer["shape_b"])
-
-                chunk_idx += layer["chunks"]
-
-                generated[layer["name"]] = (layer_a, layer_b)
-        else:
+        if layer_type == "vector":
             chunk_idx = 0
             for layer in configs:
                 chunks = []
@@ -323,25 +353,46 @@ class RHN_Hypernetwork(nn.Module):
                 chunk_idx += layer["chunks"]
 
                 generated[layer["name"]] = layer_a
+        else:
+            chunk_idx = 0
+            for layer in configs:
+                chunks = outputs_grouped[:, :, chunk_idx: chunk_idx + layer["chunks"]]
+                chunks_a = chunks[:, :, :layer["chunks_a"]]
+                chunks_b = chunks[:, :, layer["chunks_a"]:]
+
+                layer_a = chunks_a.view(batch_size, seq_len, *layer["shape_a"])
+                layer_b = chunks_b.view(batch_size, seq_len, *layer["shape_b"])
+
+                chunk_idx += layer["chunks"]
+
+                generated[layer["name"]] = (layer_a, layer_b)
 
         return generated
 
     def _calculate_chunks(self, layer_spec):
         name, shape = layer_spec
         is_vector_like = self._is_vector_like(shape)
+        alt_dim = []
 
+        num_chunks = 0
         if is_vector_like:
-            size = 1
             for dim in shape:
-                size *= dim
-            num_chunks = size / self.config.hypernet_hidden_size
+                if dim % self.config.hypernet_hidden_size == 0:
+                    num_chunks += dim / self.config.hypernet_hidden_size
+                elif dim != 1:
+                    alt_dim.append(dim)
+                    num_chunks += 1
         else:
             dim_sum = 0
             for dim in shape:
-                dim_sum += dim
-            num_chunks = dim_sum / self.config.hypernet_hidden_size
+                if dim % self.config.hypernet_hidden_size == 0:
+                    dim_sum += dim
+                else:
+                    alt_dim.append(dim)
+                    num_chunks += 1
+            num_chunks += dim_sum / self.config.hypernet_hidden_size
 
-        return int(num_chunks)
+        return int(num_chunks), alt_dim
 
     def _is_vector_like(self, shape):
         if len(shape) < 2:
@@ -349,7 +400,7 @@ class RHN_Hypernetwork(nn.Module):
 
         num_large_dims = 0
         for dim in shape:
-            if dim >= self.config.hypernet_hidden_size:
+            if dim >= 1:
                 num_large_dims += 1
 
         if num_large_dims >= 2:
