@@ -199,13 +199,11 @@ class RHN_Hypernetwork(nn.Module):
 
         self.config_per_layer = []
         self.input_size = self.config.hidden_size * self.config.L_layers
-        self.layer_ids = {"vector": [], "matrix": []}
         self.chunk_ids = {"vector": [], "matrix": []}
         for dim in alt_dims:
-            self.layer_ids[f"alt_dim_{dim}"] = []
             self.chunk_ids[f"alt_dim_{dim}"] = []
         chunk_idx = 0
-        for i, (name, shape) in enumerate(self.layer_specs):
+        for i, (name, shape) in enumerate(self.layer_specs): # TODO - Consider combining logic below.  "Type" is just structure.  "Vector" also currently assumes dim size, which is wrong.
             rows, cols = shape
 
             # Vector-like parameters generated directly, without low rank matrices.
@@ -214,53 +212,36 @@ class RHN_Hypernetwork(nn.Module):
                 for dim in shape:
                     size *= dim
 
+                ids = torch.arange(chunks_per_layer[i]) + chunk_idx
+                chunk_idx += chunks_per_layer[i]
+
                 self.config_per_layer.append({
                     "name": name,
                     "type": "vector",
                     "shape": shape,
                     "size": size,
                     "chunks": chunks_per_layer[i],
-                    "shape_a": None,
+                    "type_a": "vector",
+                    "shape_a": shape,
+                    "chunks_a": chunks_per_layer[i],
                     "size_a": None,
                     "shape_b": None,
                     "size_b": None
                 })
 
-                ids = torch.arange(chunks_per_layer[i]) + chunk_idx
-                chunk_idx += chunks_per_layer[i]
-
                 self.chunk_ids["vector"] += ids.tolist()
-                self.layer_ids["vector"].append(i)
 
-            # Matrix-like parameters w/ alt dims, generated via low rank matrices
-            elif rows % self.config.hypernet_hidden_size != 0 or cols % self.config.hypernet_hidden_size != 0:
+            # Matrix-like parameters generated via low rank matrices
+            else:
                 chunks_a = int(rows / self.config.hypernet_hidden_size) if rows % self.config.hypernet_hidden_size == 0 else 1
                 chunks_b = int(cols / self.config.hypernet_hidden_size) if cols % self.config.hypernet_hidden_size == 0 else 1
 
                 alt_dim = rows if chunks_a == 1 else cols
 
-                self.config_per_layer.append({
-                    "name": name,
-                    "type": f"alt_dim_{alt_dim}",
-                    "shape": shape,
-                    "size": None,
-                    "chunks": chunks_per_layer[i],
-                    "shape_a": (rows, self.config.hypernet_rank),
-                    "chunks_a": chunks_a,
-                    "shape_b": (self.config.hypernet_rank, cols),
-                    "chunks_b": chunks_b
-                })
-
                 ids = torch.arange(chunks_per_layer[i]) + chunk_idx
                 chunk_idx += chunks_per_layer[i]
-
-                self.chunk_ids[f"alt_dim_{alt_dim}"] += ids.tolist()
-                self.layer_ids[f"alt_dim_{alt_dim}"].append(i)
-
-            # Matrix-like parameters generated via low rank matrices
-            else:
-                chunks_a = int(rows / self.config.hypernet_hidden_size)
-                chunks_b = int(cols / self.config.hypernet_hidden_size)
+                ids_a = ids[:chunks_a]
+                ids_b = ids[chunks_a:]
 
                 self.config_per_layer.append({
                     "name": name,
@@ -268,17 +249,19 @@ class RHN_Hypernetwork(nn.Module):
                     "shape": shape,
                     "size": None,
                     "chunks": chunks_per_layer[i],
+                    "type_a": "matrix" if chunks_a != 1 else f"alt_dim_{alt_dim}",
                     "shape_a": (rows, self.config.hypernet_rank),
                     "chunks_a": chunks_a,
+                    "type_b": "matrix" if chunks_b != 1 else f"alt_dim_{alt_dim}",
                     "shape_b": (self.config.hypernet_rank, cols),
-                    "chunks_b": chunks_b
+                    "chunks_b": chunks_b,
                 })
 
-                ids = torch.arange(chunks_per_layer[i]) + chunk_idx
-                chunk_idx += chunks_per_layer[i]
+                id_label_a = "matrix" if chunks_a != 1 else f"alt_dim_{alt_dim}"
+                id_label_b = "matrix" if chunks_b != 1 else f"alt_dim_{alt_dim}"
 
-                self.chunk_ids["matrix"] += ids.tolist()
-                self.layer_ids["matrix"].append(i)
+                self.chunk_ids[id_label_a] += ids_a.tolist()
+                self.chunk_ids[id_label_b] += ids_b.tolist()
 
         # TODO - Consider alternative initialization to 0's.  Classes below have built-in LeCun Normal initialization.
         module_list = nn.ModuleList(
@@ -324,50 +307,45 @@ class RHN_Hypernetwork(nn.Module):
 
         outputs_raw = self.hypernet_base(inputs)
 
+        outputs_grouped = {}
         outputs = {}
 
         for layer_type in self.chunk_ids:
             indices = torch.tensor(self.chunk_ids[layer_type], device=device, dtype=torch.int)
             features = outputs_raw.index_select(2, indices)
-            outputs_grouped = self.output_heads[layer_type](features)
-            outputs_grouped = self._combine_chunks_and_reshape(outputs_grouped, batch_size, seq_len, layer_type)
-            outputs = outputs | outputs_grouped
+            outputs_grouped[layer_type] = {
+                "data" : self.output_heads[layer_type](features),
+                "index" : 0
+            }
+
+        for layer in self.config_per_layer:
+            type_a = layer["type_a"]
+            chunks_a = layer["chunks_a"]
+            index_a = outputs_grouped[type_a]["index"]
+            outputs_a = outputs_grouped[type_a]["data"][:, :, index_a:index_a + chunks_a]
+            outputs_a = outputs_a.view(batch_size, seq_len, *layer["shape_a"])
+
+            outputs_grouped[type_a]["index"] += chunks_a
+            if outputs_grouped[type_a]["index"] == outputs_grouped[type_a]["data"].shape[2]:
+                outputs_grouped[type_a]["index"] = 0
+
+            if layer["type"] == "matrix":
+                type_b = layer["type_b"]
+                chunks_b = layer["chunks_b"]
+                index_b = outputs_grouped[type_b]["index"]
+                outputs_b = outputs_grouped[type_b]["data"][:, :, index_b:index_b + chunks_b]
+                outputs_b = outputs_b.view(batch_size, seq_len, *layer["shape_b"])
+
+                outputs_grouped[type_b]["index"] += chunks_b
+                if outputs_grouped[type_b]["index"] == outputs_grouped[type_b]["data"].shape[2]:
+                    outputs_grouped[type_b]["index"] = 0
+
+            if layer["type"] == "vector":
+                outputs[layer["name"]] = outputs_a
+            else:
+                outputs[layer["name"]] = (outputs_a, outputs_b)
 
         return outputs
-
-    def _combine_chunks_and_reshape(self, outputs_grouped, batch_size, seq_len, layer_type) -> dict:
-        generated = {}
-
-        configs = [self.config_per_layer[i] for i in self.layer_ids[layer_type]]
-
-        if layer_type == "vector":
-            chunk_idx = 0
-            for layer in configs:
-                chunks = []
-                for i in range(layer["chunks"]):
-                    chunks.append(outputs_grouped[:, :, chunk_idx + i])
-
-                layer_a = torch.cat(chunks, dim=3)
-                layer_a = layer_a.view(batch_size, seq_len, *layer["shape"])
-
-                chunk_idx += layer["chunks"]
-
-                generated[layer["name"]] = layer_a
-        else:
-            chunk_idx = 0
-            for layer in configs:
-                chunks = outputs_grouped[:, :, chunk_idx: chunk_idx + layer["chunks"]]
-                chunks_a = chunks[:, :, :layer["chunks_a"]]
-                chunks_b = chunks[:, :, layer["chunks_a"]:]
-
-                layer_a = chunks_a.view(batch_size, seq_len, *layer["shape_a"])
-                layer_b = chunks_b.view(batch_size, seq_len, *layer["shape_b"])
-
-                chunk_idx += layer["chunks"]
-
-                generated[layer["name"]] = (layer_a, layer_b)
-
-        return generated
 
     def _calculate_chunks(self, layer_spec):
         name, shape = layer_spec
