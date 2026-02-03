@@ -73,8 +73,8 @@ class DynamicCastedLinear(nn.Module):
             else:
                 input_reshaped = input
 
-            out = torch.einsum('abc,abdc->abd', input, B.to(input.dtype)) # torch.matmul(input, B)
-            out = torch.einsum('abd,abed->abe', out, A.to(input.dtype)) # torch.matmul(out, A)
+            out = torch.einsum('abc,aedc->abed', input, B.to(input.dtype)) # torch.matmul(input, B)
+            out = torch.einsum('abed,acfd->abf', out, A.to(input.dtype)) # torch.matmul(out, A)
 
             if input.dim() == 2:
                 out = out.squeeze(1)
