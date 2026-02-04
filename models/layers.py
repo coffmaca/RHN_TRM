@@ -73,8 +73,8 @@ class DynamicCastedLinear(nn.Module):
             else:
                 input_reshaped = input
 
-            out = torch.einsum('abc,aedc->abed', input, B.to(input.dtype)) # torch.matmul(input, B)
-            out = torch.einsum('abed,acfd->abf', out, A.to(input.dtype)) # torch.matmul(out, A)
+            out = torch.einsum('abc,adc->abd', input, B.to(input.dtype)) # torch.matmul(input, B)
+            out = torch.einsum('abd,aed->abe', out, A.to(input.dtype)) # torch.matmul(out, A)
 
             if input.dim() == 2:
                 out = out.squeeze(1)
@@ -99,6 +99,23 @@ class CastedLinear(nn.Module):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return F.linear(input, self.weight.to(input.dtype), bias=self.bias.to(input.dtype) if self.bias is not None else None)
+
+
+class CastedParameter(nn.Module):
+    def __init__(self,
+                 size: tuple,
+                 init_std: float,
+                 cast_to: torch.dtype):
+        super().__init__()
+        self.cast_to = cast_to
+
+        # Truncated LeCun normal init
+        self.parameter_weight = nn.Parameter(
+            trunc_normal_init_(torch.empty(size), std=init_std)
+        )
+
+    def forward(self) -> torch.Tensor:
+        return self.parameter_weight.to(self.cast_to)
 
 
 class CastedEmbedding(nn.Module):

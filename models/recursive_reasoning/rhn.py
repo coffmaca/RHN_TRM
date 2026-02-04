@@ -10,7 +10,8 @@ from torch.profiler import profile, record_function, ProfilerActivity, tensorboa
 from pydantic import BaseModel
 import random
 from models.common import trunc_normal_init_
-from models.layers import rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear, DynamicSwiGLU, DynamicAttention
+from models.layers import (rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding,
+                           CastedParameter, CastedLinear, DynamicSwiGLU, DynamicAttention)
 from models.sparse_embedding import CastedSparseEmbedding
 
 IGNORE_LABEL_ID = -100
@@ -187,6 +188,12 @@ class RHN_Hypernetwork(nn.Module):
                 "type": "vector" if self._is_vector_like(shape) else "matrix",
             }
 
+        self.embed_scale = math.sqrt(self.config.hypernet_hidden_size)
+        embed_init_std = 1.0 / self.embed_scale
+
+        self.token_sum_query = CastedParameter((1, 1,self.config.hidden_size), init_std=embed_init_std,
+                                                cast_to=self.forward_dtype)
+
         self.input_size = self.config.hidden_size * self.config.L_layers
 
         # TODO - Consider alternative initialization to 0's.  Classes below have built-in LeCun Normal initialization.
@@ -207,7 +214,9 @@ class RHN_Hypernetwork(nn.Module):
     def forward(self, activations: torch.Tensor) -> dict:
         batch_size, seq_len, _ = activations.shape
 
-        outputs = self.hypernet_base(activations)
+        inputs = self._attention(activations)
+
+        outputs = self.hypernet_base(inputs)
         outputs = self.output_head(outputs)
 
         outputs_by_layer = {}
@@ -215,13 +224,13 @@ class RHN_Hypernetwork(nn.Module):
         for layer in self.config_per_layer:
             shape = self.config_per_layer[layer]["shape"]
 
-            outputs_a = outputs[:, :, output_index : output_index + (shape[0] * self.config.hypernet_rank)]
-            outputs_a = outputs_a.view(batch_size, seq_len, shape[0], self.config.hypernet_rank)
+            outputs_a = outputs[:, output_index : output_index + (shape[0] * self.config.hypernet_rank)]
+            outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
             output_index += shape[0] * self.config.hypernet_rank
 
             if self.config_per_layer[layer]["type"] == "matrix":
-                outputs_b = outputs[:, :, output_index : output_index + (shape[1] * self.config.hypernet_rank)]
-                outputs_b = outputs_b.view(batch_size, seq_len, self.config.hypernet_rank, shape[1])
+                outputs_b = outputs[:, output_index : output_index + (shape[1] * self.config.hypernet_rank)]
+                outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
                 output_index += shape[1] * self.config.hypernet_rank
 
             if self.config_per_layer[layer]["type"] == "vector":
@@ -231,7 +240,7 @@ class RHN_Hypernetwork(nn.Module):
 
         return outputs_by_layer
 
-    def _is_vector_like(self, shape):
+    def _is_vector_like(self, shape:list) -> bool:
         if len(shape) < 2:
             return True
 
@@ -245,12 +254,20 @@ class RHN_Hypernetwork(nn.Module):
         else:
             return True
 
-    def _output_dim(self, layer_specs):
+    def _output_dim(self, layer_specs:dict) -> int:
         dim_sum = 0
         for layer in layer_specs:
             rows, cols = layer[1]
             dim_sum += rows + cols
         return self.config.hypernet_rank * dim_sum
+
+    def _attention(self, inputs) -> torch.Tensor:
+        token_sum_query = self.token_sum_query().transpose(1, 2)
+        attn_logits = torch.matmul(inputs, token_sum_query)
+        attn_weights = F.softmax(attn_logits, dim=1)
+        pooled_inputs = torch.matmul(inputs.transpose(1, 2), attn_weights)
+
+        return pooled_inputs.squeeze(2)
 
 
 # class RHN_ACTV1ReasoningModule(nn.Module):
