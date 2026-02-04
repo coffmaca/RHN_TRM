@@ -250,7 +250,7 @@ class RHN_Hypernetwork(nn.Module):
         for layer in layer_specs:
             rows, cols = layer[1]
             dim_sum += rows + cols
-        return 2 * self.config.hypernet_rank * dim_sum
+        return self.config.hypernet_rank * dim_sum
 
 
 # class RHN_ACTV1ReasoningModule(nn.Module):
