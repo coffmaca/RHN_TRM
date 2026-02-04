@@ -15,7 +15,7 @@ evaluators:
   - name: arc@ARC
 
 # Hyperparams - Training
-global_batch_size: 32 # 128 # 768
+global_batch_size: 64 # 32 # 128 # 768
 
 epochs: 100000
 eval_interval: 10000

@@ -25,7 +25,7 @@ mlp_t: False # use mlp on L instead of transformer
 puzzle_emb_len: 16 # if non-zero, its specified to this value
 no_ACT_continue: True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
 
-hypernet_hidden_size: 256
+hypernet_hidden_size: 512
 hypernet_hidden_depth: 2
-hypernet_rank: 8
+hypernet_rank: 32
 layer_emb_dim: 32
