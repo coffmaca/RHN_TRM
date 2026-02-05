@@ -268,7 +268,7 @@ class RHN_Hypernetwork(nn.Module):
         return self.config.hypernet_rank * dim_sum
 
     def _attention(self, inputs) -> torch.Tensor:
-        token_sum_query = self.token_sum_query().transpose(1, 2)
+        token_sum_query = self.token_sum_query.transpose(1, 2)
         attn_logits = torch.matmul(inputs, token_sum_query)
         attn_weights = F.softmax(attn_logits, dim=1)
         pooled_inputs = torch.matmul(inputs.transpose(1, 2), attn_weights)
