@@ -191,8 +191,14 @@ class RHN_Hypernetwork(nn.Module):
         self.embed_scale = math.sqrt(self.config.hypernet_hidden_size)
         embed_init_std = 1.0 / self.embed_scale
 
-        self.token_sum_query = CastedParameter((1, 1, self.config.hidden_size * self.config.L_layers), init_std=embed_init_std,
-                                                cast_to=self.forward_dtype)
+        # self.token_sum_query = CastedParameter((1, 1, self.config.hidden_size * self.config.L_layers), init_std=embed_init_std,
+        #                                         cast_to=self.forward_dtype)
+        self.token_sum_query = nn.Parameter(
+            trunc_normal_init_(
+                torch.empty((1, 1, self.config.hidden_size * self.config.L_layers), dtype=self.forward_dtype),
+                std=embed_init_std
+            )
+        )
 
         self.input_size = self.config.hidden_size * self.config.L_layers
 
