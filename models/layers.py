@@ -81,6 +81,14 @@ class DynamicCastedLinear(nn.Module):
 
             return out
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['dynamic_adapter'] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
 
 class CastedLinear(nn.Module):
     def __init__(self,
