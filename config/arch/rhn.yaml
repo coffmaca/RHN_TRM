@@ -29,3 +29,4 @@ hypernet_hidden_size: 512
 hypernet_hidden_depth: 2
 hypernet_rank: 32
 layer_emb_dim: 32
+hypernet_relative_scale: 2
