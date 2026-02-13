@@ -68,6 +68,7 @@ class RHN_ACTV1Config(BaseModel):
     hypernet_hidden_depth: int
     hypernet_rank: int
     layer_emb_dim: int
+    hypernet_attn_heads: int
 
 class RHN_ACTV1Block(nn.Module):
     def __init__(self, config: RHN_ACTV1Config) -> None:
@@ -188,19 +189,27 @@ class RHN_Hypernetwork(nn.Module):
                 "type": "vector" if self._is_vector_like(shape) else "matrix",
             }
 
-        self.embed_scale = math.sqrt(self.config.hypernet_hidden_size)
-        embed_init_std = 1.0 / self.embed_scale
-
-        # self.token_sum_query = CastedParameter((1, 1, self.config.hidden_size * self.config.L_layers), init_std=embed_init_std,
-        #                                         cast_to=self.forward_dtype)
-        self.token_sum_query = nn.Parameter(
-            trunc_normal_init_(
-                torch.empty((1, 1, self.config.hidden_size * self.config.L_layers), dtype=self.forward_dtype),
-                std=embed_init_std
-            )
-        )
+        # self.embed_scale = math.sqrt(self.config.hypernet_hidden_size)
+        # embed_init_std = 1.0 / self.embed_scale
+        #
+        # # self.token_sum_query = CastedParameter((1, 1, self.config.hidden_size * self.config.L_layers), init_std=embed_init_std,
+        # #                                         cast_to=self.forward_dtype)
+        # self.token_summary_query = nn.Parameter(
+        #     trunc_normal_init_(
+        #         torch.empty((1, 1, self.config.hidden_size * self.config.L_layers), dtype=self.forward_dtype),
+        #         std=embed_init_std
+        #     )
+        # )
 
         self.input_size = self.config.hidden_size * self.config.L_layers
+
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=self.input_size,
+            num_heads=self.config.hypernet_attn_heads,
+            batch_first=True
+        ).to(dtype=self.forward_dtype)
+
+        self.norm = nn.LayerNorm(self.input_size).to(dtype=self.forward_dtype)
 
         # TODO - Consider alternative initialization to 0's.  Classes below have built-in LeCun Normal initialization.
         module_list = nn.ModuleList(
@@ -268,12 +277,16 @@ class RHN_Hypernetwork(nn.Module):
         return self.config.hypernet_rank * dim_sum
 
     def _attention(self, inputs) -> torch.Tensor:
-        token_sum_query = self.token_sum_query.transpose(1, 2)
-        attn_logits = torch.matmul(inputs, token_sum_query)
-        attn_weights = F.softmax(attn_logits, dim=1)
-        pooled_inputs = torch.matmul(inputs.transpose(1, 2), attn_weights)
+        queries = inputs.mean(dim=1, keepdim=True)
+        attn_output, _ = self.cross_attn(
+            query=queries,
+            key=inputs,
+            value=inputs
+        )
 
-        return pooled_inputs.squeeze(2)
+        pooled_inputs = self.norm(queries + attn_output)
+
+        return pooled_inputs.squeeze(1)
 
 
 # class RHN_ACTV1ReasoningModule(nn.Module):
