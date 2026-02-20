@@ -272,7 +272,8 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
             halted = is_last_step
 
             # if training, and ACT is enabled
-            if self.training and (self.config.halt_max_steps > 1):
+            # if self.training and (self.config.halt_max_steps > 1):
+            if self.config.halt_max_steps > 1:
 
                 # Halt signal
                 # NOTE: During evaluation, always use max steps, this is to guarantee the same halting steps inside a batch for batching purposes
