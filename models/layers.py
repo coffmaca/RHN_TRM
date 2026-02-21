@@ -1,5 +1,6 @@
 from typing import Tuple
 import einops
+import math
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -261,7 +262,12 @@ class AttentionPooling(nn.Module):
         self.num_key_value_heads = num_key_value_heads
         self.causal = causal
 
-        self.static_query = nn.Parameter(torch.randn(1, 1, hidden_size))
+        self.static_query = nn.Parameter(
+            trunc_normal_init_(
+                torch.empty((1, 1, hidden_size)),
+                std=1.0 / math.sqrt(hidden_size),
+            )
+        )
 
         self.q_proj = CastedLinear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.kv_proj = CastedLinear(self.hidden_size, 2 * self.num_key_value_heads * self.head_dim, bias=False)
