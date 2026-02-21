@@ -176,7 +176,7 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
 
 
 class RHN_Hypernetwork(nn.Module):
-    def __init__(self, config: RHN_ACTV1Config, layer_specs) -> None:
+    def __init__(self, config: RHN_ACTV1Config, layer_specs: dict, seq_len: int) -> None:
         super().__init__()
         self.config = config
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
@@ -188,6 +188,8 @@ class RHN_Hypernetwork(nn.Module):
                 "shape": shape,
                 "type": "vector" if self._is_vector_like(shape) else "matrix",
             }
+
+        self.seq_len = seq_len
 
         # self.embed_scale = math.sqrt(self.config.hypernet_hidden_size)
         # embed_init_std = 1.0 / self.embed_scale
@@ -203,13 +205,29 @@ class RHN_Hypernetwork(nn.Module):
 
         self.input_size = self.config.hidden_size * self.config.L_layers
 
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=self.input_size,
-            num_heads=self.config.hypernet_attn_heads,
-            batch_first=True
-        ).to(dtype=self.forward_dtype)
+        self.attn = Attention(
+                hidden_size=self.input_size,
+                head_dim=self.input_size // config.hypernet_attn_heads,
+                num_heads=config.hypernet_attn_heads,
+                num_key_value_heads=config.hypernet_attn_heads,
+                causal=False
+            )
+        self.norm_eps = config.rms_norm_eps
 
-        self.norm = nn.LayerNorm(self.input_size).to(dtype=self.forward_dtype)
+        self.mlp_t_downmixer = nn.Sequential()
+        size = self.seq_len
+        output_size = None
+        while size >= 8:
+            output_size = int(size/4)
+            self.mlp_t_downmixer.append(
+                SwiGLU(hidden_size=size, expansion=config.expansion, output_size=output_size)
+            )
+            size = output_size
+        if output_size != 1:
+            self.mlp_t_downmixer.append(
+                SwiGLU(hidden_size=output_size, expansion=config.expansion, output_size=1)
+            )
+
 
         # TODO - Consider alternative initialization to 0's.  Classes below have built-in LeCun Normal initialization.
         module_list = nn.ModuleList(
@@ -226,10 +244,10 @@ class RHN_Hypernetwork(nn.Module):
                                          self._output_dim(layer_specs),
                                          bias=False)
 
-    def forward(self, activations: torch.Tensor) -> dict:
+    def forward(self, activations: torch.Tensor, cos_sin: CosSin) -> dict:
         batch_size, seq_len, _ = activations.shape
 
-        inputs = self._attention(activations)
+        inputs = self._consolidate_activations(activations, cos_sin)
 
         outputs = self.hypernet_base(inputs)
         outputs = self.output_head(outputs)
@@ -276,17 +294,15 @@ class RHN_Hypernetwork(nn.Module):
             dim_sum += rows + cols
         return self.config.hypernet_rank * dim_sum
 
-    def _attention(self, inputs) -> torch.Tensor:
-        queries = inputs.mean(dim=1, keepdim=True)
-        attn_output, _ = self.cross_attn(
-            query=queries,
-            key=inputs,
-            value=inputs
-        )
+    def _consolidate_activations(self, inputs: torch.Tensor, cos_sin: CosSin) -> torch.Tensor:
+        attn_out = rms_norm(inputs + self.attn(cos_sin=cos_sin, hidden_states=inputs),
+                 variance_epsilon=self.norm_eps)
 
-        pooled_inputs = self.norm(queries + attn_output)
+        attn_out = attn_out.transpose(1, 2)
+        inputs_summary = self.mlp_t_downmixer(attn_out)
+        inputs_summary = inputs_summary.squeeze(-1)
 
-        return pooled_inputs.squeeze(1)
+        return inputs_summary
 
 
 # class RHN_ACTV1ReasoningModule(nn.Module):
@@ -343,7 +359,7 @@ class RHN_ACTV1_Inner(nn.Module):
                 continue
             self.layer_specs.append((name, param.shape))
 
-        self.hypernet = RHN_Hypernetwork(self.config, self.layer_specs)
+        self.hypernet = RHN_Hypernetwork(self.config, self.layer_specs, self.config.seq_len + self.puzzle_emb_len)
 
         # Initial states
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
@@ -465,7 +481,7 @@ class RHN_ACTV1_Inner(nn.Module):
 
         # Dynamic weight output
         hidden_states = hidden_states_prior + input_embeddings if input_embeddings is not None else hidden_states_prior
-        dynamic_weights = self.hypernet(activations)
+        dynamic_weights = self.hypernet(activations, **seq_info)
         for i, layer in enumerate(self.L_level):
             layer_weights = [dynamic_weights[layer_name] for layer_name in dynamic_weights if
                              f"L_level.{i}" in layer_name]
