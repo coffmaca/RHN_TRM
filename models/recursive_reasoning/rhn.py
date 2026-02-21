@@ -11,7 +11,7 @@ from pydantic import BaseModel
 import random
 from models.common import trunc_normal_init_
 from models.layers import (rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding,
-                           CastedParameter, CastedLinear, DynamicSwiGLU, DynamicAttention)
+                           CastedParameter, CastedLinear, DynamicSwiGLU, DynamicAttention, AttentionPooling)
 from models.sparse_embedding import CastedSparseEmbedding
 
 IGNORE_LABEL_ID = -100
@@ -206,7 +206,7 @@ class RHN_Hypernetwork(nn.Module):
 
         self.input_size = self.config.hidden_size * self.config.L_layers
 
-        self.attn = Attention(
+        self.pool_attn = AttentionPooling(
                 hidden_size=self.input_size,
                 head_dim=self.input_size // config.hypernet_attn_heads,
                 num_heads=config.hypernet_attn_heads,
@@ -219,19 +219,19 @@ class RHN_Hypernetwork(nn.Module):
                                               max_position_embeddings=seq_len,
                                               base=self.config.rope_theta)
 
-        self.mlp_t_downmixer = nn.Sequential()
-        size = self.seq_len
-        output_size = None
-        while size >= 8:
-            output_size = int(size/4)
-            self.mlp_t_downmixer.append(
-                SwiGLU(hidden_size=size, expansion=config.expansion, output_size=output_size)
-            )
-            size = output_size
-        if output_size != 1:
-            self.mlp_t_downmixer.append(
-                SwiGLU(hidden_size=output_size, expansion=config.expansion, output_size=1)
-            )
+        # self.mlp_t_downmixer = nn.Sequential()
+        # size = self.seq_len
+        # output_size = None
+        # while size >= 8:
+        #     output_size = int(size/4)
+        #     self.mlp_t_downmixer.append(
+        #         SwiGLU(hidden_size=size, expansion=config.expansion, output_size=output_size)
+        #     )
+        #     size = output_size
+        # if output_size != 1:
+        #     self.mlp_t_downmixer.append(
+        #         SwiGLU(hidden_size=output_size, expansion=config.expansion, output_size=1)
+        #     )
 
 
         # TODO - Consider alternative initialization to 0's.  Classes below have built-in LeCun Normal initialization.
@@ -322,9 +322,14 @@ class RHN_Hypernetwork(nn.Module):
         # attn_out = attn_out.transpose(1, 2)
         # inputs_summary = self.mlp_t_downmixer(attn_out)
         # inputs_summary = inputs_summary.squeeze(-1)
-        inputs = inputs.transpose(1, 2)
-        inputs_summary = self.mlp_t_downmixer(inputs)
-        inputs_summary = inputs_summary.squeeze(-1)
+        # inputs = inputs.transpose(1, 2)
+        # inputs_summary = self.mlp_t_downmixer(inputs)
+        # inputs_summary = inputs_summary.squeeze(-1)
+
+        attn_out = self.pool_attn(hidden_states=inputs)
+
+        inputs_summary = rms_norm(attn_out, variance_epsilon=self.norm_eps)
+        inputs_summary = inputs_summary.squeeze(1)
 
         return inputs_summary
 

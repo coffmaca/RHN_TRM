@@ -249,6 +249,55 @@ class Attention(nn.Module):
         attn_output = attn_output.reshape(batch_size, seq_len, self.output_size)  # type: ignore
         return self.o_proj(attn_output)
 
+
+class AttentionPooling(nn.Module):
+    def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False):
+        super().__init__()
+
+        self.hidden_size = hidden_size
+        self.head_dim = head_dim
+        self.output_size = head_dim * num_heads
+        self.num_heads = num_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.causal = causal
+
+        self.static_query = nn.Parameter(torch.randn(1, 1, hidden_size))
+
+        self.q_proj = CastedLinear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.kv_proj = CastedLinear(self.hidden_size, 2 * self.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            kv_states: The sequence to be pooled. Shape [batch_size, seq_len, hidden_size]
+        Returns:
+            The pooled vector. Shape [batch_size, 1, hidden_size]
+        """
+        batch_size, kv_len, _ = hidden_states.shape
+
+        query_states = self.static_query.expand(batch_size, -1, -1).to(dtype=hidden_states.dtype)
+        q_len = query_states.shape[1]  # will be 1
+
+        query = self.q_proj(query_states)
+        kv = self.kv_proj(hidden_states)
+
+        query = query.view(batch_size, q_len, self.num_heads, self.head_dim)
+        kv = kv.view(batch_size, kv_len, 2 * self.num_key_value_heads, self.head_dim)
+
+        key = kv[:, :, :self.num_key_value_heads]
+        value = kv[:, :, self.num_key_value_heads:]
+
+        query, key, value = map(lambda t: einops.rearrange(t, 'B S H D -> B H S D'), (query, key, value))
+        attn_output = F.scaled_dot_product_attention(query, key, value, is_causal=self.causal)
+        attn_output = einops.rearrange(attn_output, 'B H S D -> B S H D')
+        attn_output = attn_output.reshape(batch_size, q_len, self.output_size)
+
+        final_attn = self.o_proj(attn_output)
+
+        return query_states + final_attn
+
+
 class LinearSwish(nn.Module):
     def __init__(self, hidden_size: int, reverse=False):
         super().__init__()
