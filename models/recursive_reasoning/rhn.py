@@ -213,6 +213,10 @@ class RHN_Hypernetwork(nn.Module):
                 causal=False
             )
         self.norm_eps = config.rms_norm_eps
+        if self.config.pos_encodings == "rope":
+            self.rotary_emb = RotaryEmbedding(dim=self.input_size // self.config.hypernet_attn_heads,
+                                              max_position_embeddings=seq_len,
+                                              base=self.config.rope_theta)
 
         self.mlp_t_downmixer = nn.Sequential()
         size = self.seq_len
@@ -244,7 +248,9 @@ class RHN_Hypernetwork(nn.Module):
                                          self._output_dim(layer_specs),
                                          bias=False)
 
-    def forward(self, activations: torch.Tensor, cos_sin: CosSin) -> dict:
+    def forward(self, activations: torch.Tensor) -> dict:
+        cos_sin = self.rotary_emb() if hasattr(self, "rotary_emb") else None
+
         batch_size, seq_len, _ = activations.shape
 
         inputs = self._consolidate_activations(activations, cos_sin)
@@ -301,6 +307,9 @@ class RHN_Hypernetwork(nn.Module):
         attn_out = attn_out.transpose(1, 2)
         inputs_summary = self.mlp_t_downmixer(attn_out)
         inputs_summary = inputs_summary.squeeze(-1)
+        # inputs = inputs.transpose(1, 2)
+        # inputs_summary = self.mlp_t_downmixer(inputs)
+        # inputs_summary = inputs_summary.squeeze(-1)
 
         return inputs_summary
 
@@ -481,7 +490,7 @@ class RHN_ACTV1_Inner(nn.Module):
 
         # Dynamic weight output
         hidden_states = hidden_states_prior + input_embeddings if input_embeddings is not None else hidden_states_prior
-        dynamic_weights = self.hypernet(activations, **seq_info)
+        dynamic_weights = self.hypernet(activations)
         for i, layer in enumerate(self.L_level):
             layer_weights = [dynamic_weights[layer_name] for layer_name in dynamic_weights if
                              f"L_level.{i}" in layer_name]
