@@ -316,15 +316,15 @@ class RHN_Hypernetwork(nn.Module):
         return vals_to_generate
 
     def _consolidate_activations(self, inputs: torch.Tensor, cos_sin: CosSin) -> torch.Tensor:
-        attn_out = rms_norm(inputs + self.attn(cos_sin=cos_sin, hidden_states=inputs),
-                 variance_epsilon=self.norm_eps)
-
-        attn_out = attn_out.transpose(1, 2)
-        inputs_summary = self.mlp_t_downmixer(attn_out)
-        inputs_summary = inputs_summary.squeeze(-1)
-        # inputs = inputs.transpose(1, 2)
-        # inputs_summary = self.mlp_t_downmixer(inputs)
+        # attn_out = rms_norm(inputs + self.attn(cos_sin=cos_sin, hidden_states=inputs),
+        #          variance_epsilon=self.norm_eps)
+        #
+        # attn_out = attn_out.transpose(1, 2)
+        # inputs_summary = self.mlp_t_downmixer(attn_out)
         # inputs_summary = inputs_summary.squeeze(-1)
+        inputs = inputs.transpose(1, 2)
+        inputs_summary = self.mlp_t_downmixer(inputs)
+        inputs_summary = inputs_summary.squeeze(-1)
 
         return inputs_summary
 
