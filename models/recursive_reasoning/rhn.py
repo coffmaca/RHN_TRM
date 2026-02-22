@@ -138,18 +138,13 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
         )
         self.norm_eps = config.rms_norm_eps
 
-    def set_dynamic_adapter(self, attn_1, attn_2, up, down):
-        A_up, B_up = up
-        A_down, B_down = down
-        self.mlp.set_dynamic_adapter(A_up, B_up, A_down, B_down)
-
-        A_attn_1, B_attn_1 = attn_1
-        A_attn_2, B_attn_2 = attn_2
+    def set_dynamic_adapter(self, params_attn_1, params_attn_2, params_up, params_down):
+        self.mlp.set_dynamic_adapter(params_up, params_down)
 
         if self.config.mlp_t:
-            self.mlp_t.set_dynamic_adapter(A_attn_1, B_attn_1, A_attn_2, B_attn_2)
+            self.mlp_t.set_dynamic_adapter(params_attn_1, params_attn_2)
         else:
-            self.self_attn.set_dynamic_adapter(A_attn_1, B_attn_1, A_attn_2, B_attn_2)
+            self.self_attn.set_dynamic_adapter(params_attn_1, params_attn_2)
 
 
     def clear_dynamic_adapter(self):
@@ -230,21 +225,15 @@ class RHN_Hypernetwork(nn.Module):
         outputs_by_layer = {}
         output_index = 0
         for layer in self.config_per_layer:
-            shape = self.config_per_layer[layer]["shape"]
+            dim_0, dim_1 = self.config_per_layer[layer]["shape"]
+            total_params = dim_0 * dim_1
 
-            outputs_a = outputs[:, output_index : output_index + (shape[0] * self.config.hypernet_rank)]
-            outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
-            output_index += shape[0] * self.config.hypernet_rank
+            layer_params = outputs[:, output_index : output_index + total_params]
+            layer_params = layer_params.view(batch_size, dim_0, dim_1)
 
-            if self.config_per_layer[layer]["type"] == "matrix":
-                outputs_b = outputs[:, output_index : output_index + (shape[1] * self.config.hypernet_rank)]
-                outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
-                output_index += shape[1] * self.config.hypernet_rank
+            outputs_by_layer[layer] = layer_params
 
-            if self.config_per_layer[layer]["type"] == "vector":
-                outputs_by_layer[layer] = outputs_a
-            else:
-                outputs_by_layer[layer] = (outputs_a, outputs_b)
+            output_index += total_params
 
         return outputs_by_layer
 
@@ -262,6 +251,7 @@ class RHN_Hypernetwork(nn.Module):
         else:
             return True
 
+    # TODO - Make this dynamic / tunable for larger base models, to ensure appropriate hypernetwork scaling.
     def _output_dim(self, layer_specs:dict) -> int:
         base_param_dim_sum = 0
         base_param_total = 0
@@ -269,17 +259,11 @@ class RHN_Hypernetwork(nn.Module):
             rows, cols = layer[1]
             base_param_dim_sum += rows + cols
             base_param_total += rows * cols
-        vals_to_generate = base_param_dim_sum * self.config.hypernet_rank
-        hypernet_output_head_params = vals_to_generate * self.config.hypernet_hidden_size
-        reductions = 0
-        self.intermediate_dims = []
-        while hypernet_output_head_params > base_param_total * self.config.hypernet_relative_scale:
-            reductions += 1
-            new_dim = int(-(-vals_to_generate**(1/2)//1))  # Square root and round up
-            vals_to_generate = new_dim * self.config.hypernet_rank * 2
-            hypernet_output_head_params = vals_to_generate * self.config.hypernet_hidden_size
-            self.intermediate_dims.insert(0, new_dim)
-        self.reductions = reductions
+
+        self.output_dim = int(-(-base_param_total**(1/4)//1)) # Square root twice (i.e., 1/4th root) and round up
+
+        vals_to_generate = self.output_dim**2 * 2
+
         return vals_to_generate
 
     def _attention(self, inputs) -> torch.Tensor:
@@ -291,13 +275,13 @@ class RHN_Hypernetwork(nn.Module):
         return pooled_inputs.squeeze(2)
 
     def _expand_output(self, outputs) -> torch.Tensor:
-        for dim in self.intermediate_dims:
-            used_outputs_a = outputs[...,:dim * self.config.hypernet_rank]
-            used_outputs_a = used_outputs_a.unsqueeze(-1).view(-1, dim, self.config.hypernet_rank)
-            used_outputs_b = outputs[...,dim * self.config.hypernet_rank : dim * self.config.hypernet_rank * 2]
-            used_outputs_b = used_outputs_b.unsqueeze(-1).view(-1, self.config.hypernet_rank, dim)
-            expanded_outputs = torch.matmul(used_outputs_a, used_outputs_b)
-            outputs = expanded_outputs.flatten(start_dim=-2,end_dim=-1)
+        used_outputs_a = outputs[...,:self.output_dim**2]
+        used_outputs_a = used_outputs_a.unsqueeze(-1).view(-1, self.output_dim, self.output_dim)
+        used_outputs_b = outputs[...,self.output_dim**2 : self.output_dim**2 * 2]
+        used_outputs_b = used_outputs_b.unsqueeze(-1).view(-1, self.output_dim, self.output_dim)
+        expanded_outputs = torch.einsum('bij,bkl->bikjl', used_outputs_a, used_outputs_b)
+        outputs = expanded_outputs.flatten(start_dim=1,end_dim=-1)
+
         return outputs
 
 
