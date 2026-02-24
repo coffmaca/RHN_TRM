@@ -357,6 +357,8 @@ class RHN_ACTV1_Inner(nn.Module):
 
         self.hypernet = RHN_Hypernetwork(self.config, self.layer_specs)
 
+        self.hypernet_lambda = nn.Parameter(torch.tensor(0., dtype=self.forward_dtype))
+
         # Initial states
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
         self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
@@ -401,7 +403,7 @@ class RHN_ACTV1_Inner(nn.Module):
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
         )
 
-    def forward(self, carry: RHN_ACTV1InnerCarry, batch: Dict[str, torch.Tensor], **kwargs) -> Tuple[RHN_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    def forward(self, carry: RHN_ACTV1InnerCarry, batch: Dict[str, torch.Tensor], **kwargs) -> Tuple[RHN_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
@@ -462,7 +464,7 @@ class RHN_ACTV1_Inner(nn.Module):
         new_carry = RHN_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
-        return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
+        return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), torch.tensor(self.hypernet_lambda.item(), device=self.hypernet_lambda.device)
 
     def _dynamic_forward(self, hidden_states, hidden_states_prior, input_embeddings=None, **seq_info):
         hidden_states = hidden_states + input_embeddings if input_embeddings is not None else hidden_states
@@ -484,7 +486,7 @@ class RHN_ACTV1_Inner(nn.Module):
             layer.set_dynamic_adapter(*layer_weights)
             hidden_states = layer(hidden_states=hidden_states, **seq_info)
         dynamic_out = hidden_states
-        hidden_states = base_out + dynamic_out
+        hidden_states = (1-self.hypernet_lambda) * base_out + self.hypernet_lambda * dynamic_out
         hidden_states_prior = hidden_states.clone()
 
         return hidden_states, hidden_states_prior
@@ -515,7 +517,7 @@ class RHN_ACTV1(nn.Module):
             current_data={k: torch.empty_like(v) for k, v in batch.items()}
         )
         
-    def forward(self, carry: RHN_ACTV1Carry, batch: Dict[str, torch.Tensor]) -> Tuple[RHN_ACTV1Carry, Dict[str, torch.Tensor]]:
+    def forward(self, carry: RHN_ACTV1Carry, batch: Dict[str, torch.Tensor]) -> Tuple[RHN_ACTV1Carry, Dict[str, torch.Tensor], torch.Tensor]:
 
         # Update data, carry (removing halted sequences)
         new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
@@ -525,7 +527,7 @@ class RHN_ACTV1(nn.Module):
         new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
 
         # Forward inner model
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
+        new_inner_carry, logits, (q_halt_logits, q_continue_logits), hypernet_lambda = self.inner(new_inner_carry, new_current_data)
 
         outputs = {
             "logits": logits,
@@ -563,4 +565,4 @@ class RHN_ACTV1(nn.Module):
                     _, _, (next_q_halt_logits, next_q_continue_logits), _, _ = self.inner(new_inner_carry, new_current_data)
                     outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
 
-        return RHN_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs
+        return RHN_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs, hypernet_lambda
