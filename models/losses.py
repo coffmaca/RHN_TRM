@@ -55,7 +55,7 @@ class ACTLossHead(nn.Module):
     ) -> Tuple[Any, torch.Tensor, Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]], torch.Tensor]:
         # Model logits
         # B x SeqLen x D
-        new_carry, outputs, hypernet_lambda = self.model(**model_kwargs)
+        new_carry, outputs = self.model(**model_kwargs)
         labels = new_carry.current_data["labels"]
 
         with torch.no_grad():
@@ -79,8 +79,7 @@ class ACTLossHead(nn.Module):
                 "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
 
                 "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum(),
-                "steps":          torch.where(valid_metrics, new_carry.steps, 0).sum(),
-                "hypernet_lambda": hypernet_lambda,
+                "steps":          torch.where(valid_metrics, new_carry.steps, 0).sum()
             }
 
         # Losses
