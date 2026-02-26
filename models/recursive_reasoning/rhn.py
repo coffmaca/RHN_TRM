@@ -401,7 +401,6 @@ class RHN_ACTV1_Inner(nn.Module):
         with torch.no_grad():
             for _H_step in range(self.config.H_cycles-1):
                 for _L_step in range(self.config.L_cycles):
-                    hidden_states = hidden_states + input_embeddings
                     hidden_states, hidden_states_prior = self._dynamic_forward(hidden_states=hidden_states,
                                                                                hidden_states_prior=hidden_states_prior,
                                                                                input_embeddings=input_embeddings,
@@ -420,7 +419,7 @@ class RHN_ACTV1_Inner(nn.Module):
         # )
 
         for _L_step in range(self.config.L_cycles):
-            hidden_states = z_L + z_H + input_embeddings
+            hidden_states = z_L + z_H
             hidden_states, hidden_states_prior = self._dynamic_forward(hidden_states=hidden_states,
                                                                        hidden_states_prior=hidden_states_prior,
                                                                        input_embeddings=input_embeddings,
