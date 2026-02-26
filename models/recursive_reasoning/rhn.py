@@ -473,7 +473,7 @@ class RHN_ACTV1_Inner(nn.Module):
             hidden_states = layer(hidden_states=hidden_states, **seq_info)
             activations = torch.cat((activations, hidden_states.detach()),
                                     dim=2)  # TODO - Determine whether detaching is preferable here.
-        base_out = hidden_states.clone()
+        # base_out = hidden_states.clone()
 
         # Dynamic weight output
         hidden_states = hidden_states_prior + input_embeddings if input_embeddings is not None else hidden_states_prior
@@ -483,8 +483,8 @@ class RHN_ACTV1_Inner(nn.Module):
                              f"L_level.{i}" in layer_name]
             layer.set_dynamic_adapter(*layer_weights)
             hidden_states = layer(hidden_states=hidden_states, **seq_info)
-        dynamic_out = hidden_states
-        hidden_states = base_out + dynamic_out
+        # dynamic_out = hidden_states
+        # hidden_states = base_out + dynamic_out
         hidden_states_prior = hidden_states.clone()
 
         return hidden_states, hidden_states_prior
