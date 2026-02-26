@@ -346,6 +346,7 @@ class RHN_ACTV1_Inner(nn.Module):
 
         # Reasoning Layers
         self.L_level = torch.nn.ModuleList([RHN_ACTV1Block_Dynamic(self.config) for _i in range(self.config.L_layers)])
+        self.L_level.requires_grad_(False)
 
         # Hypernetwork
         self.layer_specs = []
@@ -358,8 +359,10 @@ class RHN_ACTV1_Inner(nn.Module):
         self.hypernet = RHN_Hypernetwork(self.config, self.layer_specs)
 
         # Initial states
-        self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
-        self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        # self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        # self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        self.H_init = nn.Buffer(torch.ones(self.config.hidden_size, dtype=self.forward_dtype), persistent=True)
+        self.L_init = nn.Buffer(torch.ones(self.config.hidden_size, dtype=self.forward_dtype), persistent=True)
 
         # Q head special init
         # Init Q to (almost) zero for faster learning during bootstrapping
@@ -412,50 +415,39 @@ class RHN_ACTV1_Inner(nn.Module):
         # Forward iterations
         it = 0
         z_H, z_L = carry.z_H, carry.z_L
-        hidden_states = hidden_states_prior = z_L + z_H
+        hidden_states = z_L + z_H
         # H_cycles-1 without grad
         with torch.no_grad():
+            _, activations = self._initial_forward(hidden_states=hidden_states,
+                                                   input_embeddings=input_embeddings,
+                                                   **seq_info)
             for _H_step in range(self.config.H_cycles-1):
                 for _L_step in range(self.config.L_cycles):
-                    hidden_states = hidden_states + input_embeddings
-                    hidden_states, hidden_states_prior = self._dynamic_forward(hidden_states=hidden_states,
-                                                                               hidden_states_prior=hidden_states_prior,
-                                                                               input_embeddings=input_embeddings,
-                                                                               **seq_info)
+                    hidden_states, activations = self._dynamic_forward(hidden_states=hidden_states,
+                                                                       activations=activations,
+                                                                       input_embeddings=input_embeddings,
+                                                                       **seq_info)
                 z_L = hidden_states
-                hidden_states = hidden_states_prior = z_H + z_L
-                hidden_states, hidden_states_prior = self._dynamic_forward(hidden_states=hidden_states,
-                                                                           hidden_states_prior=hidden_states_prior,
-                                                                           input_embeddings=None,
-                                                                           **seq_info)
+                hidden_states = z_H + z_L
+                hidden_states, activations = self._dynamic_forward(hidden_states=hidden_states,
+                                                                   activations=activations,
+                                                                   input_embeddings=None,
+                                                                   **seq_info)
                 z_H = hidden_states
-        # 1 with grad
-
-        # torch.cuda.memory._record_memory_history(
-        #     max_entries=100000
-        # )
 
         for _L_step in range(self.config.L_cycles):
             hidden_states = z_L + z_H + input_embeddings
-            hidden_states, hidden_states_prior = self._dynamic_forward(hidden_states=hidden_states,
-                                                                       hidden_states_prior=hidden_states_prior,
-                                                                       input_embeddings=input_embeddings,
-                                                                       **seq_info)
-
-        # try:
-        #     torch.cuda.memory._dump_snapshot(f"mem_prof1.pickle")
-        # except Exception as e:
-        #     print(f"Failed to capture memory snapshot {e}")
-        #
-        # # Stop recording memory snapshot history.
-        # torch.cuda.memory._record_memory_history(enabled=None)
+            hidden_states, activations = self._dynamic_forward(hidden_states=hidden_states,
+                                                               activations=activations,
+                                                               input_embeddings=input_embeddings,
+                                                               **seq_info)
 
         z_L = hidden_states
         hidden_states = z_H + z_L
-        hidden_states, hidden_states_prior = self._dynamic_forward(hidden_states=hidden_states,
-                                                                   hidden_states_prior=hidden_states_prior,
-                                                                   input_embeddings=None,
-                                                                   **seq_info)
+        hidden_states, activations = self._dynamic_forward(hidden_states=hidden_states,
+                                                           activations=activations,
+                                                           input_embeddings=None,
+                                                           **seq_info)
         z_H = hidden_states
 
         # LM Outputs
@@ -464,30 +456,29 @@ class RHN_ACTV1_Inner(nn.Module):
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
 
-    def _dynamic_forward(self, hidden_states, hidden_states_prior, input_embeddings=None, **seq_info):
+    def _initial_forward(self, hidden_states, input_embeddings=None, **seq_info):
         hidden_states = hidden_states + input_embeddings if input_embeddings is not None else hidden_states
         activations = torch.tensor([], dtype=hidden_states.dtype, device=hidden_states.device)
-        # Base model output
         for layer in self.L_level:
             layer.clear_dynamic_adapter()
             hidden_states = layer(hidden_states=hidden_states, **seq_info)
             activations = torch.cat((activations, hidden_states.detach()),
                                     dim=2)  # TODO - Determine whether detaching is preferable here.
-        base_out = hidden_states.clone()
 
-        # Dynamic weight output
-        hidden_states = hidden_states_prior + input_embeddings if input_embeddings is not None else hidden_states_prior
+        return hidden_states, activations
+
+    def _dynamic_forward(self, hidden_states, activations, input_embeddings=None, **seq_info):
+        hidden_states = hidden_states + input_embeddings if input_embeddings is not None else hidden_states
         dynamic_weights = self.hypernet(activations)
+        activations = torch.tensor([], dtype=hidden_states.dtype, device=hidden_states.device)
         for i, layer in enumerate(self.L_level):
             layer_weights = [dynamic_weights[layer_name] for layer_name in dynamic_weights if
                              f"L_level.{i}" in layer_name]
             layer.set_dynamic_adapter(*layer_weights)
             hidden_states = layer(hidden_states=hidden_states, **seq_info)
-        dynamic_out = hidden_states
-        hidden_states = base_out + dynamic_out
-        hidden_states_prior = hidden_states.clone()
-
-        return hidden_states, hidden_states_prior
+            activations = torch.cat((activations, hidden_states.detach()),
+                                    dim=2)  # TODO - Determine whether detaching is preferable here.
+        return hidden_states, activations
 
 
 
