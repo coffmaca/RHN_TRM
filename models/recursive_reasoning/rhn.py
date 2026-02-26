@@ -517,12 +517,18 @@ class RHN_ACTV1(nn.Module):
         
     def forward(self, carry: RHN_ACTV1Carry, batch: Dict[str, torch.Tensor]) -> Tuple[RHN_ACTV1Carry, Dict[str, torch.Tensor]]:
 
-        # Update data, carry (removing halted sequences)
-        new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
-        
-        new_steps = torch.where(carry.halted, 0, carry.steps)
+        # If (i) training or (ii) first pass of training or inference (i.e., when all samples are default halted)
+        if self.training or carry.halted.sum() == len(carry.halted):
+            # Update data, carry (removing halted sequences)
+            new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
 
-        new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
+            new_steps = torch.where(carry.halted, 0, carry.steps)
+
+            new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
+        else:
+            new_inner_carry = carry.inner_carry
+            new_steps = carry.steps
+            new_current_data = carry.current_data
 
         # Forward inner model
         new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
@@ -536,6 +542,7 @@ class RHN_ACTV1(nn.Module):
         with torch.no_grad():
             # Step
             new_steps = new_steps + 1
+
             is_last_step = new_steps >= self.config.halt_max_steps
             
             halted = is_last_step

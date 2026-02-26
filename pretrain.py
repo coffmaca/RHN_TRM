@@ -394,6 +394,7 @@ def evaluate(
 
             if rank == 0:
                 print(f"  Completed inference in {inference_steps} steps")
+                print(f"  Average steps per sample: {metrics["steps"] / global_batch_size}")
 
             for collection in (batch, preds):
                 for k, v in collection.items():
