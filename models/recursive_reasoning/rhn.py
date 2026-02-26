@@ -436,7 +436,7 @@ class RHN_ACTV1_Inner(nn.Module):
                 z_H = hidden_states
 
         for _L_step in range(self.config.L_cycles):
-            hidden_states = z_L + z_H + input_embeddings
+            hidden_states = z_L + z_H 
             hidden_states, activations = self._dynamic_forward(hidden_states=hidden_states,
                                                                activations=activations,
                                                                input_embeddings=input_embeddings,
