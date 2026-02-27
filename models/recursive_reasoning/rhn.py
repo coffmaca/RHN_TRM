@@ -25,6 +25,9 @@ class RHN_ACTV1InnerCarry:
 @dataclass
 class RHN_ACTV1Carry:
     inner_carry: RHN_ACTV1InnerCarry
+
+    inference_carry: Optional[torch.Tensor]
+    inference_active_indices: Optional[torch.Tensor]
     
     steps: torch.Tensor
     halted: torch.Tensor
@@ -508,6 +511,9 @@ class RHN_ACTV1(nn.Module):
 
         return RHN_ACTV1Carry(
             inner_carry=self.inner.empty_carry(batch_size),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
+
+            inference_carry=None,
+            inference_active_indices=None,
             
             steps=torch.zeros((batch_size, ), dtype=torch.int32),
             halted=torch.ones((batch_size, ), dtype=torch.bool),  # Default to halted
@@ -517,8 +523,8 @@ class RHN_ACTV1(nn.Module):
         
     def forward(self, carry: RHN_ACTV1Carry, batch: Dict[str, torch.Tensor]) -> Tuple[RHN_ACTV1Carry, Dict[str, torch.Tensor]]:
 
-        # If (i) training or (ii) first pass of training or inference (i.e., when all samples are default halted)
-        if self.training or carry.halted.sum() == len(carry.halted):
+        # If (i) training or (ii) first pass of inference (i.e., when all samples are default halted)
+        if self.training or carry.steps.sum() == 0:
             # Update data, carry (removing halted sequences)
             new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
 
@@ -527,7 +533,7 @@ class RHN_ACTV1(nn.Module):
             new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
         else:
             new_inner_carry = carry.inner_carry
-            new_steps = carry.steps
+            new_steps = carry.steps[carry.inference_carry["active"]]
             new_current_data = carry.current_data
 
         # Forward inner model
@@ -539,6 +545,22 @@ class RHN_ACTV1(nn.Module):
             "q_continue_logits": q_continue_logits
         }
 
+        # Initialize inference carries
+        if not self.training:
+            new_inference_carry = carry.inference_carry if carry.inference_carry is not None else {
+                "halted": torch.empty_like(carry.halted).fill_(False),
+                "active": torch.empty_like(carry.halted).fill_(True),
+                "logits": torch.empty_like(logits),
+                "steps": torch.empty_like(new_steps),
+                "q_halt_logits": torch.empty_like(q_halt_logits),
+                "q_continue_logits": torch.empty_like(q_continue_logits)
+            }
+            new_inference_active_indices = (carry.inference_active_indices if carry.inference_active_indices is not None
+                                            else torch.arange(logits.shape[0], device=logits.device))
+        else:
+            new_inference_carry = None
+            new_inference_active_indices = None
+
         with torch.no_grad():
             # Step
             new_steps = new_steps + 1
@@ -547,21 +569,19 @@ class RHN_ACTV1(nn.Module):
             
             halted = is_last_step
 
-            # if training, and ACT is enabled
-            # if self.training and (self.config.halt_max_steps > 1):
+            # If ACT is enabled
             if self.config.halt_max_steps > 1:
 
                 # Halt signal
-                # NOTE: During evaluation, always use max steps, this is to guarantee the same halting steps inside a batch for batching purposes
-                
                 if self.config.no_ACT_continue:
                     halted = halted | (q_halt_logits > 0)
                 else:
                     halted = halted | (q_halt_logits > q_continue_logits)
 
-                # Exploration
-                min_halt_steps = (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
-                halted = halted & (new_steps >= min_halt_steps)
+                # Exploration (Training Only)
+                if self.training:
+                    min_halt_steps = (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
+                    halted = halted & (new_steps >= min_halt_steps)
 
                 if not self.config.no_ACT_continue:
                     # Compute target Q
@@ -571,4 +591,39 @@ class RHN_ACTV1(nn.Module):
                     _, _, (next_q_halt_logits, next_q_continue_logits), _, _ = self.inner(new_inner_carry, new_current_data)
                     outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
 
-        return RHN_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs
+                # Freeze halted samples in separate tensor during inference
+                if not self.training:
+                    new_halted_indices = new_inference_active_indices[halted]
+                    active = ~halted
+
+                    # Save halted sample data to inference_carry and restore prior saved to outputs
+                    new_inference_carry["halted"][new_halted_indices] = halted[halted]
+                    new_inference_carry["active"][new_halted_indices] = ~halted[halted]
+                    new_inference_carry["logits"][new_halted_indices] = logits[halted]
+                    new_inference_carry["steps"][new_halted_indices] = new_steps[halted]
+                    new_inference_carry["q_halt_logits"][new_halted_indices] = q_halt_logits[halted]
+                    new_inference_carry["q_continue_logits"][new_halted_indices] = q_continue_logits[halted]
+                    output_logits = new_inference_carry["logits"]
+                    output_logits[new_inference_carry["active"]] = logits[active]
+                    outputs["logits"] = output_logits
+                    output_q_halt_logits = new_inference_carry["q_halt_logits"]
+                    output_q_halt_logits[new_inference_carry["active"]] = q_halt_logits[active]
+                    outputs["q_halt_logits"] = output_q_halt_logits
+                    output_q_continue_logits = new_inference_carry["q_continue_logits"]
+                    output_q_continue_logits[new_inference_carry["active"]] = q_continue_logits[active]
+                    outputs["q_continue_logits"] = output_q_continue_logits
+
+                    # Filter halted samples from data
+                    new_inner_carry.z_H = new_inner_carry.z_H[active]
+                    new_inner_carry.z_L = new_inner_carry.z_L[active]
+                    new_current_data["inputs"] = new_current_data["inputs"][active]
+                    # new_current_data["labels"] = new_current_data["labels"][active] # Skip labels - Need full batch to test full batch accuracy
+                    new_current_data["puzzle_identifiers"] = new_current_data["puzzle_identifiers"][active]
+
+                    new_inference_active_indices = new_inference_active_indices[active]
+                    halted = new_inference_carry["halted"]
+                    new_steps_updated = new_inference_carry["steps"]
+                    new_steps_updated[new_inference_carry["active"]] = new_steps[active]
+                    new_steps = new_steps_updated
+
+        return RHN_ACTV1Carry(new_inner_carry, new_inference_carry, new_inference_active_indices, new_steps, halted, new_current_data), outputs
