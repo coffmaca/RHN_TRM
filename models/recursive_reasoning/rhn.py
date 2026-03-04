@@ -138,13 +138,18 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
         )
         self.norm_eps = config.rms_norm_eps
 
-    def set_dynamic_adapter(self, params_attn_1, params_attn_2, params_up, params_down):
-        self.mlp.set_dynamic_adapter(params_up, params_down)
+    def set_dynamic_adapter(self, attn_1, attn_2, up, down):
+        A_up, B_up = up
+        A_down, B_down = down
+        self.mlp.set_dynamic_adapter(A_up, B_up, A_down, B_down)
+
+        A_attn_1, B_attn_1 = attn_1
+        A_attn_2, B_attn_2 = attn_2
 
         if self.config.mlp_t:
-            self.mlp_t.set_dynamic_adapter(params_attn_1, params_attn_2)
+            self.mlp_t.set_dynamic_adapter(A_attn_1, B_attn_1, A_attn_2, B_attn_2)
         else:
-            self.self_attn.set_dynamic_adapter(params_attn_1, params_attn_2)
+            self.self_attn.set_dynamic_adapter(A_attn_1, B_attn_1, A_attn_2, B_attn_2)
 
 
     def clear_dynamic_adapter(self):
@@ -225,15 +230,21 @@ class RHN_Hypernetwork(nn.Module):
         outputs_by_layer = {}
         output_index = 0
         for layer in self.config_per_layer:
-            dim_0, dim_1 = self.config_per_layer[layer]["shape"]
-            total_params = dim_0 * dim_1
+            shape = self.config_per_layer[layer]["shape"]
 
-            layer_params = outputs[:, output_index : output_index + total_params]
-            layer_params = layer_params.view(batch_size, dim_0, dim_1)
+            outputs_a = outputs[:, output_index : output_index + (shape[0] * self.config.hypernet_rank)]
+            outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
+            output_index += shape[0] * self.config.hypernet_rank
 
-            outputs_by_layer[layer] = layer_params
+            if self.config_per_layer[layer]["type"] == "matrix":
+                outputs_b = outputs[:, output_index : output_index + (shape[1] * self.config.hypernet_rank)]
+                outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
+                output_index += shape[1] * self.config.hypernet_rank
 
-            output_index += total_params
+            if self.config_per_layer[layer]["type"] == "vector":
+                outputs_by_layer[layer] = outputs_a
+            else:
+                outputs_by_layer[layer] = (outputs_a, outputs_b)
 
         return outputs_by_layer
 
@@ -260,7 +271,9 @@ class RHN_Hypernetwork(nn.Module):
             base_param_dim_sum += rows + cols
             base_param_total += rows * cols
 
-        self.output_dim = int(-(-base_param_total**(1/4)//1)) # Square root twice (i.e., 1/4th root) and round up
+        base_param_total_low_rank = base_param_dim_sum * self.config.hypernet_rank
+
+        self.output_dim = int(-(-base_param_total_low_rank**(1/4)//1)) # Square root twice (i.e., 1/4th root) and round up
 
         vals_to_generate = self.output_dim**2 * 2
 
