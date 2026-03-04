@@ -68,7 +68,9 @@ class RHN_ACTV1Config(BaseModel):
     hypernet_hidden_depth: int
     hypernet_rank: int
     layer_emb_dim: int
-    hypernet_relative_scale: int
+    hypernet_relative_scale: float
+    perceiver_rank: int
+    perceiver_heads: int
 
 class RHN_ACTV1Block(nn.Module):
     def __init__(self, config: RHN_ACTV1Config) -> None:
@@ -192,16 +194,20 @@ class RHN_Hypernetwork(nn.Module):
         self.embed_scale = math.sqrt(self.config.hypernet_hidden_size)
         embed_init_std = 1.0 / self.embed_scale
 
-        # self.token_sum_query = CastedParameter((1, 1, self.config.hidden_size * self.config.L_layers), init_std=embed_init_std,
-        #                                         cast_to=self.forward_dtype)
-        self.token_sum_query = nn.Parameter(
+        self.input_size = self.config.hidden_size * self.config.L_layers
+
+        self.perceiver_attn = nn.MultiheadAttention(
+            embed_dim=self.input_size,
+            num_heads=self.config.perceiver_heads,
+            batch_first=True,
+        ).to(dtype=self.forward_dtype)
+
+        self.perceiver_queries = nn.Parameter(
             trunc_normal_init_(
-                torch.empty((1, 1, self.config.hidden_size * self.config.L_layers), dtype=self.forward_dtype),
+                torch.empty((1, self.config.perceiver_rank, self.input_size), dtype=self.forward_dtype),
                 std=embed_init_std
             )
         )
-
-        self.input_size = self.config.hidden_size * self.config.L_layers
 
         # TODO - Consider alternative initialization to 0's.  Classes below have built-in LeCun Normal initialization.
         module_list = nn.ModuleList(
@@ -269,35 +275,49 @@ class RHN_Hypernetwork(nn.Module):
             rows, cols = layer[1]
             base_param_dim_sum += rows + cols
             base_param_total += rows * cols
-        vals_to_generate = base_param_dim_sum * self.config.hypernet_rank
-        hypernet_output_head_params = vals_to_generate * self.config.hypernet_hidden_size
-        reductions = 0
+        base_param_total_low_rank = base_param_dim_sum * self.config.hypernet_rank
+        vals_to_generate = base_param_total_low_rank
+        output_head_dim = math.ceil(vals_to_generate / self.config.perceiver_rank)
+        hypernet_output_head_params = output_head_dim * self.config.hypernet_hidden_size
+        max_hypernet_output_head_params = base_param_total * self.config.hypernet_relative_scale
+        self.reductions = 0
         self.intermediate_dims = []
-        while hypernet_output_head_params > base_param_total * self.config.hypernet_relative_scale:
-            reductions += 1
-            new_dim = int(-(-vals_to_generate**(1/2)//1))  # Square root and round up
-            vals_to_generate = new_dim * self.config.hypernet_rank * 2
-            hypernet_output_head_params = vals_to_generate * self.config.hypernet_hidden_size
-            self.intermediate_dims.insert(0, new_dim)
-        self.reductions = reductions
-        return vals_to_generate
+        if hypernet_output_head_params > max_hypernet_output_head_params:
+            output_head_dim = vals_to_generate
+            while hypernet_output_head_params > max_hypernet_output_head_params:
+                self.reductions += 1
+                new_dim = math.ceil(output_head_dim**(1/2))
+                self.intermediate_dims.insert(0, new_dim)
+                output_head_dim = new_dim * self.config.hypernet_rank * 2
+                hypernet_output_head_params = (output_head_dim / self.config.perceiver_rank) * self.config.hypernet_hidden_size
+            output_head_dim /= self.config.perceiver_rank
+        return int(output_head_dim)
 
     def _attention(self, inputs) -> torch.Tensor:
-        token_sum_query = self.token_sum_query.transpose(1, 2)
-        attn_logits = torch.matmul(inputs, token_sum_query)
-        attn_weights = F.softmax(attn_logits, dim=1)
-        pooled_inputs = torch.matmul(inputs.transpose(1, 2), attn_weights)
+        batch_size = inputs.shape[0]
+        queries = self.perceiver_queries.expand(batch_size, -1, -1) #.to(dtype=inputs.dtype)
+        attn_output, _ = self.perceiver_attn(
+            query=queries,
+            key=inputs,
+            value=inputs
+        )
 
-        return pooled_inputs.squeeze(2)
+        return attn_output
 
     def _expand_output(self, outputs) -> torch.Tensor:
-        for dim in self.intermediate_dims:
-            used_outputs_a = outputs[...,:dim * self.config.hypernet_rank]
-            used_outputs_a = used_outputs_a.unsqueeze(-1).view(-1, dim, self.config.hypernet_rank)
-            used_outputs_b = outputs[...,dim * self.config.hypernet_rank : dim * self.config.hypernet_rank * 2]
-            used_outputs_b = used_outputs_b.unsqueeze(-1).view(-1, self.config.hypernet_rank, dim)
+        for i, dim in enumerate(self.intermediate_dims):
+            if i==0:
+                used_outputs_a = outputs[..., :dim]
+                used_outputs_a = used_outputs_a.unsqueeze(-1).reshape(-1, dim, self.config.hypernet_rank)
+                used_outputs_b = outputs[..., dim: dim * 2]
+                used_outputs_b = used_outputs_b.unsqueeze(-1).reshape(-1, self.config.hypernet_rank, dim)
+            else:
+                used_outputs_a = outputs[...,:dim * self.config.hypernet_rank]
+                used_outputs_a = used_outputs_a.unsqueeze(-1).view(-1, dim, self.config.hypernet_rank)
+                used_outputs_b = outputs[...,dim * self.config.hypernet_rank : dim * self.config.hypernet_rank * 2]
+                used_outputs_b = used_outputs_b.unsqueeze(-1).view(-1, self.config.hypernet_rank, dim)
             expanded_outputs = torch.matmul(used_outputs_a, used_outputs_b)
-            outputs = expanded_outputs.flatten(start_dim=-2,end_dim=-1)
+            outputs = expanded_outputs.flatten(start_dim=-2, end_dim=-1)
         return outputs
 
 
