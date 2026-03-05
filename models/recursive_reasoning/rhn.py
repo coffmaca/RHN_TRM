@@ -377,7 +377,7 @@ class RHN_ACTV1_Inner(nn.Module):
         self.hypernet = RHN_Hypernetwork(self.config, self.layer_specs)
 
         # Initial states
-        self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hypernet_hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
         self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
 
         # Q head special init
