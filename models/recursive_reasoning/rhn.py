@@ -65,7 +65,6 @@ class RHN_ACTV1Config(BaseModel):
     no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
 
     hypernet_hidden_size: int
-    hypernet_hidden_depth: int
     hypernet_rank: int
     layer_emb_dim: int
     hypernet_relative_scale: float
@@ -78,21 +77,21 @@ class RHN_ACTV1Block(nn.Module):
 
         self.config = config
         if self.config.mlp_t:
-            self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
+            self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hypernet_hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
             self.mlp_t = SwiGLU(
                 hidden_size=self.config.seq_len + self.puzzle_emb_len, # L # TODO - Confirm reasoning for these values
                 expansion=config.expansion,
             )
         else:
             self.self_attn = Attention(
-                hidden_size=config.hidden_size,
-                head_dim=config.hidden_size // config.num_heads,
+                hidden_size=config.hypernet_hidden_size,
+                head_dim=config.hypernet_hidden_size // config.num_heads,
                 num_heads=config.num_heads,
                 num_key_value_heads=config.num_heads,
                 causal=False
             )
         self.mlp = SwiGLU(
-            hidden_size=config.hidden_size,
+            hidden_size=config.hypernet_hidden_size,
             expansion=config.expansion,
         )
         self.norm_eps = config.rms_norm_eps
@@ -210,15 +209,7 @@ class RHN_Hypernetwork(nn.Module):
         )
 
         # TODO - Consider alternative initialization to 0's.  Classes below have built-in LeCun Normal initialization.
-        module_list = nn.ModuleList(
-            [CastedLinear(self.input_size,
-                          self.config.hypernet_hidden_size,
-                          bias=False)] + \
-            [nn.SiLU()] + \
-            [SwiGLU(self.config.hypernet_hidden_size,
-                    self.config.expansion) for _ in range(self.config.hypernet_hidden_depth)]
-        )
-        self.hypernet_base = nn.Sequential(*module_list)
+        self.hypernet_base = nn.ModuleList([RHN_ACTV1Block(self.config) for _i in range(self.config.H_layers)])
 
         self.output_head = CastedLinear(self.config.hypernet_hidden_size,
                                          self._output_dim(layer_specs),
@@ -364,8 +355,16 @@ class RHN_ACTV1_Inner(nn.Module):
         else:
             pass
 
-        # Reasoning Layers
-        self.L_level = torch.nn.ModuleList([RHN_ACTV1Block_Dynamic(self.config) for _i in range(self.config.L_layers)])
+        # Base Model
+        # self.L_level = torch.nn.ModuleList([RHN_ACTV1Block_Dynamic(self.config) for _i in range(self.config.L_layers)])
+        self.L_level = DynamicSwiGLU(
+            hidden_size=config.hidden_size,
+            expansion=config.expansion
+        )
+
+        # Turn off Base Model training
+        for param in self.L_level.named_parameters():
+            param.requires_grad = False
 
         # Hypernetwork
         self.layer_specs = []
@@ -378,7 +377,7 @@ class RHN_ACTV1_Inner(nn.Module):
         self.hypernet = RHN_Hypernetwork(self.config, self.layer_specs)
 
         # Initial states
-        self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hypernet_hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
         self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
 
         # Q head special init
