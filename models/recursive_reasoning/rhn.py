@@ -491,8 +491,11 @@ class RHN_ACTV1_Inner(nn.Module):
         dynamic_weights = self.hypernet(activations=activations, **seq_info)
         activations = torch.tensor([], dtype=hidden_states.dtype, device=hidden_states.device)
         for i, layer in enumerate(self.L_level):
-            layer_weights = [dynamic_weights[layer_name] for layer_name in dynamic_weights if
-                             f"L_level.{i}" in layer_name]
+            layer_weights = []
+            for layer_name in dynamic_weights:
+                 if f"L_level.{i}" in layer_name:
+                     layer_weights.append(dynamic_weights[layer_name][0])
+                     layer_weights.append(dynamic_weights[layer_name][1])
             layer.set_dynamic_adapter(*layer_weights)
             hidden_states = layer(hidden_states)
             activations = torch.cat((activations, hidden_states.detach()),
