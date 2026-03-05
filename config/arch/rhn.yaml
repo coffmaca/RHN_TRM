@@ -10,7 +10,7 @@ H_cycles: 3
 L_cycles: 6
 
 H_layers: 2
-L_layers: 2
+L_layers: 1
 
 hidden_size: 512
 num_heads: 8  # min(2, hidden_size // 64)
