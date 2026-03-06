@@ -48,7 +48,8 @@ class DynamicCastedLinear(nn.Module):
                  bias: bool):
         super().__init__()
         # Truncated LeCun normal init
-        self.weight = nn.Parameter(trunc_normal_init_(torch.empty((out_features, in_features)), std=1.0 / (in_features ** 0.5)))
+        std = 1.0 / (in_features ** 0.5)
+        self.weight = nn.Parameter(trunc_normal_init_(torch.empty((out_features, in_features)), std=std))
         self.bias = None
         if bias:
             # Zero init bias
@@ -94,12 +95,12 @@ class CastedLinear(nn.Module):
     def __init__(self,
                  in_features: int,
                  out_features: int,
-                 bias: bool):
+                 bias: bool,
+                 std: float = None):
         super().__init__()
         # Truncated LeCun normal init
-        self.weight = nn.Parameter(
-            trunc_normal_init_(torch.empty((out_features, in_features)), std=1.0 / (in_features ** 0.5))
-        )
+        std = std if std is not None else 1.0 / (in_features ** 0.5)
+        self.weight = nn.Parameter(trunc_normal_init_(torch.empty((out_features, in_features)), std=std))
         self.bias = None
         if bias:
             # Zero init bias
