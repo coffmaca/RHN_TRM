@@ -145,11 +145,11 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
         self.norm_eps = config.rms_norm_eps
 
     def set_dynamic_adapter(self, up, down, attn_1=None, attn_2=None):
-        A_up, B_up = up
-        A_down, B_down = down
-        self.mlp.set_dynamic_adapter(A_up, B_up, A_down, B_down)
-
         if self.attn:
+            # Swap argument to correct assignments
+            up, attn_1 = attn_1, up
+            down, attn_2 = attn_2, down
+
             A_attn_1, B_attn_1 = attn_1
             A_attn_2, B_attn_2 = attn_2
 
@@ -157,6 +157,11 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
                 self.mlp_t.set_dynamic_adapter(A_attn_1, B_attn_1, A_attn_2, B_attn_2)
             else:
                 self.self_attn.set_dynamic_adapter(A_attn_1, B_attn_1, A_attn_2, B_attn_2)
+        A_up, B_up = up
+        A_down, B_down = down
+        self.mlp.set_dynamic_adapter(A_up, B_up, A_down, B_down)
+
+
 
 
     def clear_dynamic_adapter(self):
@@ -369,7 +374,7 @@ class RHN_ACTV1_Inner(nn.Module):
 
         # Base Model
         self.L_level = torch.nn.ModuleList(
-            [RHN_ACTV1Block_Dynamic(self.config, attn=True) for _i in range(self.config.L_layers)]
+            [RHN_ACTV1Block_Dynamic(self.config, attn=False) for _i in range(self.config.L_layers)]
         )
 
         # Turn off Base Model training
@@ -500,11 +505,6 @@ class RHN_ACTV1_Inner(nn.Module):
         for i, layer in enumerate(self.L_level):
             layer_weights = [dynamic_weights[layer_name] for layer_name in dynamic_weights if
                              f"L_level.{i}" in layer_name]
-            # layer_weights = []
-            # for layer_name in dynamic_weights:
-            #      if f"L_level.{i}" in layer_name:
-            #          layer_weights.append(dynamic_weights[layer_name][0])
-            #          layer_weights.append(dynamic_weights[layer_name][1])
             layer.set_dynamic_adapter(*layer_weights)
             hidden_states = layer(hidden_states=hidden_states, **seq_info)
             activations = torch.cat((activations, hidden_states.detach()),
