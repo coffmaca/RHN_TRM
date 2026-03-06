@@ -161,9 +161,6 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
         A_down, B_down = down
         self.mlp.set_dynamic_adapter(A_up, B_up, A_down, B_down)
 
-
-
-
     def clear_dynamic_adapter(self):
         self.mlp.clear_dynamic_adapter()
         if self.attn:
