@@ -72,24 +72,26 @@ class RHN_ACTV1Config(BaseModel):
     perceiver_heads: int
 
 class RHN_ACTV1Block(nn.Module):
-    def __init__(self, config: RHN_ACTV1Config) -> None:
+    def __init__(self, config: RHN_ACTV1Config, attn: bool = True) -> None:
         super().__init__()
 
         self.config = config
-        if self.config.mlp_t:
-            self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hypernet_hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
-            self.mlp_t = SwiGLU(
-                hidden_size=self.config.seq_len + self.puzzle_emb_len, # L # TODO - Confirm reasoning for these values
-                expansion=config.expansion,
-            )
-        else:
-            self.self_attn = Attention(
-                hidden_size=config.hypernet_hidden_size,
-                head_dim=config.hypernet_hidden_size // config.num_heads,
-                num_heads=config.num_heads,
-                num_key_value_heads=config.num_heads,
-                causal=False
-            )
+        self.attn = attn
+        if self.attn:
+            if self.config.mlp_t:
+                self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hypernet_hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
+                self.mlp_t = SwiGLU(
+                    hidden_size=self.config.seq_len + self.puzzle_emb_len, # L # TODO - Confirm reasoning for these values
+                    expansion=config.expansion,
+                )
+            else:
+                self.self_attn = Attention(
+                    hidden_size=config.hypernet_hidden_size,
+                    head_dim=config.hypernet_hidden_size // config.num_heads,
+                    num_heads=config.num_heads,
+                    num_key_value_heads=config.num_heads,
+                    causal=False
+                )
         self.mlp = SwiGLU(
             hidden_size=config.hypernet_hidden_size,
             expansion=config.expansion,
@@ -99,14 +101,15 @@ class RHN_ACTV1Block(nn.Module):
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
         # B, L, D = hidden_states.shape
         # Post Norm
-        if self.config.mlp_t:
-            hidden_states = hidden_states.transpose(1,2)
-            out = self.mlp_t(hidden_states)
-            hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
-            hidden_states = hidden_states.transpose(1,2)
-        else:
-            # Self Attention
-            hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states), variance_epsilon=self.norm_eps)
+        if self.attn:
+            if self.config.mlp_t:
+                hidden_states = hidden_states.transpose(1,2)
+                out = self.mlp_t(hidden_states)
+                hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
+                hidden_states = hidden_states.transpose(1,2)
+            else:
+                # Self Attention
+                hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states), variance_epsilon=self.norm_eps)
         # Fully Connected
         out = self.mlp(hidden_states)
         hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
@@ -114,62 +117,67 @@ class RHN_ACTV1Block(nn.Module):
 
 
 class RHN_ACTV1Block_Dynamic(nn.Module):
-    def __init__(self, config: RHN_ACTV1Config) -> None:
+    def __init__(self, config: RHN_ACTV1Config, attn: bool = True) -> None:
         super().__init__()
 
         self.config = config
-        if self.config.mlp_t:
-            self.puzzle_emb_len = -(
-                        self.config.puzzle_emb_ndim // -self.config.hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
-            self.mlp_t = DynamicSwiGLU(
-                hidden_size=self.config.seq_len + self.puzzle_emb_len,
-                expansion=config.expansion,
-            )
-        else:
-            self.self_attn = DynamicAttention(
-                hidden_size=config.hidden_size,
-                head_dim=config.hidden_size // config.num_heads,
-                num_heads=config.num_heads,
-                num_key_value_heads=config.num_heads,
-                causal=False
-            )
+        self.attn = attn
+        if self.attn:
+            if self.config.mlp_t:
+                self.puzzle_emb_len = -(
+                            self.config.puzzle_emb_ndim // -self.config.hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
+                self.mlp_t = DynamicSwiGLU(
+                    hidden_size=self.config.seq_len + self.puzzle_emb_len,
+                    expansion=config.expansion,
+                )
+            else:
+                self.self_attn = DynamicAttention(
+                    hidden_size=config.hidden_size,
+                    head_dim=config.hidden_size // config.num_heads,
+                    num_heads=config.num_heads,
+                    num_key_value_heads=config.num_heads,
+                    causal=False
+                )
         self.mlp = DynamicSwiGLU(
             hidden_size=config.hidden_size,
             expansion=config.expansion,
         )
         self.norm_eps = config.rms_norm_eps
 
-    def set_dynamic_adapter(self, attn_1, attn_2, up, down):
+    def set_dynamic_adapter(self, up, down, attn_1=None, attn_2=None):
         A_up, B_up = up
         A_down, B_down = down
         self.mlp.set_dynamic_adapter(A_up, B_up, A_down, B_down)
 
-        A_attn_1, B_attn_1 = attn_1
-        A_attn_2, B_attn_2 = attn_2
+        if self.attn:
+            A_attn_1, B_attn_1 = attn_1
+            A_attn_2, B_attn_2 = attn_2
 
-        if self.config.mlp_t:
-            self.mlp_t.set_dynamic_adapter(A_attn_1, B_attn_1, A_attn_2, B_attn_2)
-        else:
-            self.self_attn.set_dynamic_adapter(A_attn_1, B_attn_1, A_attn_2, B_attn_2)
+            if self.config.mlp_t:
+                self.mlp_t.set_dynamic_adapter(A_attn_1, B_attn_1, A_attn_2, B_attn_2)
+            else:
+                self.self_attn.set_dynamic_adapter(A_attn_1, B_attn_1, A_attn_2, B_attn_2)
 
 
     def clear_dynamic_adapter(self):
         self.mlp.clear_dynamic_adapter()
-        if self.config.mlp_t:
-            self.mlp_t.clear_dynamic_adapter()
-        else:
-            self.self_attn.clear_dynamic_adapter()
+        if self.attn:
+            if self.config.mlp_t:
+                self.mlp_t.clear_dynamic_adapter()
+            else:
+                self.self_attn.clear_dynamic_adapter()
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.config.mlp_t:
-            hidden_states = hidden_states.transpose(1, 2)
-            out = self.mlp_t(hidden_states)
-            hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
-            hidden_states = hidden_states.transpose(1, 2)
-        else:
-            # Self Attention
-            hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states),
-                                     variance_epsilon=self.norm_eps)
+        if self.attn:
+            if self.config.mlp_t:
+                hidden_states = hidden_states.transpose(1, 2)
+                out = self.mlp_t(hidden_states)
+                hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
+                hidden_states = hidden_states.transpose(1, 2)
+            else:
+                # Self Attention
+                hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states),
+                                         variance_epsilon=self.norm_eps)
         # Fully Connected
         out = self.mlp(hidden_states)
         hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
@@ -360,11 +368,9 @@ class RHN_ACTV1_Inner(nn.Module):
             pass
 
         # Base Model
-        # self.L_level = torch.nn.ModuleList([RHN_ACTV1Block_Dynamic(self.config) for _i in range(self.config.L_layers)])
-        self.L_level = nn.ModuleList([DynamicSwiGLU(
-            hidden_size=config.hidden_size,
-            expansion=config.expansion
-        ) for _i in range(self.config.L_layers)])
+        self.L_level = torch.nn.ModuleList(
+            [RHN_ACTV1Block_Dynamic(self.config, attn=False) for _i in range(self.config.L_layers)]
+        )
 
         # Turn off Base Model training
         for name, param in self.L_level.named_parameters():
@@ -439,7 +445,8 @@ class RHN_ACTV1_Inner(nn.Module):
         # H_cycles-1 without grad
         with torch.no_grad():
             _, activations = self._initial_forward(hidden_states=hidden_states,
-                                                   input_embeddings=input_embeddings)
+                                                   input_embeddings=input_embeddings,
+                                                   **seq_info)
             for _H_step in range(self.config.H_cycles-1):
                 for _L_step in range(self.config.L_cycles):
                     hidden_states, activations = self._dynamic_forward(hidden_states=hidden_states,
@@ -475,12 +482,12 @@ class RHN_ACTV1_Inner(nn.Module):
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
 
-    def _initial_forward(self, hidden_states, input_embeddings=None):
+    def _initial_forward(self, hidden_states, input_embeddings=None, **seq_info):
         hidden_states = hidden_states + input_embeddings if input_embeddings is not None else hidden_states
         activations = torch.tensor([], dtype=hidden_states.dtype, device=hidden_states.device)
         for layer in self.L_level:
             layer.clear_dynamic_adapter()
-            hidden_states = layer(hidden_states)
+            hidden_states = layer(hidden_states=hidden_states, **seq_info)
             activations = torch.cat((activations, hidden_states.detach()),
                                     dim=2)  # TODO - Determine whether detaching is preferable here.
 
@@ -491,13 +498,15 @@ class RHN_ACTV1_Inner(nn.Module):
         dynamic_weights = self.hypernet(activations=activations, **seq_info)
         activations = torch.tensor([], dtype=hidden_states.dtype, device=hidden_states.device)
         for i, layer in enumerate(self.L_level):
-            layer_weights = []
-            for layer_name in dynamic_weights:
-                 if f"L_level.{i}" in layer_name:
-                     layer_weights.append(dynamic_weights[layer_name][0])
-                     layer_weights.append(dynamic_weights[layer_name][1])
+            layer_weights = [dynamic_weights[layer_name] for layer_name in dynamic_weights if
+                             f"L_level.{i}" in layer_name]
+            # layer_weights = []
+            # for layer_name in dynamic_weights:
+            #      if f"L_level.{i}" in layer_name:
+            #          layer_weights.append(dynamic_weights[layer_name][0])
+            #          layer_weights.append(dynamic_weights[layer_name][1])
             layer.set_dynamic_adapter(*layer_weights)
-            hidden_states = layer(hidden_states)
+            hidden_states = layer(hidden_states=hidden_states, **seq_info)
             activations = torch.cat((activations, hidden_states.detach()),
                                     dim=2)  # TODO - Determine whether detaching is preferable here.
         return hidden_states, activations
