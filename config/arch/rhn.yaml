@@ -26,7 +26,7 @@ puzzle_emb_len: 16 # if non-zero, its specified to this value
 no_ACT_continue: True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
 
 hypernet_hidden_size: 512
-hypernet_hidden_depth: 2
+hypernet_depth: 3
 hypernet_rank: 32
 layer_emb_dim: 32
 hypernet_relative_scale: 2

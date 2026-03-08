@@ -65,7 +65,7 @@ class RHN_ACTV1Config(BaseModel):
     no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
 
     hypernet_hidden_size: int
-    hypernet_hidden_depth: int
+    hypernet_depth: int
     hypernet_rank: int
     layer_emb_dim: int
     hypernet_relative_scale: int
@@ -204,27 +204,31 @@ class RHN_Hypernetwork(nn.Module):
         self.input_size = self.config.hidden_size * self.config.L_layers
 
         # TODO - Consider alternative initialization to 0's.  Classes below have built-in LeCun Normal initialization.
-        module_list = nn.ModuleList(
+        self.hypernet_base = nn.ModuleList(
             [CastedLinear(self.input_size,
                           self.config.hypernet_hidden_size,
                           bias=False)] + \
             [nn.SiLU()] + \
-            [SwiGLU(self.config.hypernet_hidden_size,
-                    self.config.expansion) for _ in range(self.config.hypernet_hidden_depth)]
+            [RHN_ACTV1Block(self.config) for _i in range(self.config.hypernet_depth)]
         )
-        self.hypernet_base = nn.Sequential(*module_list)
+        # self.hypernet_base = nn.Sequential(*module_list)
 
         self.output_head = CastedLinear(self.config.hypernet_hidden_size,
                                          self._output_dim(layer_specs),
                                          bias=False)
 
-    def forward(self, activations: torch.Tensor) -> dict:
+    def forward(self, activations: torch.Tensor, **seq_info) -> dict:
         batch_size, seq_len, _ = activations.shape
 
-        inputs = self._attention(activations)
+        hidden_states = activations
 
-        outputs = self.hypernet_base(inputs)
-        outputs = self.output_head(outputs)
+        for i, layer in enumerate(self.hypernet_base):
+            if i in [0,1]:
+                hidden_states = layer(hidden_states)
+            else:
+                hidden_states = layer(hidden_states=hidden_states, **seq_info)
+
+        outputs = self.output_head(hidden_states)
         outputs = self._expand_output(outputs)
 
         outputs_by_layer = {}
@@ -263,24 +267,30 @@ class RHN_Hypernetwork(nn.Module):
             return True
 
     def _output_dim(self, layer_specs:dict) -> int:
+        seq_len = self.config.seq_len + self.config.puzzle_emb_len
         base_param_dim_sum = 0
         base_param_total = 0
         for layer in layer_specs:
             rows, cols = layer[1]
             base_param_dim_sum += rows + cols
             base_param_total += rows * cols
-        vals_to_generate = base_param_dim_sum * self.config.hypernet_rank
-        hypernet_output_head_params = vals_to_generate * self.config.hypernet_hidden_size
-        reductions = 0
+        base_param_total_low_rank = base_param_dim_sum * self.config.hypernet_rank
+        vals_to_generate = base_param_total_low_rank
+        output_head_dim = math.ceil(vals_to_generate / seq_len)
+        hypernet_output_head_params = output_head_dim * self.config.hypernet_hidden_size
+        max_hypernet_output_head_params = base_param_total * self.config.hypernet_relative_scale
+        self.reductions = 0
         self.intermediate_dims = []
-        while hypernet_output_head_params > base_param_total * self.config.hypernet_relative_scale:
-            reductions += 1
-            new_dim = int(-(-vals_to_generate**(1/2)//1))  # Square root and round up
-            vals_to_generate = new_dim * self.config.hypernet_rank * 2
-            hypernet_output_head_params = vals_to_generate * self.config.hypernet_hidden_size
-            self.intermediate_dims.insert(0, new_dim)
-        self.reductions = reductions
-        return vals_to_generate
+        if hypernet_output_head_params > max_hypernet_output_head_params:
+            output_head_dim = vals_to_generate
+            while hypernet_output_head_params > max_hypernet_output_head_params:
+                self.reductions += 1
+                new_dim = math.ceil(output_head_dim**(1/2))
+                self.intermediate_dims.insert(0, new_dim)
+                output_head_dim = new_dim * self.config.hypernet_rank * 2
+                hypernet_output_head_params = (output_head_dim / seq_len) * self.config.hypernet_hidden_size
+            output_head_dim /= seq_len
+        return int(output_head_dim)
 
     def _attention(self, inputs) -> torch.Tensor:
         token_sum_query = self.token_sum_query.transpose(1, 2)
@@ -291,13 +301,20 @@ class RHN_Hypernetwork(nn.Module):
         return pooled_inputs.squeeze(2)
 
     def _expand_output(self, outputs) -> torch.Tensor:
-        for dim in self.intermediate_dims:
-            used_outputs_a = outputs[...,:dim * self.config.hypernet_rank]
-            used_outputs_a = used_outputs_a.unsqueeze(-1).view(-1, dim, self.config.hypernet_rank)
-            used_outputs_b = outputs[...,dim * self.config.hypernet_rank : dim * self.config.hypernet_rank * 2]
-            used_outputs_b = used_outputs_b.unsqueeze(-1).view(-1, self.config.hypernet_rank, dim)
+        for i, dim in enumerate(self.intermediate_dims):
+            if i==0:
+                used_outputs_a = outputs[..., :dim]
+                used_outputs_a = used_outputs_a.unsqueeze(-1).reshape(-1, dim, self.config.hypernet_rank)
+                used_outputs_b = outputs[..., dim: dim * 2]
+                used_outputs_b = used_outputs_b.unsqueeze(-1).reshape(-1, self.config.hypernet_rank, dim)
+            else:
+                used_outputs_a = outputs[...,:dim * self.config.hypernet_rank]
+                used_outputs_a = used_outputs_a.unsqueeze(-1).view(-1, dim, self.config.hypernet_rank)
+                used_outputs_b = outputs[...,dim * self.config.hypernet_rank : dim * self.config.hypernet_rank * 2]
+                used_outputs_b = used_outputs_b.unsqueeze(-1).view(-1, self.config.hypernet_rank, dim)
             expanded_outputs = torch.matmul(used_outputs_a, used_outputs_b)
-            outputs = expanded_outputs.flatten(start_dim=-2,end_dim=-1)
+            outputs = expanded_outputs
+        outputs = outputs.flatten(start_dim=-2, end_dim=-1)
         return outputs
 
 
@@ -476,7 +493,7 @@ class RHN_ACTV1_Inner(nn.Module):
 
         # Dynamic weight output
         hidden_states = hidden_states_prior + input_embeddings if input_embeddings is not None else hidden_states_prior
-        dynamic_weights = self.hypernet(activations)
+        dynamic_weights = self.hypernet(activations=activations, **seq_info)
         for i, layer in enumerate(self.L_level):
             layer_weights = [dynamic_weights[layer_name] for layer_name in dynamic_weights if
                              f"L_level.{i}" in layer_name]
