@@ -228,8 +228,8 @@ class RHN_Hypernetwork(nn.Module):
     def forward(self, activations: torch.Tensor, **seq_info) -> dict:
         batch_size, seq_len, _ = activations.shape
 
-        # hidden_states = self._attention(activations)
-        hidden_states = activations
+        hidden_states = self._attention(activations)
+        # hidden_states = activations
 
         for layer in self.hypernet_base:
             hidden_states = layer(hidden_states=hidden_states, **seq_info)
