@@ -310,6 +310,8 @@ class RHN_Hypernetwork(nn.Module):
         return attn_output
 
     def _expand_output(self, outputs) -> torch.Tensor:
+        if len(self.intermediate_dims) == 0:
+            return outputs.flatten(start_dim=-2, end_dim=-1)
         for i, dim in enumerate(self.intermediate_dims):
             if i==0:
                 used_outputs_a = outputs[..., :dim]
