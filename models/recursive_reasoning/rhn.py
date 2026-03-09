@@ -290,7 +290,7 @@ class RHN_Hypernetwork(nn.Module):
                 self.intermediate_dims.insert(0, new_dim)
                 output_head_dim = new_dim * self.config.hypernet_rank * 2
                 hypernet_output_head_params = (output_head_dim / self.config.perceiver_rank) * self.config.hypernet_hidden_size
-            output_head_dim /= self.config.perceiver_rank
+            output_head_dim = math.ceil(output_head_dim / self.config.perceiver_rank)
         return int(output_head_dim)
 
     def _attention(self, inputs) -> torch.Tensor:
@@ -305,17 +305,15 @@ class RHN_Hypernetwork(nn.Module):
         return attn_output
 
     def _expand_output(self, outputs) -> torch.Tensor:
+        if len(self.intermediate_dims) == 0:
+            return outputs.flatten(start_dim=-2, end_dim=-1)
         for i, dim in enumerate(self.intermediate_dims):
             if i==0:
-                used_outputs_a = outputs[..., :dim]
-                used_outputs_a = used_outputs_a.unsqueeze(-1).reshape(-1, dim, self.config.hypernet_rank)
-                used_outputs_b = outputs[..., dim: dim * 2]
-                used_outputs_b = used_outputs_b.unsqueeze(-1).reshape(-1, self.config.hypernet_rank, dim)
-            else:
-                used_outputs_a = outputs[...,:dim * self.config.hypernet_rank]
-                used_outputs_a = used_outputs_a.unsqueeze(-1).view(-1, dim, self.config.hypernet_rank)
-                used_outputs_b = outputs[...,dim * self.config.hypernet_rank : dim * self.config.hypernet_rank * 2]
-                used_outputs_b = used_outputs_b.unsqueeze(-1).view(-1, self.config.hypernet_rank, dim)
+                outputs = outputs.flatten(start_dim=-2, end_dim=-1)
+            used_outputs_a = outputs[...,:dim * self.config.hypernet_rank]
+            used_outputs_a = used_outputs_a.unsqueeze(-1).view(-1, dim, self.config.hypernet_rank)
+            used_outputs_b = outputs[...,dim * self.config.hypernet_rank : dim * self.config.hypernet_rank * 2]
+            used_outputs_b = used_outputs_b.unsqueeze(-1).view(-1, self.config.hypernet_rank, dim)
             expanded_outputs = torch.matmul(used_outputs_a, used_outputs_b)
             outputs = expanded_outputs.flatten(start_dim=-2, end_dim=-1)
         return outputs
