@@ -218,8 +218,9 @@ class RHN_Hypernetwork(nn.Module):
             )
         )
 
-        # TODO - Consider alternative initialization to 0's.  Classes below have built-in LeCun Normal initialization.
-        self.hypernet_base = nn.ModuleList([RHN_ACTV1Block(self.config) for _i in range(self.config.H_layers)])
+        self.hypernet_base = nn.ModuleList(
+            [RHN_ACTV1Block(self.config, attn=False) for _i in range(self.config.H_layers)]
+        )
 
         self.output_head = CastedLinear(self.config.hypernet_hidden_size,
                                          self._output_dim(layer_specs),
@@ -272,7 +273,7 @@ class RHN_Hypernetwork(nn.Module):
             return True
 
     def _output_dim(self, layer_specs:dict) -> int:
-        seq_len = self.config.seq_len + self.config.puzzle_emb_len
+        # seq_len = self.config.seq_len + self.config.puzzle_emb_len
         base_param_dim_sum = 0
         base_param_total = 0
         for layer in layer_specs:
@@ -281,7 +282,7 @@ class RHN_Hypernetwork(nn.Module):
             base_param_total += rows * cols
         base_param_total_low_rank = base_param_dim_sum * self.config.hypernet_rank
         vals_to_generate = base_param_total_low_rank
-        output_head_dim = math.ceil(vals_to_generate / seq_len)
+        output_head_dim = math.ceil(vals_to_generate / self.config.perceiver_rank)
         hypernet_output_head_params = output_head_dim * self.config.hypernet_hidden_size
         max_hypernet_output_head_params = base_param_total * self.config.hypernet_relative_scale
         self.reductions = 0
@@ -293,8 +294,8 @@ class RHN_Hypernetwork(nn.Module):
                 new_dim = math.ceil(output_head_dim**(1/2))
                 self.intermediate_dims.insert(0, new_dim)
                 output_head_dim = new_dim * self.config.hypernet_rank * 2
-                hypernet_output_head_params = (output_head_dim / seq_len) * self.config.hypernet_hidden_size
-            output_head_dim /= seq_len
+                hypernet_output_head_params = (output_head_dim / self.config.perceiver_rank) * self.config.hypernet_hidden_size
+            output_head_dim /= self.config.perceiver_rank
         return int(output_head_dim)
 
     def _attention(self, inputs) -> torch.Tensor:
@@ -321,8 +322,7 @@ class RHN_Hypernetwork(nn.Module):
                 used_outputs_b = outputs[...,dim * self.config.hypernet_rank : dim * self.config.hypernet_rank * 2]
                 used_outputs_b = used_outputs_b.unsqueeze(-1).view(-1, self.config.hypernet_rank, dim)
             expanded_outputs = torch.matmul(used_outputs_a, used_outputs_b)
-            outputs = expanded_outputs
-        outputs = outputs.flatten(start_dim=-2, end_dim=-1)
+            outputs = expanded_outputs.flatten(start_dim=-2, end_dim=-1)
         return outputs
 
 
@@ -375,8 +375,8 @@ class RHN_ACTV1_Inner(nn.Module):
         )
 
         # Turn off Base Model training
-        for name, param in self.L_level.named_parameters():
-            param.requires_grad = False
+        # for name, param in self.L_level.named_parameters():
+        #     param.requires_grad = False
 
         # Hypernetwork
         self.layer_specs = []
