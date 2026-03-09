@@ -30,5 +30,4 @@ hypernet_hidden_depth: 2
 hypernet_rank: 32
 layer_emb_dim: 32
 hypernet_relative_scale: 2
-perceiver_rank: 32
-perceiver_heads: 8
+agg_attn_heads: 8

@@ -69,8 +69,7 @@ class RHN_ACTV1Config(BaseModel):
     hypernet_rank: int
     layer_emb_dim: int
     hypernet_relative_scale: float
-    perceiver_rank: int
-    perceiver_heads: int
+    agg_attn_heads: int
 
 class RHN_ACTV1Block(nn.Module):
     def __init__(self, config: RHN_ACTV1Config) -> None:
@@ -196,18 +195,18 @@ class RHN_Hypernetwork(nn.Module):
 
         self.input_size = self.config.hidden_size * self.config.L_layers
 
-        self.perceiver_attn = nn.MultiheadAttention(
+        self.agg_attn = nn.MultiheadAttention(
             embed_dim=self.input_size,
-            num_heads=self.config.perceiver_heads,
+            num_heads=self.config.agg_attn_heads,
             batch_first=True,
         ).to(dtype=self.forward_dtype)
 
-        self.perceiver_queries = nn.Parameter(
-            trunc_normal_init_(
-                torch.empty((1, self.config.perceiver_rank, self.input_size), dtype=self.forward_dtype),
-                std=embed_init_std
-            )
-        )
+        # self.perceiver_queries = nn.Parameter(
+        #     trunc_normal_init_(
+        #         torch.empty((1, self.config.perceiver_rank, self.input_size), dtype=self.forward_dtype),
+        #         std=embed_init_std
+        #     )
+        # )
 
         # TODO - Consider alternative initialization to 0's.  Classes below have built-in LeCun Normal initialization.
         module_list = nn.ModuleList(
@@ -269,6 +268,7 @@ class RHN_Hypernetwork(nn.Module):
             return True
 
     def _output_dim(self, layer_specs:dict) -> int:
+        seq_len = self.config.seq_len + self.config.puzzle_emb_len
         base_param_dim_sum = 0
         base_param_total = 0
         for layer in layer_specs:
@@ -277,7 +277,7 @@ class RHN_Hypernetwork(nn.Module):
             base_param_total += rows * cols
         base_param_total_low_rank = base_param_dim_sum * self.config.hypernet_rank
         vals_to_generate = base_param_total_low_rank
-        output_head_dim = math.ceil(vals_to_generate / self.config.perceiver_rank)
+        output_head_dim = math.ceil(vals_to_generate / seq_len)
         hypernet_output_head_params = output_head_dim * self.config.hypernet_hidden_size
         max_hypernet_output_head_params = base_param_total * self.config.hypernet_relative_scale
         self.reductions = 0
@@ -289,15 +289,13 @@ class RHN_Hypernetwork(nn.Module):
                 new_dim = math.ceil(output_head_dim**(1/2))
                 self.intermediate_dims.insert(0, new_dim)
                 output_head_dim = new_dim * self.config.hypernet_rank * 2
-                hypernet_output_head_params = (output_head_dim / self.config.perceiver_rank) * self.config.hypernet_hidden_size
-            output_head_dim = math.ceil(output_head_dim / self.config.perceiver_rank)
+                hypernet_output_head_params = (output_head_dim / seq_len) * self.config.hypernet_hidden_size
+            output_head_dim = math.ceil(output_head_dim / seq_len)
         return int(output_head_dim)
 
     def _attention(self, inputs) -> torch.Tensor:
-        batch_size = inputs.shape[0]
-        queries = self.perceiver_queries.expand(batch_size, -1, -1) #.to(dtype=inputs.dtype)
-        attn_output, _ = self.perceiver_attn(
-            query=queries,
+        attn_output, _ = self.agg_attn(
+            query=inputs,
             key=inputs,
             value=inputs
         )
