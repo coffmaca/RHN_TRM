@@ -81,7 +81,7 @@ class RHN_ACTV1Block(nn.Module):
             if self.config.mlp_t:
                 self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hypernet_hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
                 self.mlp_t = SwiGLU(
-                    hidden_size=self.config.seq_len + self.puzzle_emb_len, # L # TODO - Confirm reasoning for these values
+                    hidden_size= self.config.perceiver_rank, # self.config.seq_len + self.puzzle_emb_len,
                     expansion=config.expansion,
                 )
             else:
@@ -219,7 +219,7 @@ class RHN_Hypernetwork(nn.Module):
         )
 
         self.hypernet_base = nn.ModuleList(
-            [RHN_ACTV1Block(self.config, attn=False) for _i in range(self.config.H_layers)]
+            [RHN_ACTV1Block(self.config, attn=True) for _i in range(self.config.H_layers)]
         )
 
         self.output_head = CastedLinear(self.config.hypernet_hidden_size,
@@ -234,8 +234,8 @@ class RHN_Hypernetwork(nn.Module):
 
         for layer in self.hypernet_base:
             hidden_states = layer(hidden_states=hidden_states, **seq_info)
-        outputs = self.output_head(hidden_states)
-        outputs = self._expand_output(outputs)
+        outputs = self.output_head(hidden_states) # rms_norm(self.output_head(hidden_states), variance_epsilon=self.config.rms_norm_eps)
+        outputs = rms_norm(self._expand_output(outputs), variance_epsilon=self.config.rms_norm_eps)
 
         outputs_by_layer = {}
         output_index = 0
