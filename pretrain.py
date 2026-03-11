@@ -272,6 +272,11 @@ def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
     )
 
 
+def compute_ponder_weight(base_weight: float, warmup_steps: int, current_step: int) -> float:
+    if current_step >= warmup_steps:
+        return base_weight
+    return base_weight * (float(current_step) / float(max(1, warmup_steps)))
+
 
 def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetadata) -> List[Any]:
     data_paths =config.data_paths_test if len(config.data_paths_test)>0 else config.data_paths
@@ -299,8 +304,15 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         with torch.device("cuda"):
             train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
 
+    target_ponder_weight = getattr(config.arch.loss, "ponder_weight", 0.001)
+    ponder_warmup = round(config.lr_warmup_steps * 2)
+    current_ponder = compute_ponder_weight(target_ponder_weight, ponder_warmup, train_state.step)
+
     # Forward
-    train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
+    train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry,
+                                                               batch=batch,
+                                                               return_keys=[],
+                                                               current_ponder_weight=current_ponder)
 
     ((1 / global_batch_size) * loss).backward()
 
@@ -340,6 +352,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             reduced_metrics = {f"train/{k}": v / (global_batch_size if k.endswith("loss") else count) for k, v in reduced_metrics.items()}
 
             reduced_metrics["train/lr"] = lr_this_step
+            reduced_metrics["train/ponder_weight"] = current_ponder
             return reduced_metrics
 
 def evaluate(

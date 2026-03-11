@@ -2,6 +2,9 @@ name: recursive_reasoning.rhn@RHN_ACTV1
 loss:
   name: losses@ACTLossHead
   loss_type: stablemax_cross_entropy
+  ponder_weight: 0.001
+  lambda_outer_halt: 0.5
+  lambda_inner_halt: 0.5
 
 halt_exploration_prob: 0.1
 halt_max_steps: 16

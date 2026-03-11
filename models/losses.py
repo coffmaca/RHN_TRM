@@ -39,10 +39,14 @@ def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
 
 
 class ACTLossHead(nn.Module):
-    def __init__(self, model: nn.Module, loss_type: str):
+    def __init__(self, model: nn.Module, loss_type: str, ponder_weight: float = 0.001, lambda_outer_halt: float = 0.5,
+                 lambda_inner_halt: float = 0.5):
         super().__init__()
         self.model = model
         self.loss_fn = globals()[loss_type]
+        self.ponder_weight = ponder_weight
+        self.lambda_outer_halt = lambda_outer_halt
+        self.lambda_inner_halt = lambda_inner_halt
         
     def initial_carry(self, *args, **kwargs):
         return self.model.initial_carry(*args, **kwargs)  # type: ignore
@@ -50,7 +54,7 @@ class ACTLossHead(nn.Module):
     def forward(
         self,
         return_keys: Sequence[str],
-        # Model args
+        current_ponder_weight: Optional[float] = None,
         **model_kwargs,
     ) -> Tuple[Any, torch.Tensor, Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]], torch.Tensor]:
         # Model logits
@@ -67,11 +71,11 @@ class ACTLossHead(nn.Module):
             loss_counts = mask.sum(-1)
             loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)  # Avoid NaNs in division
 
-            is_correct = mask & (torch.argmax(outputs["logits"], dim=-1) == labels)
+            is_correct = mask & (outputs["preds"] == labels)
             seq_is_correct = is_correct.sum(-1) == loss_counts
             
             # Metrics (halted)
-            valid_metrics = new_carry.halted & (loss_counts > 0)
+            valid_metrics = loss_counts > 0
             metrics = {
                 "count": valid_metrics.sum(),
                 
@@ -79,25 +83,38 @@ class ACTLossHead(nn.Module):
                 "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
 
                 "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum(),
-                "steps":          torch.where(valid_metrics, new_carry.steps, 0).sum(),
             }
 
         # Losses
-
         lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
-        q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
+        q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"],
+                                                         seq_is_correct.to(outputs["q_halt_logits"].dtype),
+                                                         reduction="sum")
+
+        q_inner_logits = outputs["q_inner_logits"]
+        q_inner_masks = outputs["q_inner_masks"]
+        inner_targets = seq_is_correct.unsqueeze(1).expand_as(q_inner_logits).to(q_inner_logits.dtype)
+        raw_inner_bce = F.binary_cross_entropy_with_logits(q_inner_logits, inner_targets, reduction="none")
+        q_inner_loss = (raw_inner_bce * q_inner_masks.to(raw_inner_bce.dtype)).sum()
+
+        active_inner_steps = q_inner_masks.to(torch.float32).sum(dim=1)
+        ponder_weight = current_ponder_weight if current_ponder_weight is not None else self.ponder_weight
+        ponder_loss = ponder_weight * active_inner_steps.mean()
+
+        total_loss = lm_loss + self.lambda_outer_halt * q_halt_loss + self.lambda_inner_halt * q_inner_loss + ponder_loss
+
+
         metrics.update({
             "lm_loss": lm_loss.detach(),
             "q_halt_loss": q_halt_loss.detach(),
+            "q_inner_loss": q_inner_loss.detach(),
+            "ponder_loss": ponder_loss.detach(),
+            "avg_active_steps": active_inner_steps.mean().detach(),
+            "avg_h_steps": outputs["h_steps"].mean().detach()
         })
-        # Q continue (bootstrapping target loss); Alexia: This fits Q-learning, but seems totally unecessary
-        q_continue_loss = 0
-        if "target_q_continue" in outputs:
-            q_continue_loss = F.binary_cross_entropy_with_logits(outputs["q_continue_logits"], outputs["target_q_continue"], reduction="sum")
 
-            metrics["q_continue_loss"] = q_continue_loss.detach()
-        # Filter outputs for return
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
-        return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss), metrics, detached_outputs, new_carry.halted.all()
+        # Return True for halted because batch will always be completely finished
+        return new_carry, total_loss, metrics, detached_outputs, torch.tensor(True, device=labels.device)
 

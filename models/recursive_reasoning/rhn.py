@@ -61,7 +61,7 @@ class RHN_ACTV1Config(BaseModel):
     forward_dtype: str = "bfloat16"
 
     mlp_t: bool = False # use mlp on L instead of transformer
-    puzzle_emb_len: int = 16 # if non-zero, its specified to this value
+    puzzle_emb_len: int = 17 # if non-zero, its specified to this value
     no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
 
     hypernet_hidden_size: int
@@ -323,13 +323,22 @@ class RHN_ACTV1_Inner(nn.Module):
 
         self.embed_tokens = CastedEmbedding(self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
         self.lm_head      = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
-        self.q_head       = CastedLinear(self.config.hidden_size, 2, bias=True)
+
+        self.q_head_outer = CastedLinear(self.config.hidden_size, 2, bias=True)
+        self.q_head_inner = CastedLinear(self.config.hidden_size, 2, bias=True)
 
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)  if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len  # ceil div
         if self.config.puzzle_emb_ndim > 0:
             # Zero init puzzle embeddings
             self.puzzle_emb = CastedSparseEmbedding(self.config.num_puzzle_identifiers, self.config.puzzle_emb_ndim,
                                                     batch_size=self.config.batch_size, init_std=0, cast_to=self.forward_dtype)
+
+        self.outer_act_token = nn.Parameter(
+            trunc_normal_init_(torch.empty(1, 1, self.config.hidden_size, dtype=self.forward_dtype), std=embed_init_std)
+        )
+        self.inner_act_token = nn.Parameter(
+            trunc_normal_init_(torch.empty(1, 1, self.config.hidden_size, dtype=self.forward_dtype), std=embed_init_std)
+        )
 
         # LM Blocks
         if self.config.pos_encodings == "rope":
@@ -338,11 +347,9 @@ class RHN_ACTV1_Inner(nn.Module):
                                               base=self.config.rope_theta)
         elif self.config.pos_encodings == "learned":
             self.embed_pos = CastedEmbedding(self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
-        else:
-            pass
 
         # Reasoning Layers
-        self.L_level = torch.nn.ModuleList([RHN_ACTV1Block_Dynamic(self.config) for _i in range(self.config.L_layers)])
+        self.L_level = nn.ModuleList([RHN_ACTV1Block_Dynamic(self.config) for _i in range(self.config.L_layers)])
 
         # Hypernetwork
         self.layer_specs = []
@@ -361,12 +368,15 @@ class RHN_ACTV1_Inner(nn.Module):
         # Q head special init
         # Init Q to (almost) zero for faster learning during bootstrapping
         with torch.no_grad():
-            self.q_head.weight.zero_()
-            self.q_head.bias.fill_(-5)  # type: ignore
+            self.q_head_outer.weight.zero_()
+            self.q_head_outer.bias.fill_(-5)
+            self.q_head_inner.weight.zero_()
+            self.q_head_inner.bias.fill_(-5)
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # Token embedding
         embedding = self.embed_tokens(input.to(torch.int32))
+        batch_size = input.shape[0]
 
         # Puzzle embeddings
         if self.config.puzzle_emb_ndim > 0:
@@ -376,7 +386,18 @@ class RHN_ACTV1_Inner(nn.Module):
             if pad_count > 0:
                 puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
 
-            embedding = torch.cat((puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size), embedding), dim=-2)
+            puzzle_embedding = puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size)
+
+            outer_token_exp = self.outer_act_token.expand(batch_size, -1, -1)
+            inner_token_exp = self.inner_act_token.expand(batch_size, -1, -1)
+
+            puzzle_embedding = torch.cat((
+                outer_token_exp,
+                inner_token_exp,
+                puzzle_embedding[:, 2:, :]
+            ), dim=1)
+
+            embedding = torch.cat((puzzle_embedding, embedding), dim=-2)
 
         # Position embeddings
         if self.config.pos_encodings == "learned":
@@ -398,92 +419,161 @@ class RHN_ACTV1_Inner(nn.Module):
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
         )
 
-    def forward(self, carry: RHN_ACTV1InnerCarry, batch: Dict[str, torch.Tensor], **kwargs) -> Tuple[RHN_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    # TODO - Consider updating dynamic forward approach to work more like typical LoRA
+    # TODO - (i.e., by simply adding the dynamic weights to the base weights before running the forward pass).
+    # TODO - This way, you only need to execute one forward pass instead of 2.
+    def _dynamic_forward(self, z_L, z_H, dynamic_weights, input_embeddings=None, return_activations=False,
+                                 **seq_info):
+        # Base Pass
+        h_base = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
+        activations = torch.tensor([], dtype=z_H.dtype, device=z_H.device) if return_activations else None
+        for layer in self.L_level:
+            layer.clear_dynamic_adapter()
+            h_base = layer(hidden_states=h_base, **seq_info)
+            if return_activations:
+                activations = torch.cat((activations, h_base.detach()), dim=2)
+
+        # Dynamic Pass
+        h_dyn = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
+        for i, layer in enumerate(self.L_level):
+            layer_weights = [dynamic_weights[name] for name in dynamic_weights if f"L_level.{i}" in name]
+            layer.set_dynamic_adapter(*layer_weights)
+            h_dyn = layer(hidden_states=h_dyn, **seq_info)
+
+        return h_base + h_dyn, activations
+
+    def forward(self, carry: RHN_ACTV1InnerCarry, batch: Dict[str, torch.Tensor], **kwargs) -> Tuple[
+        RHN_ACTV1InnerCarry,
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
 
-        # Input encoding
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
 
-        # Forward iterations
-        it = 0
-        z_H, z_L = carry.z_H, carry.z_L
-        hidden_states = hidden_states_prior = z_L + z_H
-        # H_cycles-1 without grad
-        with torch.no_grad():
-            for _H_step in range(self.config.H_cycles-1):
-                for _L_step in range(self.config.L_cycles):
-                    hidden_states, hidden_states_prior = self._dynamic_forward(hidden_states=hidden_states,
-                                                                               hidden_states_prior=hidden_states_prior,
-                                                                               input_embeddings=input_embeddings,
-                                                                               **seq_info)
-                z_L = hidden_states
-                hidden_states = hidden_states_prior = z_H + z_L
-                hidden_states, hidden_states_prior = self._dynamic_forward(hidden_states=hidden_states,
-                                                                           hidden_states_prior=hidden_states_prior,
-                                                                           input_embeddings=None,
-                                                                           **seq_info)
-                z_H = hidden_states
-        # 1 with grad
+        batch_size = carry.z_H.shape[0]
+        device = carry.z_H.device
 
-        # torch.cuda.memory._record_memory_history(
-        #     max_entries=100000
-        # )
+        # Initialize completed sample tracking tensors
+        final_z_H = torch.empty_like(carry.z_H)
+        final_z_L = torch.empty_like(carry.z_L)
+        final_q_outer = torch.zeros(batch_size, 2, dtype=torch.float32, device=device)
 
-        for _L_step in range(self.config.L_cycles):
-            hidden_states = z_L + z_H
-            hidden_states, hidden_states_prior = self._dynamic_forward(hidden_states=hidden_states,
-                                                                       hidden_states_prior=hidden_states_prior,
-                                                                       input_embeddings=input_embeddings,
-                                                                       **seq_info)
+        active_idx = torch.arange(batch_size, device=device)
+        h_steps = torch.zeros(batch_size, dtype=torch.float32, device=device)
 
-        # try:
-        #     torch.cuda.memory._dump_snapshot(f"mem_prof1.pickle")
-        # except Exception as e:
-        #     print(f"Failed to capture memory snapshot {e}")
-        #
-        # # Stop recording memory snapshot history.
-        # torch.cuda.memory._record_memory_history(enabled=None)
+        max_total_inner_steps = self.config.H_cycles * self.config.L_cycles
+        global_q_inner = torch.zeros((batch_size, max_total_inner_steps), dtype=torch.float32, device=device)
+        global_inner_masks = torch.zeros((batch_size, max_total_inner_steps), dtype=torch.bool, device=device)
+        inner_step_counter = 0
 
-        z_L = hidden_states
-        hidden_states = z_H + z_L
-        hidden_states, hidden_states_prior = self._dynamic_forward(hidden_states=hidden_states,
-                                                                   hidden_states_prior=hidden_states_prior,
-                                                                   input_embeddings=None,
-                                                                   **seq_info)
-        z_H = hidden_states
+        z_H = carry.z_H.detach()
+        z_L = carry.z_L.detach()
 
-        # LM Outputs
-        new_carry = RHN_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
-        output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
-        q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
-        return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
-
-    def _dynamic_forward(self, hidden_states, hidden_states_prior, input_embeddings=None, **seq_info):
-        hidden_states = hidden_states + input_embeddings if input_embeddings is not None else hidden_states
-        activations = torch.tensor([], dtype=hidden_states.dtype, device=hidden_states.device)
-        # Base model output
+        activations = torch.tensor([], dtype=z_H.dtype, device=device)
         for layer in self.L_level:
             layer.clear_dynamic_adapter()
-            hidden_states = layer(hidden_states=hidden_states, **seq_info)
-            activations = torch.cat((activations, hidden_states.detach()),
-                                    dim=2)  # TODO - Determine whether detaching is preferable here.
-        base_out = hidden_states.clone()
+            temp_z_L = layer(hidden_states=z_L + z_H + input_embeddings, **seq_info)
+            activations = torch.cat((activations, temp_z_L.detach()), dim=2)
 
-        # Dynamic weight output
-        hidden_states = hidden_states_prior + input_embeddings if input_embeddings is not None else hidden_states_prior
-        dynamic_weights = self.hypernet(activations)
-        for i, layer in enumerate(self.L_level):
-            layer_weights = [dynamic_weights[layer_name] for layer_name in dynamic_weights if
-                             f"L_level.{i}" in layer_name]
-            layer.set_dynamic_adapter(*layer_weights)
-            hidden_states = layer(hidden_states=hidden_states, **seq_info)
-        dynamic_out = hidden_states
-        hidden_states = base_out + dynamic_out
-        hidden_states_prior = hidden_states.clone()
+        for h in range(self.config.H_cycles):
+            if active_idx.numel() == 0:
+                break
 
-        return hidden_states, hidden_states_prior
+            # Given dynamic halting, using detach() implements truncated BPTT on a per-sample basis,
+            # retaining the gradient tracking for only the last H_cycle iteration
+            z_H = z_H.detach()
+            z_L = z_L.detach()
+
+            h_steps[active_idx] += 1.0
+
+            dynamic_weights = self.hypernet(activations)  # TODO - Consider passing current L_level output instead of activations
+
+            inner_halted = torch.zeros(active_idx.numel(), dtype=torch.bool, device=device)
+
+            for l in range(self.config.L_cycles):
+                active_mask = ~inner_halted
+                if not active_mask.any():
+                    break
+
+                new_z_L, _ = self._dynamic_forward(
+                    z_L=z_L,
+                    z_H=z_H,
+                    dynamic_weights=dynamic_weights,
+                    input_embeddings=input_embeddings,
+                    **seq_info
+                )
+
+                q_inner_logits = self.q_head_inner(new_z_L[:, 1]).to(torch.float32)
+
+                if self.training:
+                    # Probabilistic exploration using Bernoulli distribution
+                    halt_probs = torch.sigmoid(q_inner_logits[..., 0])
+                    new_inner_halt = torch.bernoulli(halt_probs).to(torch.bool)
+                else:
+                    new_inner_halt = q_inner_logits[..., 0] > 0
+
+                global_q_inner[active_idx, inner_step_counter] = q_inner_logits[..., 0]
+                global_inner_masks[active_idx, inner_step_counter] = active_mask
+
+                active_mask_exp = active_mask.view(-1, 1, 1)
+                z_L = torch.where(active_mask_exp, new_z_L, z_L)
+
+                inner_halted = inner_halted | (new_inner_halt & active_mask)
+
+            # Final L_level forward pass to update z_H and return new activations
+            new_z_H, activations = self._dynamic_forward(
+                z_L=z_L,
+                z_H=z_H,
+                dynamic_weights=dynamic_weights,
+                input_embeddings=None,
+                return_activations=True,
+                **seq_info
+            )
+
+            q_outer = self.q_head_outer(new_z_H[:, 0]).to(torch.float32)
+            final_q_outer[active_idx] = q_outer
+
+            if self.training:
+                # Probabilistic exploration using Bernoulli distribution
+                halt_probs = torch.sigmoid(q_outer[..., 0])
+                new_outer_halt = torch.bernoulli(halt_probs).to(torch.bool)
+            else:
+                new_outer_halt = q_outer[..., 0] > 0
+
+            halting_global_idx = active_idx[new_outer_halt]
+            final_z_H[halting_global_idx] = new_z_H[new_outer_halt]
+            final_z_L[halting_global_idx] = new_z_L[new_outer_halt]
+
+            keep_mask = ~new_outer_halt
+
+            z_L = new_z_L[keep_mask]
+            z_H = new_z_H[keep_mask]
+            input_embeddings = input_embeddings[keep_mask] if input_embeddings is not None else None
+
+            activations = activations[keep_mask]
+
+            active_idx = active_idx[keep_mask]
+
+        # Fallback for never-halted samples
+        if active_idx.numel() > 0:
+            final_z_H[active_idx] = z_H
+            final_z_L[active_idx] = z_L
+
+        new_carry = RHN_ACTV1InnerCarry(z_H=final_z_H.detach(), z_L=final_z_L.detach())
+        output = self.lm_head(final_z_H)[:, self.puzzle_emb_len:]
+
+        if inner_step_counter > 0:
+            stacked_q_inner = global_q_inner[:, :inner_step_counter]
+            stacked_inner_masks = global_inner_masks[:, :inner_step_counter]
+        else:
+            stacked_q_inner = torch.empty((batch_size, 0), dtype=torch.float32, device=device)
+            stacked_inner_masks = torch.empty((batch_size, 0), dtype=torch.bool, device=device)
+
+        return new_carry, output, (final_q_outer[..., 0], final_q_outer[..., 1], stacked_q_inner, stacked_inner_masks,
+                                   h_steps)
 
 
 
@@ -501,6 +591,7 @@ class RHN_ACTV1(nn.Module):
 
     def initial_carry(self, batch: Dict[str, torch.Tensor]):
         batch_size = batch["inputs"].shape[0]
+        device = batch["inputs"].device
 
         return RHN_ACTV1Carry(
             inner_carry=self.inner.empty_carry(batch_size),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
@@ -508,55 +599,39 @@ class RHN_ACTV1(nn.Module):
             steps=torch.zeros((batch_size, ), dtype=torch.int32),
             halted=torch.ones((batch_size, ), dtype=torch.bool),  # Default to halted
             
-            current_data={k: torch.empty_like(v) for k, v in batch.items()}
+            current_data=batch
         )
         
-    def forward(self, carry: RHN_ACTV1Carry, batch: Dict[str, torch.Tensor]) -> Tuple[RHN_ACTV1Carry, Dict[str, torch.Tensor]]:
+    def forward(self, carry: RHN_ACTV1Carry, batch: Dict[str, torch.Tensor], **kwargs) -> Tuple[
+        RHN_ACTV1Carry,
+        Dict[str, torch.Tensor]
+    ]:
+        batch_size = batch["inputs"].shape[0]
+        device = batch["inputs"].device
 
         # Update data, carry (removing halted sequences)
-        new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
+        reset_flag = torch.ones(batch_size, dtype=torch.bool, device=device) # Carry will now always require complete data replacement
+        new_inner_carry = self.inner.reset_carry(reset_flag, carry.inner_carry)
         
-        new_steps = torch.where(carry.halted, 0, carry.steps)
-
-        new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
-
         # Forward inner model
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
+        new_inner_carry, logits, inner_outputs = self.inner(new_inner_carry, batch, **kwargs)
+
+        q_halt_logits, q_continue_logits, q_inner_logits, q_inner_masks, h_steps = inner_outputs
 
         outputs = {
             "logits": logits,
             "q_halt_logits": q_halt_logits,
-            "q_continue_logits": q_continue_logits
+            "q_continue_logits": q_continue_logits,
+            "q_inner_logits": q_inner_logits,
+            "q_inner_masks": q_inner_masks,
+            "h_steps": h_steps
         }
 
-        with torch.no_grad():
-            # Step
-            new_steps = new_steps + 1
-            is_last_step = new_steps >= self.config.halt_max_steps
-            
-            halted = is_last_step
+        final_carry = RHN_ACTV1Carry(
+            inner_carry=new_inner_carry,
+            steps=h_steps,
+            halted=torch.ones(batch_size, dtype=torch.bool, device=device), # All samples will now always be halted
+            current_data=batch
+        )
 
-            # if training, and ACT is enabled
-            if self.training and (self.config.halt_max_steps > 1):
-
-                # Halt signal
-                # NOTE: During evaluation, always use max steps, this is to guarantee the same halting steps inside a batch for batching purposes
-                
-                if self.config.no_ACT_continue:
-                    halted = halted | (q_halt_logits > 0)
-                else:
-                    halted = halted | (q_halt_logits > q_continue_logits)
-
-                # Exploration
-                min_halt_steps = (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
-                halted = halted & (new_steps >= min_halt_steps)
-
-                if not self.config.no_ACT_continue:
-                    # Compute target Q
-                    # NOTE: No replay buffer and target networks for computing target Q-value.
-                    # As batch_size is large, there're many parallel envs.
-                    # Similar concept as PQN https://arxiv.org/abs/2407.04811
-                    _, _, (next_q_halt_logits, next_q_continue_logits), _, _ = self.inner(new_inner_carry, new_current_data)
-                    outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
-
-        return RHN_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs
+        return final_carry, outputs
