@@ -517,6 +517,7 @@ class RHN_ACTV1_Inner(nn.Module):
 
                 global_q_inner[active_idx, inner_step_counter] = q_inner_logits[..., 0]
                 global_inner_masks[active_idx, inner_step_counter] = active_mask
+                inner_step_counter += 1
 
                 active_mask_exp = active_mask.view(-1, 1, 1)
                 z_L = torch.where(active_mask_exp, new_z_L, z_L)

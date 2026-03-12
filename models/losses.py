@@ -99,7 +99,7 @@ class ACTLossHead(nn.Module):
 
         active_inner_steps = q_inner_masks.to(torch.float32).sum(dim=1)
         ponder_weight = current_ponder_weight if current_ponder_weight is not None else self.ponder_weight
-        ponder_loss = ponder_weight * active_inner_steps.mean()
+        ponder_loss = ponder_weight * active_inner_steps.sum()
 
         total_loss = lm_loss + self.lambda_outer_halt * q_halt_loss + self.lambda_inner_halt * q_inner_loss + ponder_loss
 
@@ -109,8 +109,8 @@ class ACTLossHead(nn.Module):
             "q_halt_loss": q_halt_loss.detach(),
             "q_inner_loss": q_inner_loss.detach(),
             "ponder_loss": ponder_loss.detach(),
-            "avg_active_steps": active_inner_steps.mean().detach(),
-            "avg_h_steps": outputs["h_steps"].mean().detach()
+            "l*h_steps": active_inner_steps.sum().detach(),
+            "h_steps": outputs["h_steps"].sum().detach()
         })
 
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
