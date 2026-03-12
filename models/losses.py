@@ -75,7 +75,7 @@ class ACTLossHead(nn.Module):
             seq_is_correct = is_correct.sum(-1) == loss_counts
             
             # Metrics (halted)
-            valid_metrics = loss_counts > 0
+            valid_metrics = new_carry.halted & (loss_counts > 0)
             metrics = {
                 "count": valid_metrics.sum(),
                 
@@ -109,12 +109,12 @@ class ACTLossHead(nn.Module):
             "q_halt_loss": q_halt_loss.detach(),
             "q_inner_loss": q_inner_loss.detach(),
             "ponder_loss": ponder_loss.detach(),
-            "l*h_steps": active_inner_steps.sum().detach(),
-            "h_steps": outputs["h_steps"].sum().detach()
+            "l*h_steps": torch.where(valid_metrics, new_carry.inner_carry.cumulative_l_h_steps, 0).sum().detach(),
+            "h_steps": torch.where(valid_metrics, new_carry.inner_carry.cumulative_h_steps, 0).sum().detach(),
+            "steps": torch.where(valid_metrics, new_carry.steps, 0).sum().detach()
         })
 
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
-        # Return True for halted because batch will always be completely finished
-        return new_carry, total_loss, metrics, detached_outputs, torch.tensor(True, device=labels.device)
+        return new_carry, total_loss, metrics, detached_outputs, new_carry.halted.all()
 

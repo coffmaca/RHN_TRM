@@ -20,6 +20,8 @@ IGNORE_LABEL_ID = -100
 class RHN_ACTV1InnerCarry:
     z_H: torch.Tensor
     z_L: torch.Tensor
+    cumulative_h_steps: torch.Tensor
+    cumulative_l_h_steps: torch.Tensor
 
 
 @dataclass
@@ -408,15 +410,22 @@ class RHN_ACTV1_Inner(nn.Module):
         return self.embed_scale * embedding
 
     def empty_carry(self, batch_size: int):
+        device = self.H_init.device
         return RHN_ACTV1InnerCarry(
-            z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
-            z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size,
+                            dtype=self.forward_dtype, device=device),
+            z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size,
+                            dtype=self.forward_dtype, device=device),
+            cumulative_h_steps=torch.zeros(batch_size, dtype=torch.float32, device=device),
+            cumulative_l_h_steps=torch.zeros(batch_size, dtype=torch.float32, device=device)
         )
         
     def reset_carry(self, reset_flag: torch.Tensor, carry: RHN_ACTV1InnerCarry):
         return RHN_ACTV1InnerCarry(
             z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
+            cumulative_h_steps=torch.where(reset_flag, 0.0, carry.cumulative_h_steps),
+            cumulative_l_h_steps=torch.where(reset_flag, 0.0, carry.cumulative_l_h_steps)
         )
 
     # TODO - Consider updating dynamic forward approach to work more like typical LoRA
@@ -445,7 +454,7 @@ class RHN_ACTV1_Inner(nn.Module):
     def forward(self, carry: RHN_ACTV1InnerCarry, batch: Dict[str, torch.Tensor], **kwargs) -> Tuple[
         RHN_ACTV1InnerCarry,
         torch.Tensor,
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
     ]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
@@ -463,6 +472,8 @@ class RHN_ACTV1_Inner(nn.Module):
 
         active_idx = torch.arange(batch_size, device=device)
         h_steps = torch.zeros(batch_size, dtype=torch.float32, device=device)
+
+        chunk_halted = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
         max_total_inner_steps = self.config.H_cycles * self.config.L_cycles
         global_q_inner = torch.zeros((batch_size, max_total_inner_steps), dtype=torch.float32, device=device)
@@ -545,6 +556,7 @@ class RHN_ACTV1_Inner(nn.Module):
                 new_outer_halt = q_outer[..., 0] > 0
 
             halting_global_idx = active_idx[new_outer_halt]
+            chunk_halted[halting_global_idx] = True
             final_z_H[halting_global_idx] = new_z_H[new_outer_halt]
             final_z_L[halting_global_idx] = new_z_L[new_outer_halt]
 
@@ -563,18 +575,29 @@ class RHN_ACTV1_Inner(nn.Module):
             final_z_H[active_idx] = z_H
             final_z_L[active_idx] = z_L
 
-        new_carry = RHN_ACTV1InnerCarry(z_H=final_z_H.detach(), z_L=final_z_L.detach())
-        output = self.lm_head(final_z_H)[:, self.puzzle_emb_len:]
-
         if inner_step_counter > 0:
             stacked_q_inner = global_q_inner[:, :inner_step_counter]
             stacked_inner_masks = global_inner_masks[:, :inner_step_counter]
+            current_l_h_steps = stacked_inner_masks.to(torch.float32).sum(dim=1)
         else:
             stacked_q_inner = torch.empty((batch_size, 0), dtype=torch.float32, device=device)
             stacked_inner_masks = torch.empty((batch_size, 0), dtype=torch.bool, device=device)
+            current_l_h_steps = torch.zeros(batch_size, dtype=torch.float32, device=device)
+
+        new_cumulative_h_steps = carry.cumulative_h_steps + h_steps
+        new_cumulative_l_h_steps = carry.cumulative_l_h_steps + current_l_h_steps
+
+        new_carry = RHN_ACTV1InnerCarry(
+            z_H=final_z_H.detach(),
+            z_L=final_z_L.detach(),
+            cumulative_h_steps=new_cumulative_h_steps.detach(),
+            cumulative_l_h_steps=new_cumulative_l_h_steps.detach()
+        )
+
+        output = self.lm_head(final_z_H)[:, self.puzzle_emb_len:]
 
         return new_carry, output, (final_q_outer[..., 0], final_q_outer[..., 1], stacked_q_inner, stacked_inner_masks,
-                                   h_steps)
+                                   h_steps, chunk_halted)
 
 
 
@@ -597,27 +620,26 @@ class RHN_ACTV1(nn.Module):
         return RHN_ACTV1Carry(
             inner_carry=self.inner.empty_carry(batch_size),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
             
-            steps=torch.zeros((batch_size, ), dtype=torch.int32),
-            halted=torch.ones((batch_size, ), dtype=torch.bool),  # Default to halted
+            steps=torch.zeros((batch_size, ), dtype=torch.float32, device=device),
+            halted=torch.ones((batch_size, ), dtype=torch.bool, device=device),  # Default to halted
             
-            current_data=batch
+            current_data={k: torch.empty_like(v) for k, v in batch.items()}
         )
         
     def forward(self, carry: RHN_ACTV1Carry, batch: Dict[str, torch.Tensor], **kwargs) -> Tuple[
         RHN_ACTV1Carry,
         Dict[str, torch.Tensor]
     ]:
-        batch_size = batch["inputs"].shape[0]
-        device = batch["inputs"].device
+        new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
+        new_steps = torch.where(carry.halted, 0.0, carry.steps)
+        new_current_data = {
+            k: torch.where(carry.halted.view((-1,) + (1,) * (batch[k].ndim - 1)), batch[k], v)
+            for k, v in carry.current_data.items()
+        }
 
-        # Update data, carry (removing halted sequences)
-        reset_flag = torch.ones(batch_size, dtype=torch.bool, device=device) # Carry will now always require complete data replacement
-        new_inner_carry = self.inner.reset_carry(reset_flag, carry.inner_carry)
-        
-        # Forward inner model
-        new_inner_carry, logits, inner_outputs = self.inner(new_inner_carry, batch, **kwargs)
+        new_inner_carry, logits, inner_outputs = self.inner(new_inner_carry, new_current_data, **kwargs)
 
-        q_halt_logits, q_continue_logits, q_inner_logits, q_inner_masks, h_steps = inner_outputs
+        q_halt_logits, q_continue_logits, q_inner_logits, q_inner_masks, h_steps, chunk_halted = inner_outputs
 
         outputs = {
             "logits": logits,
@@ -628,11 +650,11 @@ class RHN_ACTV1(nn.Module):
             "h_steps": h_steps
         }
 
-        final_carry = RHN_ACTV1Carry(
-            inner_carry=new_inner_carry,
-            steps=h_steps,
-            halted=torch.ones(batch_size, dtype=torch.bool, device=device), # All samples will now always be halted
-            current_data=batch
-        )
+        with torch.no_grad():
+            new_steps = new_steps + 1
+            is_last_step = new_steps >= self.config.halt_max_steps
+            halted = chunk_halted | is_last_step
+
+        final_carry = RHN_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data)
 
         return final_carry, outputs
