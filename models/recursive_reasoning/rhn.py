@@ -653,7 +653,7 @@ class RHN_ACTV1(nn.Module):
         with torch.no_grad():
             new_steps = new_steps + 1
             is_last_step = new_steps >= self.config.halt_max_steps
-            halted = is_last_step if self.training else chunk_halted | is_last_step # TODO - Implement ACT for inference
+            halted = chunk_halted | is_last_step if self.training else is_last_step # TODO - Implement ACT for inference
 
         final_carry = RHN_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data)
 
