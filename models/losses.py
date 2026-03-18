@@ -39,7 +39,7 @@ def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
 
 
 class ACTLossHead(nn.Module):
-    def __init__(self, model: nn.Module, loss_type: str, ponder_weight: float = 0.001, lambda_outer_halt: float = 0.5,
+    def __init__(self, model: nn.Module, loss_type: str, ponder_weight: float = 0.01, lambda_outer_halt: float = 0.5,
                  lambda_inner_halt: float = 0.5):
         super().__init__()
         self.model = model
