@@ -175,13 +175,18 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
         return hidden_states
 
 
-class RHN_Hypernetwork(nn.Module):
-    def __init__(self, config: RHN_ACTV1Config, layer_specs) -> None:
+class RHN_Unhypernetwork(nn.Module):
+    def __init__(self, config: RHN_ACTV1Config) -> None:
         super().__init__()
         self.config = config
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
 
-        self.layer_specs = layer_specs
+        self.layer_specs = []
+        for name, param in self.named_parameters():
+            name_tag = name.split(".")[0]
+            if name_tag != "L_level":
+                continue
+            self.layer_specs.append((name, param.shape))
         self.config_per_layer = {}
         for name, shape in self.layer_specs:
             self.config_per_layer[name] = {
@@ -189,19 +194,15 @@ class RHN_Hypernetwork(nn.Module):
                 "type": "vector" if self._is_vector_like(shape) else "matrix",
             }
 
-        self.embed_scale = math.sqrt(self.config.hypernet_hidden_size)
-        embed_init_std = 1.0 / self.embed_scale
-
-        # self.token_sum_query = CastedParameter((1, 1, self.config.hidden_size * self.config.L_layers), init_std=embed_init_std,
-        #                                         cast_to=self.forward_dtype)
-        self.token_sum_query = nn.Parameter(
-            trunc_normal_init_(
-                torch.empty((1, 1, self.config.hidden_size * self.config.L_layers), dtype=self.forward_dtype),
-                std=embed_init_std
-            )
-        )
-
         self.input_size = self.config.hidden_size * self.config.L_layers
+
+        self.agg_attn = nn.MultiheadAttention(
+            embed_dim=self.input_size,
+            num_heads=self.config.num_heads,
+            batch_first=True,
+        ).to(dtype=self.forward_dtype)
+
+        self.unhypernet_base = nn.ModuleList([RHN_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
 
         # TODO - Consider alternative initialization to 0's.  Classes below have built-in LeCun Normal initialization.
         module_list = nn.ModuleList(
@@ -212,41 +213,31 @@ class RHN_Hypernetwork(nn.Module):
             [SwiGLU(self.config.hypernet_hidden_size,
                     self.config.expansion) for _ in range(self.config.hypernet_hidden_depth)]
         )
-        self.hypernet_base = nn.Sequential(*module_list)
+        self.unhypernet = nn.Sequential(*module_list)
 
         self.output_head = CastedLinear(self.config.hypernet_hidden_size,
-                                         self._output_dim(layer_specs),
+                                         self.config.hypernet_hidden_size, #self._output_dim(self.layer_specs),
                                          bias=False)
 
-    def forward(self, activations: torch.Tensor) -> dict:
-        batch_size, seq_len, _ = activations.shape
+    def forward(self, z_L: torch.Tensor, z_H: torch.Tensor, input_embeddings: torch.Tensor = None, **seq_info) -> dict:
+        unhypernet_base = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
+        activations = torch.tensor([], dtype=unhypernet_base.dtype, device=unhypernet_base.device)
+        # Base model output
+        for layer in self.unhypernet_base:
+            unhypernet_base = layer(hidden_states=unhypernet_base, **seq_info)
+            activations = torch.cat((activations, unhypernet_base.detach()),
+                                    dim=2)  # TODO - Determine whether detaching is preferable here.
 
-        inputs = self._attention(activations)
+        # Unhypernet Output
+        unhypernet_out = self._attention(activations)
+        unhypernet_out = self.unhypernet(unhypernet_out)
+        unhypernet_out = self.output_head(unhypernet_out)
+        for i, layer in enumerate(self.unhypernet_base):
+            unhypernet_out = layer(hidden_states=unhypernet_out, **seq_info)
 
-        outputs = self.hypernet_base(inputs)
-        outputs = self.output_head(outputs)
-        outputs = self._expand_output(outputs)
+        unhypernet_out += unhypernet_base
 
-        outputs_by_layer = {}
-        output_index = 0
-        for layer in self.config_per_layer:
-            shape = self.config_per_layer[layer]["shape"]
-
-            outputs_a = outputs[:, output_index : output_index + (shape[0] * self.config.hypernet_rank)]
-            outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
-            output_index += shape[0] * self.config.hypernet_rank
-
-            if self.config_per_layer[layer]["type"] == "matrix":
-                outputs_b = outputs[:, output_index : output_index + (shape[1] * self.config.hypernet_rank)]
-                outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
-                output_index += shape[1] * self.config.hypernet_rank
-
-            if self.config_per_layer[layer]["type"] == "vector":
-                outputs_by_layer[layer] = outputs_a
-            else:
-                outputs_by_layer[layer] = (outputs_a, outputs_b)
-
-        return outputs_by_layer
+        return unhypernet_out
 
     def _is_vector_like(self, shape:list) -> bool:
         if len(shape) < 2:
@@ -263,7 +254,7 @@ class RHN_Hypernetwork(nn.Module):
             return True
 
     # TODO - Make this dynamic / tunable for larger base models, to ensure appropriate hypernetwork scaling.
-    def _output_dim(self, layer_specs:dict) -> int:
+    def _output_dim(self, layer_specs:list) -> int:
         base_param_dim_sum = 0
         base_param_total = 0
         for layer in layer_specs:
@@ -280,12 +271,13 @@ class RHN_Hypernetwork(nn.Module):
         return vals_to_generate
 
     def _attention(self, inputs) -> torch.Tensor:
-        token_sum_query = self.token_sum_query.transpose(1, 2)
-        attn_logits = torch.matmul(inputs, token_sum_query)
-        attn_weights = F.softmax(attn_logits, dim=1)
-        pooled_inputs = torch.matmul(inputs.transpose(1, 2), attn_weights)
+        attn_output, _ = self.agg_attn(
+            query=inputs,
+            key=inputs,
+            value=inputs
+        )
 
-        return pooled_inputs.squeeze(2)
+        return attn_output
 
     def _expand_output(self, outputs) -> torch.Tensor:
         used_outputs_a = outputs[...,:self.output_dim**2]
@@ -342,17 +334,18 @@ class RHN_ACTV1_Inner(nn.Module):
             pass
 
         # Reasoning Layers
-        self.L_level = torch.nn.ModuleList([RHN_ACTV1Block_Dynamic(self.config) for _i in range(self.config.L_layers)])
+        # self.L_level = nn.ModuleList([RHN_ACTV1Block_Dynamic(self.config) for _i in range(self.config.L_layers)])
+        #
+        # # Hypernetwork
+        # self.layer_specs = []
+        # for name, param in self.named_parameters():
+        #     name_tag = name.split(".")[0]
+        #     if name_tag != "L_level":
+        #         continue
+        #     self.layer_specs.append((name, param.shape))
 
-        # Hypernetwork
-        self.layer_specs = []
-        for name, param in self.named_parameters():
-            name_tag = name.split(".")[0]
-            if name_tag != "L_level":
-                continue
-            self.layer_specs.append((name, param.shape))
-
-        self.hypernet = RHN_Hypernetwork(self.config, self.layer_specs)
+        # self.hypernet = RHN_Hypernetwork(self.config, self.layer_specs)
+        self.unhypernet = RHN_Unhypernetwork(self.config)
 
         # Initial states
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
@@ -412,22 +405,22 @@ class RHN_ACTV1_Inner(nn.Module):
         with torch.no_grad():
             for _H_step in range(self.config.H_cycles-1):
                 for _L_step in range(self.config.L_cycles):
-                    z_L = self._dynamic_forward(z_L=z_L,
+                    z_L = self.unhypernet(z_L=z_L,
                                                 z_H=z_H,
                                                 input_embeddings=input_embeddings,
                                                 **seq_info)
-                z_H = self._dynamic_forward(z_L=z_L,
+                z_H = self.unhypernet(z_L=z_L,
                                             z_H=z_H,
                                             input_embeddings=None,
                                             **seq_info)
 
         for _L_step in range(self.config.L_cycles):
-            z_L = self._dynamic_forward(z_L=z_L,
+            z_L = self.unhypernet(z_L=z_L,
                                         z_H=z_H,
                                         input_embeddings=input_embeddings,
                                         **seq_info)
 
-        z_H = self._dynamic_forward(z_L=z_L,
+        z_H = self.unhypernet(z_L=z_L,
                                     z_H=z_H,
                                     input_embeddings=None,
                                     **seq_info)
@@ -438,26 +431,26 @@ class RHN_ACTV1_Inner(nn.Module):
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
 
-    def _dynamic_forward(self, z_L, z_H, input_embeddings=None, **seq_info):
-        h_base = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
-        activations = torch.tensor([], dtype=h_base.dtype, device=h_base.device)
-        # Base model output
-        for layer in self.L_level:
-            layer.clear_dynamic_adapter()
-            h_base = layer(hidden_states=h_base, **seq_info)
-            activations = torch.cat((activations, h_base.detach()),
-                                    dim=2)  # TODO - Determine whether detaching is preferable here.
-
-        # Dynamic weight output
-        h_dyn = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
-        dynamic_weights = self.hypernet(activations)
-        for i, layer in enumerate(self.L_level):
-            layer_weights = [dynamic_weights[layer_name] for layer_name in dynamic_weights if
-                             f"L_level.{i}" in layer_name]
-            layer.set_dynamic_adapter(*layer_weights)
-            h_dyn = layer(hidden_states=h_dyn, **seq_info)
-
-        return h_base + h_dyn
+    # def _dynamic_forward(self, z_L, z_H, input_embeddings=None, **seq_info):
+    #     h_base = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
+    #     activations = torch.tensor([], dtype=h_base.dtype, device=h_base.device)
+    #     # Base model output
+    #     for layer in self.L_level:
+    #         layer.clear_dynamic_adapter()
+    #         h_base = layer(hidden_states=h_base, **seq_info)
+    #         activations = torch.cat((activations, h_base.detach()),
+    #                                 dim=2)  # TODO - Determine whether detaching is preferable here.
+    #
+    #     # Dynamic weight output
+    #     h_dyn = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
+    #     dynamic_weights = self.hypernet(activations)
+    #     for i, layer in enumerate(self.L_level):
+    #         layer_weights = [dynamic_weights[layer_name] for layer_name in dynamic_weights if
+    #                          f"L_level.{i}" in layer_name]
+    #         layer.set_dynamic_adapter(*layer_weights)
+    #         h_dyn = layer(hidden_states=h_dyn, **seq_info)
+    #
+    #     return h_base + h_dyn
 
 
 
