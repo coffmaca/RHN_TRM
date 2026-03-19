@@ -196,17 +196,17 @@ class RHN_Unhypernetwork(nn.Module):
 
         self.input_size = self.config.hidden_size * self.config.L_layers
 
-        self.agg_attn = nn.MultiheadAttention(
-            embed_dim=self.input_size,
-            num_heads=self.config.num_heads,
-            batch_first=True,
-        ).to(dtype=self.forward_dtype)
+        # self.agg_attn = nn.MultiheadAttention(
+        #     embed_dim=self.input_size,
+        #     num_heads=self.config.num_heads,
+        #     batch_first=True,
+        # ).to(dtype=self.forward_dtype)
 
         self.unhypernet_base = nn.ModuleList([RHN_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
 
         # TODO - Consider alternative initialization to 0's.  Classes below have built-in LeCun Normal initialization.
         module_list = nn.ModuleList(
-            [CastedLinear(self.input_size,
+            [CastedLinear(self.config.hidden_size,
                           self.config.hypernet_hidden_size,
                           bias=False)] + \
             [nn.SiLU()] + \
@@ -221,16 +221,16 @@ class RHN_Unhypernetwork(nn.Module):
 
     def forward(self, z_L: torch.Tensor, z_H: torch.Tensor, input_embeddings: torch.Tensor = None, **seq_info) -> dict:
         unhypernet_base = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
-        activations = torch.tensor([], dtype=unhypernet_base.dtype, device=unhypernet_base.device)
+        # activations = torch.tensor([], dtype=unhypernet_base.dtype, device=unhypernet_base.device)
         # Base model output
         for layer in self.unhypernet_base:
             unhypernet_base = layer(hidden_states=unhypernet_base, **seq_info)
-            activations = torch.cat((activations, unhypernet_base.detach()),
-                                    dim=2)  # TODO - Determine whether detaching is preferable here.
+            # activations = torch.cat((activations, unhypernet_base.detach()),
+            #                         dim=2)  # TODO - Determine whether detaching is preferable here.
 
         # Unhypernet Output
-        unhypernet_out = self._attention(activations)
-        unhypernet_out = self.unhypernet(unhypernet_out)
+        # unhypernet_out = self._attention(activations)
+        unhypernet_out = self.unhypernet(unhypernet_base)
         unhypernet_out = self.output_head(unhypernet_out)
         for i, layer in enumerate(self.unhypernet_base):
             unhypernet_out = layer(hidden_states=unhypernet_out, **seq_info)
