@@ -413,42 +413,30 @@ class RHN_ACTV1_Inner(nn.Module):
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
 
         # Forward iterations
-        it = 0
         z_H, z_L = carry.z_H, carry.z_L
-        hidden_states = z_L + z_H
         # H_cycles-1 without grad
         with torch.no_grad():
-            _, activations = self._initial_forward(hidden_states=hidden_states,
-                                                   input_embeddings=input_embeddings,
-                                                   **seq_info)
             for _H_step in range(self.config.H_cycles-1):
                 for _L_step in range(self.config.L_cycles):
-                    hidden_states, activations = self._dynamic_forward(hidden_states=hidden_states,
-                                                                       activations=activations,
-                                                                       input_embeddings=input_embeddings,
-                                                                       **seq_info)
-                z_L = hidden_states
-                hidden_states = z_H + z_L
-                hidden_states, activations = self._dynamic_forward(hidden_states=hidden_states,
-                                                                   activations=activations,
-                                                                   input_embeddings=None,
-                                                                   **seq_info)
-                z_H = hidden_states
+                    z_L = self._dynamic_forward(z_L=z_L,
+                                                z_H=z_H,
+                                                input_embeddings=input_embeddings,
+                                                **seq_info)
+                z_H = self._dynamic_forward(z_L=z_L,
+                                            z_H=z_H,
+                                            input_embeddings=None,
+                                            **seq_info)
 
         for _L_step in range(self.config.L_cycles):
-            hidden_states = z_L + z_H 
-            hidden_states, activations = self._dynamic_forward(hidden_states=hidden_states,
-                                                               activations=activations,
-                                                               input_embeddings=input_embeddings,
-                                                               **seq_info)
+            z_L = self._dynamic_forward(z_L=z_L,
+                                        z_H=z_H,
+                                        input_embeddings=input_embeddings,
+                                        **seq_info)
 
-        z_L = hidden_states
-        hidden_states = z_H + z_L
-        hidden_states, activations = self._dynamic_forward(hidden_states=hidden_states,
-                                                           activations=activations,
-                                                           input_embeddings=None,
-                                                           **seq_info)
-        z_H = hidden_states
+        z_H = self._dynamic_forward(z_L=z_L,
+                                    z_H=z_H,
+                                    input_embeddings=None,
+                                    **seq_info)
 
         # LM Outputs
         new_carry = RHN_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
@@ -456,29 +444,26 @@ class RHN_ACTV1_Inner(nn.Module):
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
 
-    def _initial_forward(self, hidden_states, input_embeddings=None, **seq_info):
-        hidden_states = hidden_states + input_embeddings if input_embeddings is not None else hidden_states
-        activations = torch.tensor([], dtype=hidden_states.dtype, device=hidden_states.device)
+    def _dynamic_forward(self, z_L, z_H, input_embeddings=None, **seq_info):
+        h_base = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
+        activations = torch.tensor([], dtype=h_base.dtype, device=h_base.device)
+        # Base model output
         for layer in self.L_level:
             layer.clear_dynamic_adapter()
-            hidden_states = layer(hidden_states=hidden_states, **seq_info)
-            activations = torch.cat((activations, hidden_states.detach()),
+            h_base = layer(hidden_states=h_base, **seq_info)
+            activations = torch.cat((activations, h_base.detach()),
                                     dim=2)  # TODO - Determine whether detaching is preferable here.
 
-        return hidden_states, activations
-
-    def _dynamic_forward(self, hidden_states, activations, input_embeddings=None, **seq_info):
-        hidden_states = hidden_states + input_embeddings if input_embeddings is not None else hidden_states
+        # Dynamic weight output
+        h_dyn = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
         dynamic_weights = self.hypernet(activations)
-        activations = torch.tensor([], dtype=hidden_states.dtype, device=hidden_states.device)
         for i, layer in enumerate(self.L_level):
             layer_weights = [dynamic_weights[layer_name] for layer_name in dynamic_weights if
                              f"L_level.{i}" in layer_name]
             layer.set_dynamic_adapter(*layer_weights)
-            hidden_states = layer(hidden_states=hidden_states, **seq_info)
-            activations = torch.cat((activations, hidden_states.detach()),
-                                    dim=2)  # TODO - Determine whether detaching is preferable here.
-        return hidden_states, activations
+            h_dyn = layer(hidden_states=h_dyn, **seq_info)
+
+        return h_base + h_dyn
 
 
 
