@@ -462,7 +462,7 @@ class RHN_ACTV1_Inner(nn.Module):
             layer.set_dynamic_adapter(*layer_weights)
             h_dyn = layer(hidden_states=h_dyn, **seq_info)
 
-        return h_base + h_dyn
+        return (1-self.hypernet_lambda) * h_base + self.hypernet_lambda * h_dyn
 
 
 
