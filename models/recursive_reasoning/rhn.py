@@ -314,9 +314,10 @@ class RHN_Hypernetwork(nn.Module):
             return outputs.flatten(start_dim=-2, end_dim=-1)
         for i, dim in enumerate(self.intermediate_dims):
             if i==0:
-                used_outputs_a = outputs[..., :dim]
+                dim_1 = int(dim*(self.config.hypernet_rank/self.config.perceiver_rank)) # TODO - Cleanup.  Assumes hypernet_rank / perceiver_rank are multiples.
+                used_outputs_a = outputs[..., :dim_1]
                 used_outputs_a = used_outputs_a.unsqueeze(-1).reshape(-1, dim, self.config.hypernet_rank)
-                used_outputs_b = outputs[..., dim: dim * 2]
+                used_outputs_b = outputs[..., dim_1: dim_1 * 2]
                 used_outputs_b = used_outputs_b.unsqueeze(-1).reshape(-1, self.config.hypernet_rank, dim)
             else:
                 used_outputs_a = outputs[...,:dim * self.config.hypernet_rank]
