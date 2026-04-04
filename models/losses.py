@@ -46,9 +46,44 @@ class ACTLossHead(nn.Module):
         self.model = model
         self.loss_fn = globals()[config.arch.loss.model_extra["loss_type"]]
         self.l2_lambda = config.arch.model_extra["hypernet_l2_lambda"]
+        self.hypernet_ema_decay_slow = config.arch.model_extra["hypernet_ema_decay_slow"]
+        self.hypernet_ema_decay_fast = config.arch.model_extra["hypernet_ema_decay_fast"]
+        self.hypernet_lml2_diverg_penalty_gamma = config.arch.model_extra["hypernet_lml2_diverg_penalty_gamma"]
+
+        self.register_buffer("ema_lm_slow", torch.tensor(1.0, dtype=torch.float32))
+        self.register_buffer("ema_lm_fast", torch.tensor(1.0, dtype=torch.float32))
+        self.register_buffer("ema_l2_slow", torch.tensor(1.0, dtype=torch.float32))
+        self.register_buffer("ema_l2_fast", torch.tensor(1.0, dtype=torch.float32))
         
     def initial_carry(self, *args, **kwargs):
         return self.model.initial_carry(*args, **kwargs)  # type: ignore
+
+    def lm_l2_divergence_penalty(self, lm_loss, scaled_l2_loss):
+        with torch.no_grad():
+            lm_fast_delta = F.relu((self.ema_lm_fast - lm_loss) / (self.ema_lm_fast + 1e-8))
+        l2_fast_delta = F.relu((scaled_l2_loss - self.ema_l2_fast) / (self.ema_l2_fast + 1e-8))
+        total_fast_delta = lm_fast_delta * l2_fast_delta
+
+        with torch.no_grad():
+            lm_slow_delta = F.relu((self.ema_lm_slow - lm_loss) / (self.ema_lm_slow + 1e-8))
+        l2_slow_delta = F.relu((scaled_l2_loss - self.ema_l2_slow) / (self.ema_l2_slow + 1e-8))
+        total_slow_delta = lm_slow_delta * l2_slow_delta
+
+        divergence_penalty = self.hypernet_lml2_diverg_penalty_gamma * (total_fast_delta + total_slow_delta)
+
+        if self.training:
+            with torch.no_grad():
+                self.ema_lm_fast =  (self.ema_lm_fast * self.hypernet_ema_decay_fast) + (
+                        lm_loss.detach() * (1 - self.hypernet_ema_decay_fast))
+                self.ema_l2_fast = (self.ema_l2_fast * self.hypernet_ema_decay_fast) + (
+                        scaled_l2_loss.detach() * (1 - self.hypernet_ema_decay_fast))
+
+                self.ema_lm_slow = (self.ema_lm_slow * self.hypernet_ema_decay_slow) + (
+                        lm_loss.detach() * (1 - self.hypernet_ema_decay_slow))
+                self.ema_l2_slow = (self.ema_l2_slow * self.hypernet_ema_decay_slow) + (
+                        scaled_l2_loss.detach() * (1 - self.hypernet_ema_decay_slow))
+
+        return divergence_penalty
 
     def forward(
         self,
@@ -90,10 +125,17 @@ class ACTLossHead(nn.Module):
         lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
         q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
         scaled_l2_loss = (outputs["hypernet_l2"] * valid_metrics).sum() * self.l2_lambda
+
+        divergence_penalty = self.lm_l2_divergence_penalty(lm_loss, scaled_l2_loss)
+
+        # 4. Update both sets of EMAs
+
+
         metrics.update({
             "lm_loss": lm_loss.detach(),
             "q_halt_loss": q_halt_loss.detach(),
             "hypernet_l2_loss": scaled_l2_loss.detach(),
+            "divergence_penalty": divergence_penalty.detach(),
         })
         # Q continue (bootstrapping target loss); Alexia: This fits Q-learning, but seems totally unecessary
         q_continue_loss = 0
@@ -105,7 +147,7 @@ class ACTLossHead(nn.Module):
         # Filter outputs for return
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
-        final_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss) + scaled_l2_loss
+        final_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss) + scaled_l2_loss + divergence_penalty
 
         return new_carry, final_loss, metrics, detached_outputs, new_carry.halted.all()
 
