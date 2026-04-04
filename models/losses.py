@@ -128,9 +128,6 @@ class ACTLossHead(nn.Module):
 
         divergence_penalty = self.lm_l2_divergence_penalty(lm_loss, scaled_l2_loss)
 
-        # 4. Update both sets of EMAs
-
-
         metrics.update({
             "lm_loss": lm_loss.detach(),
             "q_halt_loss": q_halt_loss.detach(),
