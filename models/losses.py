@@ -59,13 +59,15 @@ class ACTLossHead(nn.Module):
         return self.model.initial_carry(*args, **kwargs)  # type: ignore
 
     def lm_l2_divergence_penalty(self, lm_loss, scaled_l2_loss):
-        with torch.no_grad():
-            lm_fast_delta = F.relu((self.ema_lm_fast - lm_loss) / (self.ema_lm_fast + 1e-8))
+        # with torch.no_grad():
+        #     lm_fast_delta = F.relu((self.ema_lm_fast - lm_loss) / (self.ema_lm_fast + 1e-8))
+        lm_fast_delta = F.relu((self.ema_lm_fast - lm_loss) / (self.ema_lm_fast + 1e-8))
         l2_fast_delta = F.relu((scaled_l2_loss - self.ema_l2_fast) / (self.ema_l2_fast + 1e-8))
         total_fast_delta = lm_fast_delta * l2_fast_delta
 
-        with torch.no_grad():
-            lm_slow_delta = F.relu((self.ema_lm_slow - lm_loss) / (self.ema_lm_slow + 1e-8))
+        # with torch.no_grad():
+        #     lm_slow_delta = F.relu((self.ema_lm_slow - lm_loss) / (self.ema_lm_slow + 1e-8))
+        lm_slow_delta = F.relu((self.ema_lm_slow - lm_loss) / (self.ema_lm_slow + 1e-8))
         l2_slow_delta = F.relu((scaled_l2_loss - self.ema_l2_slow) / (self.ema_l2_slow + 1e-8))
         total_slow_delta = lm_slow_delta * l2_slow_delta
 
