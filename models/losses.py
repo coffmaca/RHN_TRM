@@ -83,7 +83,7 @@ class ACTLossHead(nn.Module):
                 self.ema_l2_slow = (self.ema_l2_slow * self.hypernet_ema_decay_slow) + (
                         scaled_l2_loss.detach() * (1 - self.hypernet_ema_decay_slow))
 
-        return divergence_penalty
+        return divergence_penalty, total_fast_delta, total_slow_delta
 
     def forward(
         self,
@@ -126,12 +126,14 @@ class ACTLossHead(nn.Module):
         q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
         scaled_l2_loss = (outputs["hypernet_l2"] * valid_metrics).sum() * self.l2_lambda
 
-        divergence_penalty = self.lm_l2_divergence_penalty(lm_loss, scaled_l2_loss)
+        divergence_penalty, total_fast_delta, total_slow_delta = self.lm_l2_divergence_penalty(lm_loss, scaled_l2_loss)
 
         metrics.update({
             "lm_loss": lm_loss.detach(),
             "q_halt_loss": q_halt_loss.detach(),
             "hypernet_l2_loss": scaled_l2_loss.detach(),
+            "divergence_short": total_fast_delta.detach(),
+            "divergence_long": total_slow_delta.detach(),
             "divergence_penalty": divergence_penalty.detach(),
         })
         # Q continue (bootstrapping target loss); Alexia: This fits Q-learning, but seems totally unecessary
