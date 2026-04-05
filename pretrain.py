@@ -241,8 +241,18 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         with torch.device("cuda"):
             train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
 
+    # Calculate divergence warmup factor (10% of total steps)
+    divergence_warmup_steps = max(1, int(train_state.total_steps *
+                                         config.arch.model_extra["hypernet_lml2_diverg_warmup"]))
+    divergence_warmup_factor = min(1.0, float(train_state.step) / float(divergence_warmup_steps))
+
     # Forward
-    train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
+    train_state.carry, loss, metrics, _, _ = train_state.model(
+        carry=train_state.carry,
+        batch=batch,
+        return_keys=[],
+        divergence_warmup_factor=divergence_warmup_factor
+    )
 
     ((1 / global_batch_size) * loss).backward()
 

@@ -37,3 +37,4 @@ hypernet_l2_lambda: 1e-4
 hypernet_ema_decay_slow: 0.9999
 hypernet_ema_decay_fast: 0.99
 hypernet_lml2_diverg_penalty_gamma: 10
+hypernet_lml2_diverg_warmup: 0.1

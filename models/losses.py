@@ -58,7 +58,7 @@ class ACTLossHead(nn.Module):
     def initial_carry(self, *args, **kwargs):
         return self.model.initial_carry(*args, **kwargs)  # type: ignore
 
-    def lm_l2_divergence_penalty(self, lm_loss, scaled_l2_loss):
+    def lm_l2_divergence_penalty(self, lm_loss, scaled_l2_loss, divergence_warmup_factor):
         # with torch.no_grad():
         #     lm_fast_delta = F.relu((self.ema_lm_fast - lm_loss) / (self.ema_lm_fast + 1e-8))
         lm_fast_delta = F.relu((self.ema_lm_fast - lm_loss) / (self.ema_lm_fast + 1e-8))
@@ -71,7 +71,8 @@ class ACTLossHead(nn.Module):
         l2_slow_delta = F.relu((scaled_l2_loss - self.ema_l2_slow) / (self.ema_l2_slow + 1e-8))
         total_slow_delta = lm_slow_delta * l2_slow_delta
 
-        divergence_penalty = self.hypernet_lml2_diverg_penalty_gamma * (total_fast_delta + total_slow_delta)
+        divergence_penalty = self.hypernet_lml2_diverg_penalty_gamma * divergence_warmup_factor * (total_fast_delta +
+                                                                                                   total_slow_delta)
 
         if self.training:
             with torch.no_grad():
@@ -90,6 +91,7 @@ class ACTLossHead(nn.Module):
     def forward(
         self,
         return_keys: Sequence[str],
+        divergence_warmup_factor: float = 1.0,
         # Model args
         **model_kwargs,
     ) -> Tuple[Any, torch.Tensor, Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]], torch.Tensor]:
@@ -128,7 +130,9 @@ class ACTLossHead(nn.Module):
         q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
         scaled_l2_loss = (outputs["hypernet_l2"] * valid_metrics).sum() * self.l2_lambda
 
-        divergence_penalty, total_fast_delta, total_slow_delta = self.lm_l2_divergence_penalty(lm_loss, scaled_l2_loss)
+        divergence_penalty, total_fast_delta, total_slow_delta = self.lm_l2_divergence_penalty(lm_loss,
+                                                                                               scaled_l2_loss,
+                                                                                               divergence_warmup_factor)
 
         metrics.update({
             "lm_loss": lm_loss.detach(),
