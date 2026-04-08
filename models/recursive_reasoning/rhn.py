@@ -241,7 +241,7 @@ class RHN_Hypernetwork(nn.Module):
         # hidden_states = activations
 
         for layer in self.hypernet_base:
-            hidden_states = self.dropout(layer(hidden_states=hidden_states, **seq_info))
+            hidden_states = self.dropout(layer(hidden_states=hidden_states, cos_sin=seq_info["cos_sin_hyper"]))
         outputs = self.output_head(hidden_states) # rms_norm(self.output_head(hidden_states), variance_epsilon=self.config.rms_norm_eps)
         outputs = rms_norm(self._expand_output(outputs), variance_epsilon=self.config.rms_norm_eps)
 
@@ -404,6 +404,15 @@ class RHN_ACTV1_Inner(nn.Module):
 
         self.hypernet = RHN_Hypernetwork(self.config, self.layer_specs)
 
+        if self.config.pos_encodings == "rope":
+            self.rotary_emb_hyper = RotaryEmbedding(dim=self.config.hypernet_hidden_size // self.config.num_heads,
+                                              max_position_embeddings=self.config.perceiver_rank,
+                                              base=self.config.rope_theta)
+        elif self.config.pos_encodings == "learned":
+            self.embed_pos_hyper = CastedEmbedding(self.config.perceiver_rank, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
+        else:
+            pass
+
         # Initial states
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
         self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
@@ -451,6 +460,7 @@ class RHN_ACTV1_Inner(nn.Module):
     def forward(self, carry: RHN_ACTV1InnerCarry, batch: Dict[str, torch.Tensor], **kwargs) -> Tuple[RHN_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
+            cos_sin_hyper=self.rotary_emb_hyper() if hasattr(self, "rotary_emb") else None,
         )
 
         # Input encoding
@@ -500,7 +510,7 @@ class RHN_ACTV1_Inner(nn.Module):
         ###### Base model output ######
         for layer in self.L_level:
             layer.clear_dynamic_adapter()
-            h_base = layer(hidden_states=h_base, **seq_info)
+            h_base = layer(hidden_states=h_base, cos_sin=seq_info["cos_sin"])
             activations = torch.cat((activations, h_base.detach()),
                                     dim=2)  # TODO - Determine whether detaching is preferable here.
         ###############################
@@ -513,7 +523,7 @@ class RHN_ACTV1_Inner(nn.Module):
             layer_weights = [dynamic_weights[layer_name] for layer_name in dynamic_weights if
                              f"L_level.{i}" in layer_name]
             layer.set_dynamic_adapter(*layer_weights)
-            h_dyn = layer(hidden_states=h_dyn, **seq_info)
+            h_dyn = layer(hidden_states=h_dyn, cos_sin=seq_info["cos_sin"])
         ###################################
         return h_base + h_dyn, step_l2
 
