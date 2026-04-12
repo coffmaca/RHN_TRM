@@ -248,7 +248,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
                                          config.arch.model_extra["hypernet_lml2_diverg_penalty_warmup"]))
     training_percentage = train_state.step / train_state.total_steps
     training_step_minus_delay = train_state.step - divergence_delay_steps
-    divergence_warmup_factor = (min(0.0, float(training_step_minus_delay) / float(divergence_warmup_steps))
+    divergence_warmup_factor = (min(1.0, float(training_step_minus_delay) / float(divergence_warmup_steps))
                                 if training_percentage >= config.arch.model_extra["hypernet_lml2_diverg_penalty_delay"]
                                 else 0.0)
 
@@ -298,6 +298,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             reduced_metrics = {f"train/{k}": v / (global_batch_size if k.endswith("loss") else count) for k, v in reduced_metrics.items()}
 
             reduced_metrics["train/lr"] = lr_this_step
+            reduced_metrics["train/diverge_warmup_factor"] = divergence_warmup_factor
             return reduced_metrics
 
 def evaluate(
