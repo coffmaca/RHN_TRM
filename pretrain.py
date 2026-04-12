@@ -246,11 +246,11 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
                                          config.arch.model_extra["hypernet_lml2_diverg_penalty_delay"]))
     divergence_warmup_steps = max(1, int(train_state.total_steps *
                                          config.arch.model_extra["hypernet_lml2_diverg_penalty_warmup"]))
-    training_percentage = train_state.step / train_state.total_steps
-    training_step_minus_delay = train_state.step - divergence_delay_steps
-    divergence_warmup_factor = (min(1.0, float(training_step_minus_delay) / float(divergence_warmup_steps))
-                                if training_percentage >= config.arch.model_extra["hypernet_lml2_diverg_penalty_delay"]
-                                else 0.0)
+    if train_state.step <= divergence_delay_steps:
+        divergence_warmup_factor = 0.0
+    else:
+        training_step_minus_delay = train_state.step - divergence_delay_steps
+        divergence_warmup_factor = min(1.0, float(training_step_minus_delay) / float(divergence_warmup_steps))
 
     # Forward
     train_state.carry, loss, metrics, _, _ = train_state.model(
