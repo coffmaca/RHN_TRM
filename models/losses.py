@@ -152,7 +152,7 @@ class ACTLossHead(nn.Module):
         # Filter outputs for return
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
-        final_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss) + scaled_l2_loss + divergence_penalty
+        final_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss) + divergence_penalty # + scaled_l2_loss
 
         return new_carry, final_loss, metrics, detached_outputs, new_carry.halted.all()
 
