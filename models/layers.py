@@ -290,8 +290,10 @@ class SwiGLU(nn.Module):
         super().__init__()
         inter = _find_multiple(round(expansion * hidden_size * 2 / 3), 256)
 
-        self.gate_up_proj = spectral_norm(CastedLinear(hidden_size, inter * 2, bias=False))
-        self.down_proj    = spectral_norm(CastedLinear(inter, hidden_size, bias=False))
+        self.gate_up_proj = CastedLinear(hidden_size, inter * 2, bias=False)
+        self.down_proj    = CastedLinear(inter, hidden_size, bias=False)
+        # self.gate_up_proj = spectral_norm(CastedLinear(hidden_size, inter * 2, bias=False))
+        # self.down_proj = spectral_norm(CastedLinear(inter, hidden_size, bias=False))
 
     def forward(self, x):
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
