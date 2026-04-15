@@ -237,11 +237,13 @@ class RHN_Hypernetwork(nn.Module):
 
         activations = self.dropout(activations)
 
-        hidden_states = self.dropout(self._attention(activations))
+        hidden_states = self._attention(activations)
+        # hidden_states = self.dropout(self._attention(activations))
         # hidden_states = activations
 
         for layer in self.hypernet_base:
-            hidden_states = self.dropout(layer(hidden_states=hidden_states, cos_sin=seq_info["cos_sin_hyper"]))
+            hidden_states = layer(hidden_states=hidden_states, cos_sin=seq_info["cos_sin_hyper"])
+            # hidden_states = self.dropout(layer(hidden_states=hidden_states, cos_sin=seq_info["cos_sin_hyper"]))
         outputs = self.output_head(hidden_states) # rms_norm(self.output_head(hidden_states), variance_epsilon=self.config.rms_norm_eps)
         outputs = rms_norm(self._expand_output(outputs), variance_epsilon=self.config.rms_norm_eps)
 
