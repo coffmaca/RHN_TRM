@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from torch import nn
 import math
 
+from config_init import PretrainConfig
+
 IGNORE_LABEL_ID = -100
 
 
@@ -39,10 +41,11 @@ def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
 
 
 class ACTLossHead(nn.Module):
-    def __init__(self, model: nn.Module, loss_type: str):
+    def __init__(self, model: nn.Module, config: PretrainConfig):
         super().__init__()
         self.model = model
-        self.loss_fn = globals()[loss_type]
+        self.loss_fn = globals()[config.arch.loss.model_extra["loss_type"]]
+        self.softmax_temperature = config.arch.model_extra["hypernet_softmax_temperature"]
         
     def initial_carry(self, *args, **kwargs):
         return self.model.initial_carry(*args, **kwargs)  # type: ignore
@@ -84,7 +87,24 @@ class ACTLossHead(nn.Module):
 
         # Losses
 
-        lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
+        per_token_loss = self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask)
+        per_seq_loss = (per_token_loss / loss_divisor).sum(dim=-1)
+
+        with torch.no_grad():
+            valid_seq_mask = (loss_counts > 0)
+            logits_for_weights = per_seq_loss.detach() / self.softmax_temperature
+            logits_for_weights = torch.where(
+                valid_seq_mask,
+                logits_for_weights,
+                torch.tensor(-1e9, device=logits_for_weights.device, dtype=logits_for_weights.dtype)
+            )
+
+            batch_weights = F.softmax(logits_for_weights, dim=0)
+
+            num_valid_seqs = valid_seq_mask.sum().to(batch_weights.dtype)
+            batch_weights = batch_weights * num_valid_seqs
+
+        lm_loss = (per_seq_loss * batch_weights).sum()
         q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
         metrics.update({
             "lm_loss": lm_loss.detach(),
