@@ -69,8 +69,12 @@ class PretrainConfig(pydantic.BaseModel):
     # Names
     project_name: Optional[str] = None
     run_name: Optional[str] = None
+
+    # Continue Prior Runs
     load_checkpoint: Optional[str] = None
     checkpoint_path: Optional[str] = None
+    wandb_run_id: Optional[str] = None
+    last_step: Optional[int] = None
 
     # Extras
     seed: int = 0
@@ -587,7 +591,18 @@ def launch(hydra_config: DictConfig):
     ema_helper = None
     if RANK == 0:
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
-        wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
+        if config.wandb_run_id is not None:
+            wandb.init(project=config.project_name,
+                       name=config.run_name,
+                       id=config.wandb_run_id,
+                       resume="must",
+                       config=config.model_dump(),
+                       settings=wandb.Settings(_disable_stats=True))
+        else:
+            wandb.init(project=config.project_name,
+                       name=config.run_name,
+                       config=config.model_dump(),
+                       settings=wandb.Settings(_disable_stats=True))
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
         save_code_and_config(config)
     if config.ema:
@@ -604,6 +619,9 @@ def launch(hydra_config: DictConfig):
             print("TRAIN")
         train_state.model.train()
         for set_name, batch, global_batch_size in train_loader:
+            if config.last_step is not None and train_state.step <= config.last_step:
+                train_state.step += global_batch_size
+                continue
             metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
 
             if RANK == 0 and metrics is not None:
@@ -611,6 +629,9 @@ def launch(hydra_config: DictConfig):
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
             if config.ema:
                 ema_helper.update(train_state.model)
+
+        if config.last_step is not None and train_state.step <= config.last_step:
+            continue
 
         if _iter_id >= config.min_eval_interval:
             ############ Evaluation
