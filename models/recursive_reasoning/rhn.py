@@ -71,6 +71,8 @@ class RHN_ACTV1Config(BaseModel):
     perceiver_rank: int
     perceiver_heads: int
 
+    hypernet_input_noise_std: float = 0.05
+
 class RHN_ACTV1Block(nn.Module):
     def __init__(self, config: RHN_ACTV1Config, attn: bool = True) -> None:
         super().__init__()
@@ -483,7 +485,14 @@ class RHN_ACTV1_Inner(nn.Module):
             layer.clear_dynamic_adapter()
             h_base = layer(hidden_states=h_base, **seq_info)
             activations = torch.cat((activations, h_base.detach()),
-                                    dim=2)  # TODO - Determine whether detaching is preferable here.
+                                    dim=2)
+
+        # Noise Injection
+        if self.training and getattr(self.config, "hypernet_input_noise_std", 0.0) > 0.0:
+            act_std = activations.std(dim=-1, keepdim=True).detach() + 1e-6
+            target_noise_std = self.config.hypernet_input_noise_std * act_std
+            noise = torch.randn_like(activations) * target_noise_std
+            activations = activations + noise
 
         # Dynamic weight output
         h_dyn = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H

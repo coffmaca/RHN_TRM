@@ -31,3 +31,5 @@ layer_emb_dim: 32
 hypernet_relative_scale: 2
 perceiver_rank: 32
 perceiver_heads: 8
+
+hypernet_input_noise_std: 0.05
