@@ -348,6 +348,7 @@ class RHN_ACTV1_Inner(nn.Module):
         super().__init__()
         self.config = config
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
+        self.hypernet_input_noise_std = config.hypernet_input_noise_std
 
         # I/O
 
@@ -488,7 +489,7 @@ class RHN_ACTV1_Inner(nn.Module):
                                     dim=2)
 
         # Noise Injection
-        if self.training and getattr(self.config, "hypernet_input_noise_std", 0.0) > 0.0:
+        if self.training and self.hypernet_input_noise_std > 0.0:
             act_std = activations.std(dim=-1, keepdim=True).detach() + 1e-6
             target_noise_std = self.config.hypernet_input_noise_std * act_std
             noise = torch.randn_like(activations) * target_noise_std
