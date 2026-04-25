@@ -34,6 +34,9 @@ class TrainState:
 
     step: int
     total_steps: int
+    effective_step: int
+    accumulated_samples: int
+    effective_optim_steps: int
 
 
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
@@ -165,7 +168,10 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
 
     return TrainState(
         step=0,
+        effective_step=0,
         total_steps=total_steps,
+        accumulated_samples=0,
+        effective_optim_steps=0,
 
         model=model,
         optimizers=optimizers,
@@ -233,8 +239,15 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     if train_state.step > train_state.total_steps:  # At most train_total_steps
         return
 
+    if not hasattr(train_state, "accumulated_samples"):
+        train_state.accumulated_samples = 0
+        train_state.effective_optim_steps = 0
+
+    show_loss = False
+
     # To device
     batch = {k: v.cuda() for k, v in batch.items()}
+    local_batch_size = batch["inputs"].size(0)
 
     # Init carry if it is None
     if train_state.carry is None:
@@ -246,22 +259,34 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 
     ((1 / global_batch_size) * loss).backward()
 
-    # Allreduce
-    if world_size > 1:
-        for param in train_state.model.parameters():
-            if param.grad is not None:
-                dist.all_reduce(param.grad)
-            
-    # Apply optimizer
-    lr_this_step = None    
-    for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
-        lr_this_step = compute_lr(base_lr, config, train_state)
+    halted_this_step = int(metrics["count"].item()) if isinstance(metrics["count"], torch.Tensor) else int(
+        metrics["count"])
+    train_state.accumulated_samples += halted_this_step
 
-        for param_group in optim.param_groups:
-            param_group['lr'] = lr_this_step
-            
-        optim.step()
-        optim.zero_grad()
+    lr_this_step = None
+
+    if train_state.accumulated_samples >= local_batch_size:
+        # Allreduce
+        if world_size > 1:
+            for param in train_state.model.parameters():
+                if param.grad is not None:
+                    dist.all_reduce(param.grad)
+
+        # Apply optimizer
+        for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
+            train_state.effective_optim_steps += 1
+            train_state.effective_step = train_state.effective_optim_steps
+
+            lr_this_step = compute_lr(base_lr, config, train_state)
+
+            for param_group in optim.param_groups:
+                param_group['lr'] = lr_this_step
+
+            optim.step()
+            optim.zero_grad()
+
+        train_state.accumulated_samples -= local_batch_size
+        show_loss = True
 
     # Reduce metrics
     if len(metrics):
@@ -282,6 +307,10 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             reduced_metrics = {f"train/{k}": v / (global_batch_size if k.endswith("loss") else count) for k, v in reduced_metrics.items()}
 
             reduced_metrics["train/lr"] = lr_this_step
+
+            if not show_loss:
+                del reduced_metrics["train/lm_loss"]
+
             return reduced_metrics
 
 def evaluate(

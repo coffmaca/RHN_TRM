@@ -44,6 +44,7 @@ class ACTLossHead(nn.Module):
     def __init__(self, model: nn.Module, config: PretrainConfig):
         super().__init__()
         self.model = model
+        self.halt_max_steps = config.arch.model_extra["halt_max_steps"]
         self.loss_fn = globals()[config.arch.loss.model_extra["loss_type"]]
         self.softmax_temperature = config.arch.model_extra["hypernet_softmax_temperature"]
         
@@ -91,7 +92,7 @@ class ACTLossHead(nn.Module):
         per_seq_loss = (per_token_loss / loss_divisor).sum(dim=-1)
 
         with torch.no_grad():
-            valid_seq_mask = (loss_counts > 0)
+            valid_seq_mask = new_carry.halted & (loss_counts > 0)
             logits_for_weights = per_seq_loss.detach() / self.softmax_temperature
             logits_for_weights = torch.where(
                 valid_seq_mask,
@@ -106,6 +107,7 @@ class ACTLossHead(nn.Module):
 
         lm_loss = (per_seq_loss * batch_weights).sum()
         q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
+        q_halt_loss /= self.halt_max_steps
         metrics.update({
             "lm_loss": lm_loss.detach(),
             "q_halt_loss": q_halt_loss.detach(),
