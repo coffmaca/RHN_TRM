@@ -219,7 +219,7 @@ class RHN_Hypernetwork(nn.Module):
         )
 
         self.hypernet_base = nn.ModuleList(
-            [RHN_ACTV1Block(self.config, attn=True) for _i in range(self.config.H_layers)]
+            [RHN_ACTV1Block(self.config, attn=False) for _i in range(self.config.H_layers)]
         )
 
         self.output_head = CastedLinear(self.config.hypernet_hidden_size,
