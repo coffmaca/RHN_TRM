@@ -222,9 +222,19 @@ class RHN_Hypernetwork(nn.Module):
             [RHN_ACTV1Block(self.config, attn=False) for _i in range(self.config.H_layers)]
         )
 
+        self.mu_proj = CastedLinear(self.config.hypernet_hidden_size, self.config.hypernet_hidden_size, bias=True)
+        self.logvar_proj = CastedLinear(self.config.hypernet_hidden_size, self.config.hypernet_hidden_size, bias=True)
+
+        with torch.no_grad():
+            self.logvar_proj.weight.zero_()
+            self.logvar_proj.bias.fill_(-4.0)  # type: ignore
+
         self.output_head = CastedLinear(self.config.hypernet_hidden_size,
                                          self._output_dim(layer_specs),
                                          bias=False)
+
+        # with torch.no_grad():
+        #     self.output_head.weight.mul_(0.01)
 
     def forward(self, activations: torch.Tensor, **seq_info) -> dict:
         batch_size, seq_len, _ = activations.shape
@@ -234,7 +244,20 @@ class RHN_Hypernetwork(nn.Module):
 
         for layer in self.hypernet_base:
             hidden_states = layer(hidden_states=hidden_states, **seq_info)
-        outputs = self.output_head(hidden_states) # rms_norm(self.output_head(hidden_states), variance_epsilon=self.config.rms_norm_eps)
+
+        mu = self.mu_proj(hidden_states)
+        log_var = self.logvar_proj(hidden_states)
+
+        if self.training:
+            std = torch.exp(0.5 * log_var)
+            eps = torch.randn_like(std)
+            z = mu + eps * std
+        else:
+            z = mu
+
+        step_kl = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=[-2, -1])
+
+        outputs = self.output_head(z) # rms_norm(self.output_head(hidden_states), variance_epsilon=self.config.rms_norm_eps)
         outputs = rms_norm(self._expand_output(outputs), variance_epsilon=self.config.rms_norm_eps)
 
         outputs_by_layer = {}
