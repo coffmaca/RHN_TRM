@@ -282,11 +282,10 @@ class RHN_Hypernetwork(nn.Module):
             base_param_total += rows * cols
 
         base_param_total_low_rank = base_param_dim_sum * self.config.hypernet_rank
-        base_param_total_low_rank /= int(self.config.perceiver_rank) # Factor out perceiver rank, as this dim is flattened
 
-        self.output_dim = int(-(-base_param_total_low_rank ** (1 / 4) // 1))  # Square root twice (i.e., 1/4th root) and round up
+        self.kron_dim = int(-(-base_param_total_low_rank ** (1 / 4) // 1))  # Square root twice (i.e., 1/4th root) and round up
 
-        vals_to_generate = self.output_dim ** 2 * 2
+        vals_to_generate = math.ceil((self.kron_dim ** 2 * 2) / self.config.perceiver_rank)
 
         return vals_to_generate
 
@@ -302,22 +301,15 @@ class RHN_Hypernetwork(nn.Module):
         return attn_output
 
     def _expand_output(self, outputs) -> torch.Tensor:
-        if len(self.intermediate_dims) == 0:
-            return outputs.flatten(start_dim=-2, end_dim=-1)
-        for i, dim in enumerate(self.intermediate_dims):
-            if i==0:
-                dim_1 = int(dim*(self.config.hypernet_rank/self.config.perceiver_rank)) # TODO - Cleanup.  Assumes hypernet_rank / perceiver_rank are multiples.
-                used_outputs_a = outputs[..., :dim_1]
-                used_outputs_a = used_outputs_a.unsqueeze(-1).reshape(-1, dim, self.config.hypernet_rank)
-                used_outputs_b = outputs[..., dim_1: dim_1 * 2]
-                used_outputs_b = used_outputs_b.unsqueeze(-1).reshape(-1, self.config.hypernet_rank, dim)
-            else:
-                used_outputs_a = outputs[...,:dim * self.config.hypernet_rank]
-                used_outputs_a = used_outputs_a.unsqueeze(-1).view(-1, dim, self.config.hypernet_rank)
-                used_outputs_b = outputs[...,dim * self.config.hypernet_rank : dim * self.config.hypernet_rank * 2]
-                used_outputs_b = used_outputs_b.unsqueeze(-1).view(-1, self.config.hypernet_rank, dim)
-            expanded_outputs = torch.matmul(used_outputs_a, used_outputs_b)
-            outputs = expanded_outputs.flatten(start_dim=-2, end_dim=-1)
+        batch_size = outputs.shape[0]
+        outputs = outputs.reshape(batch_size, -1) # Collapse perceiver rank dimension
+        used_outputs_a = outputs[..., :self.kron_dim ** 2]
+        used_outputs_a = used_outputs_a.unsqueeze(-1).view(-1, self.kron_dim, self.kron_dim)
+        used_outputs_b = outputs[..., self.kron_dim ** 2: self.kron_dim ** 2 * 2]
+        used_outputs_b = used_outputs_b.unsqueeze(-1).view(-1, self.kron_dim, self.kron_dim)
+        expanded_outputs = torch.einsum('bij,bkl->bikjl', used_outputs_a, used_outputs_b)
+        outputs = expanded_outputs.flatten(start_dim=1, end_dim=-1)
+
         return outputs
 
 
