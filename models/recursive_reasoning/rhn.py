@@ -356,6 +356,7 @@ class RHN_Hypernetwork(nn.Module):
                 used_outputs_b = outputs[...,dim * self.config.hypernet_rank : dim * self.config.hypernet_rank * 2]
                 used_outputs_b = used_outputs_b.unsqueeze(-1).view(-1, self.config.hypernet_rank, dim)
             expanded_outputs = torch.matmul(used_outputs_a, used_outputs_b)
+            expanded_outputs = rms_norm(expanded_outputs, variance_epsilon=self.config.rms_norm_eps)
             outputs = expanded_outputs.flatten(start_dim=-2, end_dim=-1)
         return outputs
 
