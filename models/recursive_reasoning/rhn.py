@@ -231,12 +231,20 @@ class RHN_Hypernetwork(nn.Module):
             self.logvar_proj.weight.zero_()
             self.logvar_proj.bias.fill_(-4.0)  # type: ignore
 
-        self.output_head = CastedLinear(self.config.hypernet_hidden_size,
+        self.output_head = nn.utils.spectral_norm(
+            CastedLinear(self.config.hypernet_hidden_size,
                                          self._output_dim(layer_specs),
                                          bias=False)
+        )
 
-        # with torch.no_grad():
-        #     self.output_head.weight.mul_(0.01)
+        self._apply_spectral_norm_recursively(self.hypernet_base)
+
+    def _apply_spectral_norm_recursively(self, module: nn.Module):
+        for name, child in module.named_children():
+            if isinstance(child, CastedLinear):
+                setattr(module, name, nn.utils.spectral_norm(child))
+            else:
+                self._apply_spectral_norm_recursively(child)
 
     def forward(self, activations: torch.Tensor, **seq_info) -> dict:
         batch_size, seq_len, _ = activations.shape
