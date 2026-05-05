@@ -1,5 +1,6 @@
 from typing import Tuple
 import einops
+import math
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -39,6 +40,33 @@ def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, si
     k_embed = (k * cos.unsqueeze(-2)) + (rotate_half(k) * sin.unsqueeze(-2))
 
     return q_embed.to(orig_dtype), k_embed.to(orig_dtype)
+
+
+class SinusoidalIterationEmbedding(nn.Module):
+    def __init__(self, dim: int, max_position_embeddings: float = 10000.0):
+        super().__init__()
+        self.dim = dim
+        self.max_period = max_position_embeddings
+
+    def forward(self, step_tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        half_dim = self.dim // 2
+
+        # Calculate the frequencies
+        freqs = torch.exp(
+            -math.log(self.max_period) * torch.arange(
+                start=0, end=half_dim, dtype=torch.float32, device=step_tensor.device
+            ) / half_dim
+        )
+
+        args = step_tensor.unsqueeze(-1).float() * freqs
+
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+
+        # Handle odd dimensions
+        if self.dim % 2 != 0:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[..., :1])], dim=-1)
+
+        return embedding.to(dtype)
 
 
 class DynamicCastedLinear(nn.Module):
