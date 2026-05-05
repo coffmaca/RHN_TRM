@@ -3,6 +3,7 @@ import einops
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.nn.utils.parametrizations import spectral_norm
 
 #try:
 #    from flash_attn_interface import flash_attn_func  # type: ignore[import]
@@ -94,7 +95,8 @@ class CastedLinear(nn.Module):
     def __init__(self,
                  in_features: int,
                  out_features: int,
-                 bias: bool):
+                 bias: bool,
+                 use_spectral_norm: bool = False):
         super().__init__()
         # Truncated LeCun normal init
         self.weight = nn.Parameter(
@@ -104,6 +106,9 @@ class CastedLinear(nn.Module):
         if bias:
             # Zero init bias
             self.bias = nn.Parameter(torch.zeros((out_features, )))
+
+        if use_spectral_norm:
+            spectral_norm(self, name='weight')
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return F.linear(input, self.weight.to(input.dtype), bias=self.bias.to(input.dtype) if self.bias is not None else None)
@@ -211,7 +216,7 @@ class DynamicAttention(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False):
+    def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False, use_spectral_norm=False):
         super().__init__()
 
         self.hidden_size = hidden_size
@@ -221,8 +226,8 @@ class Attention(nn.Module):
         self.num_key_value_heads = num_key_value_heads
         self.causal = causal
 
-        self.qkv_proj = CastedLinear(self.hidden_size, (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim, bias=False)
-        self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False)
+        self.qkv_proj = CastedLinear(self.hidden_size, (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim, bias=False, spectral_norm=spectral_norm)
+        self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False, use_spectral_norm=use_spectral_norm)
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
@@ -250,10 +255,10 @@ class Attention(nn.Module):
         return self.o_proj(attn_output)
 
 class LinearSwish(nn.Module):
-    def __init__(self, hidden_size: int, reverse=False):
+    def __init__(self, hidden_size: int, reverse=False, use_spectral_norm=False):
         super().__init__()
 
-        self.linear = CastedLinear(hidden_size, hidden_size, bias=False)
+        self.linear = CastedLinear(hidden_size, hidden_size, bias=False, use_spectral_norm=use_spectral_norm)
         self.reverse = reverse
 
     def forward(self, x):
@@ -285,12 +290,12 @@ class DynamicSwiGLU(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    def __init__(self, hidden_size: int, expansion: float):
+    def __init__(self, hidden_size: int, expansion: float, use_spectral_norm : bool =False):
         super().__init__()
         inter = _find_multiple(round(expansion * hidden_size * 2 / 3), 256)
 
-        self.gate_up_proj = CastedLinear(hidden_size, inter * 2, bias=False)
-        self.down_proj    = CastedLinear(inter, hidden_size, bias=False)
+        self.gate_up_proj = CastedLinear(hidden_size, inter * 2, bias=False, use_spectral_norm=use_spectral_norm)
+        self.down_proj    = CastedLinear(inter, hidden_size, bias=False, use_spectral_norm=use_spectral_norm)
 
     def forward(self, x):
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
