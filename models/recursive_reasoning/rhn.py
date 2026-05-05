@@ -74,7 +74,7 @@ class RHN_ACTV1Config(BaseModel):
     hypernet_kl_lambda: float = 1e-4
 
 class RHN_ACTV1Block(nn.Module):
-    def __init__(self, config: RHN_ACTV1Config, attn: bool = True, spectral_norm : bool = False) -> None:
+    def __init__(self, config: RHN_ACTV1Config, attn: bool = True, use_spectral_norm : bool = False) -> None:
         super().__init__()
 
         self.config = config
@@ -85,7 +85,7 @@ class RHN_ACTV1Block(nn.Module):
                 self.mlp_t = SwiGLU(
                     hidden_size= self.config.perceiver_rank, # self.config.seq_len + self.puzzle_emb_len,
                     expansion=config.expansion,
-                    spectral_norm=spectral_norm
+                    use_spectral_norm=use_spectral_norm
                 )
             else:
                 self.self_attn = Attention(
@@ -94,12 +94,12 @@ class RHN_ACTV1Block(nn.Module):
                     num_heads=config.num_heads,
                     num_key_value_heads=config.num_heads,
                     causal=False,
-                    spectral_norm=spectral_norm
+                    use_spectral_norm=use_spectral_norm
                 )
         self.mlp = SwiGLU(
             hidden_size=config.hypernet_hidden_size,
             expansion=config.expansion,
-            spectral_norm=spectral_norm
+            use_spectral_norm=use_spectral_norm
         )
         self.norm_eps = config.rms_norm_eps
 
@@ -225,7 +225,7 @@ class RHN_Hypernetwork(nn.Module):
         )
 
         self.hypernet_base = nn.ModuleList(
-            [RHN_ACTV1Block(self.config, attn=False, spectral_norm=True) for _i in range(self.config.H_layers)]
+            [RHN_ACTV1Block(self.config, attn=False, use_spectral_norm=True) for _i in range(self.config.H_layers)]
         )
 
         self.mu_proj = CastedLinear(self.config.hypernet_hidden_size, self.config.hypernet_hidden_size, bias=True)
@@ -238,7 +238,7 @@ class RHN_Hypernetwork(nn.Module):
         self.output_head = CastedLinear(self.config.hypernet_hidden_size,
                                         self._output_dim(layer_specs),
                                         bias=False,
-                                        spectral_norm=True)
+                                        use_spectral_norm=True)
 
     def forward(self, activations: torch.Tensor, **seq_info) -> Tuple[dict, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
