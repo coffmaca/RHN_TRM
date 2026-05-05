@@ -50,12 +50,13 @@ class ACTLossHead(nn.Module):
     def forward(
         self,
         return_keys: Sequence[str],
+        log_deep_metrics: bool = False,
         # Model args
         **model_kwargs,
     ) -> Tuple[Any, torch.Tensor, Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]], torch.Tensor]:
         # Model logits
         # B x SeqLen x D
-        new_carry, outputs = self.model(**model_kwargs)
+        new_carry, outputs = self.model(log_deep_metrics=log_deep_metrics, **model_kwargs)
         labels = new_carry.current_data["labels"]
 
         with torch.no_grad():
@@ -81,6 +82,14 @@ class ACTLossHead(nn.Module):
                 "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum(),
                 "steps":          torch.where(valid_metrics, new_carry.steps, 0).sum(),
             }
+
+            if "q_continue_logits" in outputs:
+                q_margin = torch.abs(outputs["q_halt_logits"] - outputs["q_continue_logits"])
+                metrics["telemetry/q_halt_margin"] = torch.where(valid_metrics, q_margin, 0).sum()
+
+            for k, v in outputs.items():
+                if k.startswith("telemetry/"):
+                    metrics[k] = v.detach()
 
         # Losses
 
