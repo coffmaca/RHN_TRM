@@ -106,12 +106,13 @@ class RHN_ACTV1Block(nn.Module):
         if self.attn:
             if self.config.mlp_t:
                 hidden_states = hidden_states.transpose(1,2)
-                out = self.mlp_t(hidden_states)
-                hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
+                att_out = self.mlp_t(hidden_states)
+                hidden_states = rms_norm(hidden_states + att_out, variance_epsilon=self.norm_eps)
                 hidden_states = hidden_states.transpose(1,2)
             else:
                 # Self Attention
-                hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states), variance_epsilon=self.norm_eps)
+                att_out = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
+                hidden_states = rms_norm(hidden_states + att_out, variance_epsilon=self.norm_eps)
         # Fully Connected
         out = self.mlp(hidden_states)
         hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
@@ -175,13 +176,13 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
         if self.attn:
             if self.config.mlp_t:
                 hidden_states = hidden_states.transpose(1, 2)
-                out = self.mlp_t(hidden_states)
-                hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
+                att_out = self.mlp_t(hidden_states)
+                hidden_states = rms_norm(hidden_states + att_out, variance_epsilon=self.norm_eps)
                 hidden_states = hidden_states.transpose(1, 2)
             else:
                 # Self Attention
-                hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states),
-                                         variance_epsilon=self.norm_eps)
+                att_out = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
+                hidden_states = rms_norm(hidden_states + att_out, variance_epsilon=self.norm_eps)
         # Fully Connected
         out = self.mlp(hidden_states)
         hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
@@ -246,7 +247,7 @@ class RHN_Hypernetwork(nn.Module):
             else:
                 self._apply_spectral_norm_recursively(child)
 
-    def forward(self, activations: torch.Tensor, **seq_info) -> dict:
+    def forward(self, activations: torch.Tensor, **seq_info) -> Tuple[dict, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
 
         hidden_states = self._attention(activations)
@@ -312,30 +313,20 @@ class RHN_Hypernetwork(nn.Module):
             return True
 
     def _output_dim(self, layer_specs:dict) -> int:
-        # seq_len = self.config.seq_len + self.config.puzzle_emb_len
         base_param_dim_sum = 0
         base_param_total = 0
         for layer in layer_specs:
             rows, cols = layer[1]
             base_param_dim_sum += rows + cols
             base_param_total += rows * cols
+
         base_param_total_low_rank = base_param_dim_sum * self.config.hypernet_rank
-        vals_to_generate = base_param_total_low_rank
-        output_head_dim = math.ceil(vals_to_generate / self.config.perceiver_rank)
-        hypernet_output_head_params = output_head_dim * self.config.hypernet_hidden_size
-        max_hypernet_output_head_params = base_param_total * self.config.hypernet_relative_scale
-        self.reductions = 0
-        self.intermediate_dims = []
-        if hypernet_output_head_params > max_hypernet_output_head_params:
-            output_head_dim = vals_to_generate
-            while hypernet_output_head_params > max_hypernet_output_head_params:
-                self.reductions += 1
-                new_dim = math.ceil(output_head_dim**(1/2))
-                self.intermediate_dims.insert(0, new_dim)
-                output_head_dim = new_dim * self.config.hypernet_rank * 2
-                hypernet_output_head_params = (output_head_dim / self.config.perceiver_rank) * self.config.hypernet_hidden_size
-            output_head_dim /= self.config.perceiver_rank
-        return int(output_head_dim)
+
+        self.kron_dim = int(-(-base_param_total_low_rank ** (1 / 4) // 1))  # Square root twice (i.e., 1/4th root) and round up
+
+        vals_to_generate = math.ceil((self.kron_dim ** 2 * 2) / self.config.perceiver_rank)
+
+        return vals_to_generate
 
     def _attention(self, inputs) -> torch.Tensor:
         batch_size = inputs.shape[0]
@@ -349,23 +340,15 @@ class RHN_Hypernetwork(nn.Module):
         return attn_output
 
     def _expand_output(self, outputs) -> torch.Tensor:
-        if len(self.intermediate_dims) == 0:
-            return outputs.flatten(start_dim=-2, end_dim=-1)
-        for i, dim in enumerate(self.intermediate_dims):
-            if i==0:
-                dim_1 = int(dim*(self.config.hypernet_rank/self.config.perceiver_rank)) # TODO - Cleanup.  Assumes hypernet_rank / perceiver_rank are multiples.
-                used_outputs_a = outputs[..., :dim_1]
-                used_outputs_a = used_outputs_a.unsqueeze(-1).reshape(-1, dim, self.config.hypernet_rank)
-                used_outputs_b = outputs[..., dim_1: dim_1 * 2]
-                used_outputs_b = used_outputs_b.unsqueeze(-1).reshape(-1, self.config.hypernet_rank, dim)
-            else:
-                used_outputs_a = outputs[...,:dim * self.config.hypernet_rank]
-                used_outputs_a = used_outputs_a.unsqueeze(-1).view(-1, dim, self.config.hypernet_rank)
-                used_outputs_b = outputs[...,dim * self.config.hypernet_rank : dim * self.config.hypernet_rank * 2]
-                used_outputs_b = used_outputs_b.unsqueeze(-1).view(-1, self.config.hypernet_rank, dim)
-            expanded_outputs = torch.matmul(used_outputs_a, used_outputs_b)
-            expanded_outputs = rms_norm(expanded_outputs, variance_epsilon=self.config.rms_norm_eps)
-            outputs = expanded_outputs.flatten(start_dim=-2, end_dim=-1)
+        batch_size = outputs.shape[0]
+        outputs = outputs.reshape(batch_size, -1) # Collapse perceiver rank dimension
+        used_outputs_a = outputs[..., :self.kron_dim ** 2]
+        used_outputs_a = used_outputs_a.unsqueeze(-1).view(-1, self.kron_dim, self.kron_dim)
+        used_outputs_b = outputs[..., self.kron_dim ** 2: self.kron_dim ** 2 * 2]
+        used_outputs_b = used_outputs_b.unsqueeze(-1).view(-1, self.kron_dim, self.kron_dim)
+        expanded_outputs = torch.einsum('bij,bkl->bikjl', used_outputs_a, used_outputs_b)
+        outputs = expanded_outputs.flatten(start_dim=1, end_dim=-1)
+
         return outputs
 
 
