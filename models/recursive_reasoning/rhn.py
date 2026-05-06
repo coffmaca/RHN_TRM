@@ -1,5 +1,6 @@
 from typing import Tuple, List, Dict, Optional
 from dataclasses import dataclass
+import functools
 import math
 import torch
 import copy
@@ -200,11 +201,25 @@ class RHN_Hypernetwork(nn.Module):
 
         self.layer_specs = layer_specs
         self.config_per_layer = {}
+
+        dims = []
         for name, shape in self.layer_specs:
+            is_vector = self._is_vector_like(shape)
             self.config_per_layer[name] = {
                 "shape": shape,
-                "type": "vector" if self._is_vector_like(shape) else "matrix",
+                "type": "vector" if is_vector else "matrix",
             }
+            if is_vector:
+                dims.append(shape[0])
+            else:
+                dims.extend([shape[0], shape[1]])
+
+        clean_dims = [d for d in dims if d % 64 == 0]
+        if not clean_dims:
+            clean_dims = [d for d in dims if d % 2 == 0] or dims  # Fallbacks
+
+        self.chunk_size = functools.reduce(math.gcd, clean_dims)
+        self.total_chunked_coords = sum(math.ceil(d / self.chunk_size) for d in dims)
 
         self.embed_scale = math.sqrt(self.config.hypernet_hidden_size)
         embed_init_std = 1.0 / self.embed_scale
@@ -217,6 +232,7 @@ class RHN_Hypernetwork(nn.Module):
             batch_first=True,
         ).to(dtype=self.forward_dtype)
 
+        # Input attention / pooling
         self.perceiver_queries = nn.Parameter(
             trunc_normal_init_(
                 torch.empty((1, self.config.perceiver_rank, self.input_size), dtype=self.forward_dtype),
@@ -228,6 +244,20 @@ class RHN_Hypernetwork(nn.Module):
             [RHN_ACTV1Block(self.config, attn=False, use_spectral_norm=True) for _i in range(self.config.H_layers)]
         )
 
+        # Output attention / pooling
+        self.pooling_attn = nn.MultiheadAttention(
+            embed_dim=self.config.hypernet_hidden_size,
+            num_heads=self.config.num_heads,
+            batch_first=True,
+        ).to(dtype=self.forward_dtype)
+
+        self.pooling_query = nn.Parameter(
+            trunc_normal_init_(
+                torch.empty((1, 1, self.config.hypernet_hidden_size), dtype=self.forward_dtype),
+                std=embed_init_std
+            )
+        )
+
         self.mu_proj = CastedLinear(self.config.hypernet_hidden_size, self.config.hypernet_hidden_size, bias=True)
         self.logvar_proj = CastedLinear(self.config.hypernet_hidden_size, self.config.hypernet_hidden_size, bias=True)
 
@@ -235,19 +265,30 @@ class RHN_Hypernetwork(nn.Module):
             self.logvar_proj.weight.zero_()
             self.logvar_proj.bias.fill_(-4.0)  # type: ignore
 
-        self.output_head = CastedLinear(self.config.hypernet_hidden_size,
-                                        self._output_dim(layer_specs),
-                                        bias=False,
-                                        use_spectral_norm=True)
+        # Output head / decoder
+        self.coord_dim = self.config.layer_emb_dim
+        self.coord_embeddings = nn.Embedding(self.total_chunked_coords, self.coord_dim)
+
+        self.decoder = SwiGLU(
+            hidden_size=self.config.hypernet_hidden_size,
+            expansion=self.config.expansion,
+            use_spectral_norm=True,
+            in_features=self.config.hypernet_hidden_size + self.coord_dim,
+            out_features=self.config.hypernet_rank * self.chunk_size
+        )
+
+        with torch.no_grad():
+            self.decoder.down_proj.weight.zero_()
 
     def forward(self, activations: torch.Tensor, **seq_info) -> Tuple[dict, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
 
-        hidden_states = self._attention(activations)
-        # hidden_states = activations
+        hidden_states = self._input_attention(activations)
 
         for layer in self.hypernet_base:
             hidden_states = layer(hidden_states=hidden_states, **seq_info)
+
+        hidden_states = self._output_attention(hidden_states=hidden_states)
 
         mu = self.mu_proj(hidden_states)
         log_var = self.logvar_proj(hidden_states)
@@ -262,32 +303,45 @@ class RHN_Hypernetwork(nn.Module):
         # Compute KL Loss
         step_kl = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=[-2, -1])
 
-        outputs = self.output_head(z) # rms_norm(self.output_head(hidden_states), variance_epsilon=self.config.rms_norm_eps)
-        outputs = rms_norm(self._expand_output(outputs), variance_epsilon=self.config.rms_norm_eps)
+        all_coords = self.coord_embeddings.weight
+        z_expanded = z.unsqueeze(1).expand(-1, self.total_chunked_coords, -1)
+        coords_expanded = all_coords.unsqueeze(0).expand(batch_size, -1, -1)
+        combined_input = torch.cat([z_expanded, coords_expanded], dim=-1)
+        generated_chunks = self.decoder(combined_input)
+        generated_values = generated_chunks.view(batch_size, -1, self.config.hypernet_rank)
 
-        # Compute L2 Loss
-        batch_size = outputs.shape[0]
-        step_l2 = torch.zeros(batch_size, device=outputs.device, dtype=outputs.dtype)
-        step_l2 += outputs.view(batch_size, -1).pow(2).sum(dim=1)
+        step_l2 = generated_values.view(batch_size, -1).pow(2).sum(dim=1)
 
         outputs_by_layer = {}
         output_index = 0
-        for layer in self.config_per_layer:
-            shape = self.config_per_layer[layer]["shape"]
+        for layer_name, config in self.config_per_layer.items():
+            shape = config["shape"]
 
-            outputs_a = outputs[:, output_index : output_index + (shape[0] * self.config.hypernet_rank)]
-            outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
-            output_index += shape[0] * self.config.hypernet_rank
+            if config["type"] == "matrix":
+                # Component A
+                d0 = shape[0]
+                padded_d0 = math.ceil(d0 / self.chunk_size) * self.chunk_size
+                A_padded = generated_values[:, output_index: output_index + padded_d0, :]
+                A = A_padded[:, :d0, :]  # Slice off excess padding
+                output_index += padded_d0
 
-            if self.config_per_layer[layer]["type"] == "matrix":
-                outputs_b = outputs[:, output_index : output_index + (shape[1] * self.config.hypernet_rank)]
-                outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
-                output_index += shape[1] * self.config.hypernet_rank
+                # Component B
+                d1 = shape[1]
+                padded_d1 = math.ceil(d1 / self.chunk_size) * self.chunk_size
+                B_padded = generated_values[:, output_index: output_index + padded_d1, :]
+                B = B_padded[:, :d1, :].transpose(1, 2)  # Slice padding, then transpose
+                output_index += padded_d1
 
-            if self.config_per_layer[layer]["type"] == "vector":
-                outputs_by_layer[layer] = outputs_a
+                outputs_by_layer[layer_name] = (A, B)
             else:
-                outputs_by_layer[layer] = (outputs_a, outputs_b)
+                # Vector Component
+                d0 = shape[0]
+                padded_d0 = math.ceil(d0 / self.chunk_size) * self.chunk_size
+                A_padded = generated_values[:, output_index: output_index + padded_d0, :]
+                A = A_padded[:, :d0, :]
+                output_index += padded_d0
+
+                outputs_by_layer[layer_name] = A
 
         return outputs_by_layer, step_l2, step_kl
 
@@ -305,32 +359,7 @@ class RHN_Hypernetwork(nn.Module):
         else:
             return True
 
-    def _output_dim(self, layer_specs:dict) -> int:
-        base_param_dim_sum = 0
-        base_param_total = 0
-        for layer in layer_specs:
-            rows, cols = layer[1]
-            base_param_dim_sum += rows + cols
-            base_param_total += rows * cols
-        base_param_total_low_rank = base_param_dim_sum * self.config.hypernet_rank
-        vals_to_generate = base_param_total_low_rank
-        output_head_dim = math.ceil(vals_to_generate / self.config.perceiver_rank)
-        hypernet_output_head_params = output_head_dim * self.config.hypernet_hidden_size
-        max_hypernet_output_head_params = base_param_total * self.config.hypernet_relative_scale
-        self.reductions = 0
-        self.intermediate_dims = []
-        if hypernet_output_head_params > max_hypernet_output_head_params:
-            output_head_dim = vals_to_generate
-            while hypernet_output_head_params > max_hypernet_output_head_params:
-                self.reductions += 1
-                new_dim = math.ceil(output_head_dim**(1/2))
-                self.intermediate_dims.insert(0, new_dim)
-                output_head_dim = new_dim * self.config.hypernet_rank * 2
-                hypernet_output_head_params = (output_head_dim / self.config.perceiver_rank) * self.config.hypernet_hidden_size
-            output_head_dim /= self.config.perceiver_rank
-        return int(output_head_dim)
-
-    def _attention(self, inputs) -> torch.Tensor:
+    def _input_attention(self, inputs) -> torch.Tensor:
         batch_size = inputs.shape[0]
         queries = self.perceiver_queries.expand(batch_size, -1, -1) #.to(dtype=inputs.dtype)
         attn_output, _ = self.perceiver_attn(
@@ -341,25 +370,16 @@ class RHN_Hypernetwork(nn.Module):
 
         return attn_output
 
-    def _expand_output(self, outputs) -> torch.Tensor:
-        if len(self.intermediate_dims) == 0:
-            return outputs.flatten(start_dim=-2, end_dim=-1)
-        for i, dim in enumerate(self.intermediate_dims):
-            if i==0:
-                dim_1 = int(dim*(self.config.hypernet_rank/self.config.perceiver_rank)) # TODO - Cleanup.  Assumes hypernet_rank / perceiver_rank are multiples.
-                used_outputs_a = outputs[..., :dim_1]
-                used_outputs_a = used_outputs_a.unsqueeze(-1).reshape(-1, dim, self.config.hypernet_rank)
-                used_outputs_b = outputs[..., dim_1: dim_1 * 2]
-                used_outputs_b = used_outputs_b.unsqueeze(-1).reshape(-1, self.config.hypernet_rank, dim)
-            else:
-                used_outputs_a = outputs[...,:dim * self.config.hypernet_rank]
-                used_outputs_a = used_outputs_a.unsqueeze(-1).view(-1, dim, self.config.hypernet_rank)
-                used_outputs_b = outputs[...,dim * self.config.hypernet_rank : dim * self.config.hypernet_rank * 2]
-                used_outputs_b = used_outputs_b.unsqueeze(-1).view(-1, self.config.hypernet_rank, dim)
-            expanded_outputs = torch.matmul(used_outputs_a, used_outputs_b)
-            expanded_outputs = rms_norm(expanded_outputs, variance_epsilon=self.config.rms_norm_eps)
-            outputs = expanded_outputs.flatten(start_dim=-2, end_dim=-1)
-        return outputs
+    def _output_attention(self, hidden_states) -> torch.Tensor:
+        batch_size = hidden_states.shape[0]
+        query = self.pooling_query.expand(batch_size, -1, -1) #.to(dtype=inputs.dtype)
+        attn_output, _ = self.pooling_attn(
+            query=query,
+            key=hidden_states,
+            value=hidden_states
+        )
+
+        return attn_output.squeeze(-2)
 
 
 # class RHN_ACTV1ReasoningModule(nn.Module):
