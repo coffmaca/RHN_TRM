@@ -194,17 +194,25 @@ class RHN_Hypernetwork(nn.Module):
 
         self.layer_specs = layer_specs
         self.config_per_layer = {}
+
+        self.total_coords = 0
         for name, shape in self.layer_specs:
+            is_vector = self._is_vector_like(shape)
             self.config_per_layer[name] = {
                 "shape": shape,
-                "type": "vector" if self._is_vector_like(shape) else "matrix",
+                "type": "vector" if is_vector else "matrix",
             }
+            if is_vector:
+                self.total_coords += shape[0]
+            else:
+                self.total_coords += shape[0] + shape[1]
 
         self.embed_scale = math.sqrt(self.config.hypernet_hidden_size)
         embed_init_std = 1.0 / self.embed_scale
 
         self.input_size = self.config.hidden_size * self.config.L_layers
 
+        # Input attention
         self.perceiver_attn = nn.MultiheadAttention(
             embed_dim=self.input_size,
             num_heads=self.config.perceiver_heads,
@@ -218,43 +226,71 @@ class RHN_Hypernetwork(nn.Module):
             )
         )
 
+        # Hypernet base/trunk
         self.hypernet_base = nn.ModuleList(
             [RHN_ACTV1Block(self.config, attn=False) for _i in range(self.config.H_layers)]
         )
 
-        self.output_head = CastedLinear(self.config.hypernet_hidden_size,
-                                         self._output_dim(layer_specs),
-                                         bias=False)
+        # Output attention pooling
+        self.pooling_attn = nn.MultiheadAttention(
+            embed_dim=self.config.hypernet_hidden_size,
+            num_heads=self.config.num_heads,
+            batch_first=True,
+        ).to(dtype=self.forward_dtype)
+
+        self.pooling_query = nn.Parameter(
+            trunc_normal_init_(
+                torch.empty((1, 1, self.config.hypernet_hidden_size), dtype=self.forward_dtype),
+                std=embed_init_std
+            )
+        )
+
+        # Output head / decoder
+        self.coord_dim = self.config.layer_emb_dim
+        self.coord_embeddings = nn.Embedding(self.total_coords, self.coord_dim)
+
+        self.decoder = SwiGLU(
+            hidden_size=self.config.hypernet_hidden_size,
+            expansion=self.config.expansion,
+            in_features=self.config.hypernet_hidden_size + self.coord_dim,
+            out_features=self.config.hypernet_rank
+        )
+
+        with torch.no_grad():
+            self.decoder.down_proj.weight.zero_()
 
     def forward(self, activations: torch.Tensor, **seq_info) -> dict:
         batch_size, seq_len, _ = activations.shape
 
-        hidden_states = self._attention(activations)
-        # hidden_states = activations
+        hidden_states = self._input_attention(activations)
 
         for layer in self.hypernet_base:
             hidden_states = layer(hidden_states=hidden_states, **seq_info)
-        outputs = self.output_head(hidden_states) # rms_norm(self.output_head(hidden_states), variance_epsilon=self.config.rms_norm_eps)
-        outputs = rms_norm(self._expand_output(outputs), variance_epsilon=self.config.rms_norm_eps)
+
+        hidden_states = self._pooling_attention(hidden_states=hidden_states)
+
+        all_coords = self.coord_embeddings.weight
+        hidden_states_expanded = hidden_states.unsqueeze(1).expand(-1, self.total_coords, -1)
+        coords_expanded = all_coords.unsqueeze(0).expand(batch_size, -1, -1)
+
+        combined_input = torch.cat([hidden_states_expanded, coords_expanded], dim=-1)
+        outputs = self.decoder(combined_input)
 
         outputs_by_layer = {}
         output_index = 0
-        for layer in self.config_per_layer:
-            shape = self.config_per_layer[layer]["shape"]
+        for layer_name, config in self.config_per_layer.items():
+            shape = config["shape"]
 
-            outputs_a = outputs[:, output_index : output_index + (shape[0] * self.config.hypernet_rank)]
-            outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
-            output_index += shape[0] * self.config.hypernet_rank
-
-            if self.config_per_layer[layer]["type"] == "matrix":
-                outputs_b = outputs[:, output_index : output_index + (shape[1] * self.config.hypernet_rank)]
-                outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
-                output_index += shape[1] * self.config.hypernet_rank
-
-            if self.config_per_layer[layer]["type"] == "vector":
-                outputs_by_layer[layer] = outputs_a
+            if config["type"] == "matrix":
+                A = outputs[:, output_index: output_index + shape[0], :]
+                output_index += shape[0]
+                B = outputs[:, output_index: output_index + shape[1], :].transpose(1, 2)
+                output_index += shape[1]
+                outputs_by_layer[layer_name] = (A, B)
             else:
-                outputs_by_layer[layer] = (outputs_a, outputs_b)
+                A = outputs[:, output_index: output_index + shape[0], :]
+                output_index += shape[0]
+                outputs_by_layer[layer_name] = A
 
         return outputs_by_layer
 
@@ -298,7 +334,7 @@ class RHN_Hypernetwork(nn.Module):
             output_head_dim /= self.config.perceiver_rank
         return int(output_head_dim)
 
-    def _attention(self, inputs) -> torch.Tensor:
+    def _input_attention(self, inputs) -> torch.Tensor:
         batch_size = inputs.shape[0]
         queries = self.perceiver_queries.expand(batch_size, -1, -1) #.to(dtype=inputs.dtype)
         attn_output, _ = self.perceiver_attn(
@@ -308,6 +344,17 @@ class RHN_Hypernetwork(nn.Module):
         )
 
         return attn_output
+
+    def _pooling_attention(self, hidden_states) -> torch.Tensor:
+        batch_size = hidden_states.shape[0]
+        query = self.pooling_query.expand(batch_size, -1, -1) #.to(dtype=inputs.dtype)
+        attn_output, _ = self.pooling_attn(
+            query=query,
+            key=hidden_states,
+            value=hidden_states
+        )
+
+        return attn_output.squeeze(-2)
 
     def _expand_output(self, outputs) -> torch.Tensor:
         if len(self.intermediate_dims) == 0:

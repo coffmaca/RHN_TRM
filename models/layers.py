@@ -285,12 +285,20 @@ class DynamicSwiGLU(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    def __init__(self, hidden_size: int, expansion: float):
+    def __init__(self,
+                 hidden_size: int,
+                 expansion: float,
+                 in_features: int = None,
+                 out_features: int = None):
         super().__init__()
+
+        in_dim = in_features if in_features is not None else hidden_size
+        out_dim = out_features if out_features is not None else hidden_size
+
         inter = _find_multiple(round(expansion * hidden_size * 2 / 3), 256)
 
-        self.gate_up_proj = CastedLinear(hidden_size, inter * 2, bias=False)
-        self.down_proj    = CastedLinear(inter, hidden_size, bias=False)
+        self.gate_up_proj = CastedLinear(in_dim, inter * 2, bias=False)
+        self.down_proj    = CastedLinear(inter, out_dim, bias=False)
 
     def forward(self, x):
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
