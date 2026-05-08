@@ -277,8 +277,8 @@ class RHN_Hypernetwork(nn.Module):
             out_features=self.config.hypernet_rank * self.chunk_size
         )
 
-        with torch.no_grad():
-            self.decoder.down_proj.weight.zero_()
+        # with torch.no_grad():
+        #     self.decoder.down_proj.weight.zero_()
 
     def forward(self, activations: torch.Tensor, **seq_info) -> Tuple[dict, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
