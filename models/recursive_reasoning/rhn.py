@@ -199,10 +199,12 @@ class RHN_Hypernetwork(nn.Module):
         self.config = config
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
 
+        self.max_decoder_iterations = getattr(self.config, 'max_decoder_iterations', 10)
+
         self.layer_specs = layer_specs
         self.config_per_layer = {}
 
-        dims = []
+        self.total_coords = 0
         for name, shape in self.layer_specs:
             is_vector = self._is_vector_like(shape)
             self.config_per_layer[name] = {
@@ -210,16 +212,9 @@ class RHN_Hypernetwork(nn.Module):
                 "type": "vector" if is_vector else "matrix",
             }
             if is_vector:
-                dims.append(shape[0])
+                self.total_coords += shape[0]
             else:
-                dims.extend([shape[0], shape[1]])
-
-        clean_dims = [d for d in dims if d % 64 == 0]
-        if not clean_dims:
-            clean_dims = [d for d in dims if d % 2 == 0] or dims  # Fallbacks
-
-        self.chunk_size = functools.reduce(math.gcd, clean_dims)
-        self.total_chunked_coords = sum(math.ceil(d / self.chunk_size) for d in dims)
+                self.total_coords += shape[0] + shape[1]
 
         self.embed_scale = math.sqrt(self.config.hypernet_hidden_size)
         embed_init_std = 1.0 / self.embed_scale
@@ -267,14 +262,14 @@ class RHN_Hypernetwork(nn.Module):
 
         # Output head / decoder
         self.coord_dim = self.config.layer_emb_dim
-        self.coord_embeddings = nn.Embedding(self.total_chunked_coords, self.coord_dim)
+        self.coord_embeddings = nn.Embedding(self.total_coords, self.coord_dim)
 
         self.decoder = SwiGLU(
             hidden_size=self.config.hypernet_hidden_size,
             expansion=self.config.expansion,
             use_spectral_norm=True,
             in_features=self.config.hypernet_hidden_size + self.coord_dim,
-            out_features=self.config.hypernet_rank * self.chunk_size
+            out_features=self.config.hypernet_rank
         )
 
         # with torch.no_grad():
@@ -304,12 +299,13 @@ class RHN_Hypernetwork(nn.Module):
         step_kl = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=[-2, -1])
 
         all_coords = self.coord_embeddings.weight
-        z_expanded = z.unsqueeze(1).expand(-1, self.total_chunked_coords, -1)
+        z_expanded = z.unsqueeze(1).expand(-1, self.total_coords, -1)
         coords_expanded = all_coords.unsqueeze(0).expand(batch_size, -1, -1)
-        combined_input = torch.cat([z_expanded, coords_expanded], dim=-1)
-        generated_chunks = self.decoder(combined_input)
-        generated_values = generated_chunks.view(batch_size, -1, self.config.hypernet_rank)
 
+        combined_input = torch.cat([z_expanded, coords_expanded], dim=-1)
+        generated_values = self.decoder(combined_input)
+
+        # Compute direct L2 norm on generated parameters
         step_l2 = generated_values.view(batch_size, -1).pow(2).sum(dim=1)
 
         outputs_by_layer = {}
@@ -318,29 +314,14 @@ class RHN_Hypernetwork(nn.Module):
             shape = config["shape"]
 
             if config["type"] == "matrix":
-                # Component A
-                d0 = shape[0]
-                padded_d0 = math.ceil(d0 / self.chunk_size) * self.chunk_size
-                A_padded = generated_values[:, output_index: output_index + padded_d0, :]
-                A = A_padded[:, :d0, :]  # Slice off excess padding
-                output_index += padded_d0
-
-                # Component B
-                d1 = shape[1]
-                padded_d1 = math.ceil(d1 / self.chunk_size) * self.chunk_size
-                B_padded = generated_values[:, output_index: output_index + padded_d1, :]
-                B = B_padded[:, :d1, :].transpose(1, 2)  # Slice padding, then transpose
-                output_index += padded_d1
-
+                A = generated_values[:, output_index: output_index + shape[0], :]
+                output_index += shape[0]
+                B = generated_values[:, output_index: output_index + shape[1], :].transpose(1, 2)
+                output_index += shape[1]
                 outputs_by_layer[layer_name] = (A, B)
             else:
-                # Vector Component
-                d0 = shape[0]
-                padded_d0 = math.ceil(d0 / self.chunk_size) * self.chunk_size
-                A_padded = generated_values[:, output_index: output_index + padded_d0, :]
-                A = A_padded[:, :d0, :]
-                output_index += padded_d0
-
+                A = generated_values[:, output_index: output_index + shape[0], :]
+                output_index += shape[0]
                 outputs_by_layer[layer_name] = A
 
         return outputs_by_layer, step_l2, step_kl
