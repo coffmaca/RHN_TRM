@@ -241,7 +241,7 @@ class RHN_Hypernetwork(nn.Module):
         )
 
         self.hypernet_base = nn.ModuleList(
-            [RHN_ACTV1Block(self.config, attn=False, use_spectral_norm=True) for _i in range(self.config.H_layers)]
+            [RHN_ACTV1Block(self.config, attn=False, use_spectral_norm=False) for _i in range(self.config.H_layers)]
         )
 
         # Output attention / pooling
@@ -272,7 +272,7 @@ class RHN_Hypernetwork(nn.Module):
         self.decoder = SwiGLU(
             hidden_size=self.config.hypernet_hidden_size,
             expansion=self.config.expansion,
-            use_spectral_norm=True,
+            use_spectral_norm=False,
             in_features=self.config.hypernet_hidden_size + self.coord_dim,
             out_features=self.config.hypernet_rank * self.chunk_size
         )
