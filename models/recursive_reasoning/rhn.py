@@ -14,6 +14,7 @@ from models.common import trunc_normal_init_
 from models.layers import (rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding,
                            CastedParameter, CastedLinear, DynamicSwiGLU, DynamicAttention)
 from models.sparse_embedding import CastedSparseEmbedding
+from torch.utils.checkpoint import checkpoint
 
 IGNORE_LABEL_ID = -100
 
@@ -73,6 +74,8 @@ class RHN_ACTV1Config(BaseModel):
     perceiver_heads: int
     hypernet_l2_lambda: float = 1e-4
     hypernet_kl_lambda: float = 1e-4
+
+    max_decoder_iterations: int = 10
 
 class RHN_ACTV1Block(nn.Module):
     def __init__(self, config: RHN_ACTV1Config, attn: bool = True, use_spectral_norm : bool = False) -> None:
@@ -299,11 +302,26 @@ class RHN_Hypernetwork(nn.Module):
         step_kl = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=[-2, -1])
 
         all_coords = self.coord_embeddings.weight
-        z_expanded = z.unsqueeze(1).expand(-1, self.total_coords, -1)
-        coords_expanded = all_coords.unsqueeze(0).expand(batch_size, -1, -1)
+        coords_per_iter = math.ceil(self.total_coords / self.max_decoder_iterations)
 
-        combined_input = torch.cat([z_expanded, coords_expanded], dim=-1)
-        generated_values = self.decoder(combined_input)
+        generated_chunks = []
+
+        def run_decoder_chunk(chunk_input):
+            return self.decoder(chunk_input)
+
+        for i in range(0, self.total_coords, coords_per_iter):
+            curr_coords = all_coords[i: i + coords_per_iter]
+            num_curr_coords = curr_coords.shape[0]
+
+            z_expanded = z.unsqueeze(1).expand(-1, num_curr_coords, -1)
+            coords_expanded = curr_coords.unsqueeze(0).expand(batch_size, -1, -1)
+            combined_input = torch.cat([z_expanded, coords_expanded], dim=-1)
+
+            chunk_out = checkpoint(run_decoder_chunk, combined_input, use_reentrant=False)
+
+            generated_chunks.append(chunk_out)
+
+        generated_values = torch.cat(generated_chunks, dim=1)
 
         # Compute direct L2 norm on generated parameters
         step_l2 = generated_values.view(batch_size, -1).pow(2).sum(dim=1)
