@@ -199,8 +199,6 @@ class RHN_Hypernetwork(nn.Module):
         self.config = config
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
 
-        self.max_decoder_iterations = getattr(self.config, 'max_decoder_iterations', 10)
-
         self.layer_specs = layer_specs
         self.config_per_layer = {}
 
