@@ -43,10 +43,10 @@ def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, si
 
 
 class SinusoidalIterationEmbedding(nn.Module):
-    def __init__(self, dim: int, max_position_embeddings: float = 10000.0):
+    def __init__(self, dim: int, max_period: float = 10000.0):
         super().__init__()
         self.dim = dim
-        self.max_period = max_position_embeddings
+        self.max_period = max_period
 
     def forward(self, step_tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         half_dim = self.dim // 2

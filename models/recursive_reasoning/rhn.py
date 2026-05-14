@@ -20,6 +20,7 @@ IGNORE_LABEL_ID = -100
 class RHN_ACTV1InnerCarry:
     z_H: torch.Tensor
     z_L: torch.Tensor
+    inner_step: torch.Tensor
 
 
 @dataclass
@@ -208,7 +209,8 @@ class RHN_Hypernetwork(nn.Module):
             )
         )
 
-        self.iteration_token = SinusoidalIterationEmbedding(dim=self.input_size)
+        total_max_steps = float(self.config.H_cycles * self.config.L_cycles * self.config.halt_max_steps)
+        self.iteration_token = SinusoidalIterationEmbedding(dim=self.input_size, max_period=total_max_steps)
 
         # TODO - Consider alternative initialization to 0's.  Classes below have built-in LeCun Normal initialization.
         module_list = nn.ModuleList(
@@ -225,12 +227,11 @@ class RHN_Hypernetwork(nn.Module):
                                          self._output_dim(layer_specs),
                                          bias=False)
 
-    def forward(self, activations: torch.Tensor, iteration_step: int) -> Tuple[dict, torch.Tensor]:
+    def forward(self, activations: torch.Tensor, iteration_steps: torch.Tensor) -> Tuple[dict, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
 
-        step_tensor = torch.tensor([iteration_step], device=activations.device)
-        iter_token = self.iteration_token(step_tensor, dtype=self.forward_dtype)
-        iter_token = iter_token.unsqueeze(0).expand(batch_size, 1, -1)
+        iter_token = self.iteration_token(iteration_steps, dtype=self.forward_dtype)
+        iter_token = iter_token.unsqueeze(1)
 
         activations = torch.cat([iter_token, activations], dim=1)
 
@@ -417,12 +418,14 @@ class RHN_ACTV1_Inner(nn.Module):
         return RHN_ACTV1InnerCarry(
             z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
             z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            inner_step=torch.zeros(batch_size, dtype=torch.long, device=self.H_init.device)
         )
         
     def reset_carry(self, reset_flag: torch.Tensor, carry: RHN_ACTV1InnerCarry):
         return RHN_ACTV1InnerCarry(
             z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
+            inner_step=torch.where(reset_flag, torch.zeros_like(carry.inner_step), carry.inner_step)
         )
 
     def forward(self, carry: RHN_ACTV1InnerCarry, batch: Dict[str, torch.Tensor],
@@ -438,7 +441,8 @@ class RHN_ACTV1_Inner(nn.Module):
 
         # Forward iterations
         z_H, z_L = carry.z_H, carry.z_L
-        global_step = 0
+
+        current_steps = carry.inner_step.clone()
 
         total_metrics = {
             "telemetry/act_sparsity": torch.tensor(0.0, device=z_H.device),
@@ -476,19 +480,19 @@ class RHN_ACTV1_Inner(nn.Module):
                                                 z_H=z_H,
                                                 input_embeddings=input_embeddings,
                                                 log_deep_metrics=log_deep_metrics,
-                                                iteration_step=global_step,
+                                                iteration_steps=current_steps,
                                                 **seq_info)
                     track_metrics(prev_z_L, z_L, step_m)
-                    global_step += 1
+                    current_steps += 1
                 prev_z_H = z_H
                 z_H, _, step_m = self._dynamic_forward(z_L=z_L,
                                             z_H=z_H,
                                             input_embeddings=None,
-                                            iteration_step=global_step,
+                                            iteration_steps=current_steps,
                                             log_deep_metrics=log_deep_metrics,
                                             **seq_info)
                 track_metrics(prev_z_H, z_H, step_m)
-                global_step += 1
+                current_steps += 1
 
         for _L_step in range(self.config.L_cycles):
             prev_z_L = z_L
@@ -496,18 +500,19 @@ class RHN_ACTV1_Inner(nn.Module):
                                         z_H=z_H,
                                         input_embeddings=input_embeddings,
                                         log_deep_metrics=log_deep_metrics,
-                                        iteration_step=global_step,
+                                        iteration_steps=current_steps,
                                         **seq_info)
             track_metrics(prev_z_L, z_L, step_m)
-            global_step += 1
+            current_steps += 1
 
         prev_z_H = z_H
         z_H, step_l2, step_m = self._dynamic_forward(z_L=z_L,
                                     z_H=z_H,
                                     input_embeddings=None,
                                     log_deep_metrics=log_deep_metrics,
-                                    iteration_step=global_step,
+                                    iteration_steps=current_steps,
                                     **seq_info)
+        current_steps += 1
 
         total_l2 += step_l2
         # total_kl += step_kl
@@ -522,12 +527,16 @@ class RHN_ACTV1_Inner(nn.Module):
                 total_metrics[k] /= metric_calls
 
         # LM Outputs
-        new_carry = RHN_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
+        new_carry = RHN_ACTV1InnerCarry(
+            z_H=z_H.detach(),
+            z_L=z_L.detach(),
+            inner_step=current_steps.detach()
+        )  # New carry no grad
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), avg_l2, total_metrics #, avg_kl
 
-    def _dynamic_forward(self, z_L, z_H, iteration_step: int, input_embeddings=None, log_deep_metrics=False, **seq_info) -> Tuple[
+    def _dynamic_forward(self, z_L, z_H, iteration_steps: torch.Tensor, input_embeddings=None, log_deep_metrics=False, **seq_info) -> Tuple[
         torch.Tensor, torch.Tensor, dict
     ]:
         h_base = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
@@ -541,7 +550,7 @@ class RHN_ACTV1_Inner(nn.Module):
 
         # Dynamic weight output
         h_dyn = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
-        dynamic_weights, step_l2 = self.hypernet(activations, iteration_step=iteration_step)
+        dynamic_weights, step_l2 = self.hypernet(activations, iteration_steps=iteration_steps)
 
         step_metrics = {}
         with torch.no_grad():
