@@ -303,8 +303,15 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         with torch.device("cuda"):
             train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
 
+    log_deep_metrics = (train_state.step % 100 == 0)
+
     # Forward
-    train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
+    train_state.carry, loss, metrics, _, _ = train_state.model(
+        carry=train_state.carry,
+        batch=batch,
+        return_keys=[],
+        log_deep_metrics=log_deep_metrics
+    )
 
     ((1 / global_batch_size) * loss).backward()
 
@@ -313,7 +320,31 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         for param in train_state.model.parameters():
             if param.grad is not None:
                 dist.all_reduce(param.grad)
-            
+
+    captured_metrics = {}
+    if rank == 0 and log_deep_metrics:
+        hypernet_grad_sq = 0.0
+        base_grad_sq = 0.0
+
+        pre_step_weights = {}
+
+        with torch.no_grad():
+            for name, param in train_state.model.named_parameters():
+                if param.requires_grad:
+                    pre_step_weights[name] = param.clone().detach()
+
+                if param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    captured_metrics[f"telemetry/grad_norm/{name}"] = grad_norm
+
+                    if "hypernet" in name:
+                        hypernet_grad_sq += grad_norm ** 2
+                    elif "L_level" in name:
+                        base_grad_sq += grad_norm ** 2
+
+            captured_metrics["telemetry/total_grad_norm/hypernetwork"] = math.sqrt(hypernet_grad_sq)
+            captured_metrics["telemetry/total_grad_norm/base_model"] = math.sqrt(base_grad_sq)
+
     # Apply optimizer
     lr_this_step = None    
     for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
@@ -324,6 +355,35 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             
         optim.step()
         optim.zero_grad()
+
+    if rank == 0 and log_deep_metrics:
+        hypernet_update_sq = 0.0
+        hypernet_weight_sq = 0.0
+        base_update_sq = 0.0
+        base_weight_sq = 0.0
+
+        with torch.no_grad():
+            for name, param in train_state.model.named_parameters():
+                if param.requires_grad and name in pre_step_weights:
+                    update_norm = (param - pre_step_weights[name]).norm().item()
+                    weight_norm = param.norm().item()
+
+                    ratio = update_norm / (weight_norm + 1e-8)
+                    captured_metrics[f"telemetry/update_ratio/{name}"] = ratio
+
+                    if "hypernet" in name:
+                        hypernet_update_sq += update_norm ** 2
+                        hypernet_weight_sq += weight_norm ** 2
+                    elif "L_level" in name:
+                        base_update_sq += update_norm ** 2
+                        base_weight_sq += weight_norm ** 2
+
+            captured_metrics["telemetry/total_update_ratio/hypernetwork"] = math.sqrt(hypernet_update_sq) / (
+                        math.sqrt(hypernet_weight_sq) + 1e-8)
+            captured_metrics["telemetry/total_update_ratio/base_model"] = math.sqrt(base_update_sq) / (
+                        math.sqrt(base_weight_sq) + 1e-8)
+
+            del pre_step_weights
 
     # Reduce metrics
     if len(metrics):
@@ -344,6 +404,16 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             reduced_metrics = {f"train/{k}": v / (global_batch_size if k.endswith("loss") else count) for k, v in reduced_metrics.items()}
 
             reduced_metrics["train/lr"] = lr_this_step
+
+            if log_deep_metrics:
+                with torch.no_grad():
+                    for name, param in train_state.model.named_parameters():
+                        if param.requires_grad:
+                            reduced_metrics[f"telemetry/static_mean/{name}"] = param.mean().item()
+                            reduced_metrics[f"telemetry/static_std/{name}"] = param.std().item()
+
+                reduced_metrics.update(captured_metrics)
+
             return reduced_metrics
 
 def evaluate(
