@@ -11,7 +11,7 @@ from pydantic import BaseModel
 import random
 from models.common import trunc_normal_init_
 from models.layers import (rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding,
-                           CastedParameter, CastedLinear, DynamicSwiGLU, DynamicAttention)
+                           CastedParameter, CastedLinear, DynamicSwiGLU, DynamicAttention, SinusoidalIterationEmbedding)
 from models.sparse_embedding import CastedSparseEmbedding
 
 IGNORE_LABEL_ID = -100
@@ -71,6 +71,7 @@ class RHN_ACTV1Config(BaseModel):
     hypernet_relative_scale: float
     perceiver_rank: int
     perceiver_heads: int
+    hypernet_iteration_emb_dim: int = 64
 
 class RHN_ACTV1Block(nn.Module):
     def __init__(self, config: RHN_ACTV1Config) -> None:
@@ -204,6 +205,15 @@ class RHN_Hypernetwork(nn.Module):
             )
         )
 
+        self.iteration_token = SinusoidalIterationEmbedding(dim=self.input_size)
+
+        self.token_sum_query = nn.Parameter(
+            trunc_normal_init_(
+                torch.empty((1, 1, self.config.hidden_size * self.config.L_layers), dtype=self.forward_dtype),
+                std=embed_init_std
+            )
+        )
+
         # TODO - Consider alternative initialization to 0's.  Classes below have built-in LeCun Normal initialization.
         module_list = nn.ModuleList(
             [CastedLinear(self.input_size,
@@ -219,8 +229,14 @@ class RHN_Hypernetwork(nn.Module):
                                          self._output_dim(layer_specs),
                                          bias=False)
 
-    def forward(self, activations: torch.Tensor) -> dict:
+    def forward(self, activations: torch.Tensor, iteration_step: int) -> dict:
         batch_size, seq_len, _ = activations.shape
+
+        step_tensor = torch.tensor([iteration_step], device=activations.device)
+        iter_token = self.iteration_token(step_tensor, dtype=self.forward_dtype)
+        iter_token = iter_token.unsqueeze(0).expand(batch_size, 1, -1)
+
+        activations = torch.cat([iter_token, activations], dim=1)
 
         inputs = self._attention(activations)
 
@@ -421,6 +437,8 @@ class RHN_ACTV1_Inner(nn.Module):
 
         # Forward iterations
         z_H, z_L = carry.z_H, carry.z_L
+        global_step = 0
+
         # H_cycles-1 without grad
         with torch.no_grad():
             for _H_step in range(self.config.H_cycles-1):
@@ -428,21 +446,28 @@ class RHN_ACTV1_Inner(nn.Module):
                     z_L = self._dynamic_forward(z_L=z_L,
                                                 z_H=z_H,
                                                 input_embeddings=input_embeddings,
+                                                iteration_step=global_step,
                                                 **seq_info)
+                    global_step += 1
                 z_H = self._dynamic_forward(z_L=z_L,
                                             z_H=z_H,
                                             input_embeddings=None,
+                                            iteration_step=global_step,
                                             **seq_info)
+                global_step += 1
 
         for _L_step in range(self.config.L_cycles):
             z_L = self._dynamic_forward(z_L=z_L,
                                         z_H=z_H,
                                         input_embeddings=input_embeddings,
+                                        iteration_step=global_step,
                                         **seq_info)
+            global_step += 1
 
         z_H = self._dynamic_forward(z_L=z_L,
                                     z_H=z_H,
                                     input_embeddings=None,
+                                    iteration_step=global_step,
                                     **seq_info)
 
         # LM Outputs
@@ -451,7 +476,7 @@ class RHN_ACTV1_Inner(nn.Module):
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
 
-    def _dynamic_forward(self, z_L, z_H, input_embeddings=None, **seq_info):
+    def _dynamic_forward(self, z_L, z_H, iteration_step: int, input_embeddings=None, **seq_info):
         h_base = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
         activations = torch.tensor([], dtype=h_base.dtype, device=h_base.device)
         # Base model output
@@ -463,7 +488,7 @@ class RHN_ACTV1_Inner(nn.Module):
 
         # Dynamic weight output
         h_dyn = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
-        dynamic_weights = self.hypernet(activations)
+        dynamic_weights = self.hypernet(activations, iteration_step=iteration_step)
         for i, layer in enumerate(self.L_level):
             layer_weights = [dynamic_weights[layer_name] for layer_name in dynamic_weights if
                              f"L_level.{i}" in layer_name]
