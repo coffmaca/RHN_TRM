@@ -209,7 +209,7 @@ class RHN_Hypernetwork(nn.Module):
             )
         )
 
-        total_max_steps = float(self.config.H_cycles * self.config.L_cycles * self.config.halt_max_steps)
+        total_max_steps = float(self.config.H_cycles * (self.config.L_cycles + 1) * self.config.halt_max_steps)
         self.iteration_token = SinusoidalIterationEmbedding(dim=self.input_size, max_period=total_max_steps)
 
         # TODO - Consider alternative initialization to 0's.  Classes below have built-in LeCun Normal initialization.
@@ -488,8 +488,8 @@ class RHN_ACTV1_Inner(nn.Module):
                 z_H, _, step_m = self._dynamic_forward(z_L=z_L,
                                             z_H=z_H,
                                             input_embeddings=None,
-                                            iteration_steps=current_steps,
                                             log_deep_metrics=log_deep_metrics,
+                                            iteration_steps=current_steps,
                                             **seq_info)
                 track_metrics(prev_z_H, z_H, step_m)
                 current_steps += 1
