@@ -512,6 +512,7 @@ class RHN_ACTV1_Inner(nn.Module):
 
         if log_deep_metrics:
             total_metrics["telemetry/gen_svd_ratio"] = torch.tensor(0.0, device=z_H.device)
+            total_metrics["telemetry/gen_base_l2_ratio"] = torch.tensor(0.0, device=z_H.device)
 
         metric_calls = 0
 
@@ -525,6 +526,7 @@ class RHN_ACTV1_Inner(nn.Module):
             # Low-Frequency (Every 100 Steps)
             if log_deep_metrics:
                 total_metrics["telemetry/gen_svd_ratio"] += step_metrics["svd_ratio"]
+                total_metrics["telemetry/gen_base_l2_ratio"] += step_metrics["gen_base_l2_ratio"]
             metric_calls += 1
 
         total_l2 = torch.zeros(z_L.shape[0], device=z_L.device, dtype=z_L.dtype)
@@ -582,7 +584,7 @@ class RHN_ACTV1_Inner(nn.Module):
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), avg_l2, avg_kl, total_metrics
 
-    def _dynamic_forward(self, z_L, z_H, input_embeddings=None, log_deep_metrics=False, **seq_info)-> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    def _dynamic_forward(self, z_L, z_H, input_embeddings=None, log_deep_metrics=False, **seq_info):
         h_base = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
         activations = torch.tensor([], dtype=h_base.dtype, device=h_base.device)
         # Base model output
@@ -603,9 +605,11 @@ class RHN_ACTV1_Inner(nn.Module):
 
             gen_norm = 0.0
             svd_ratio = 0.0
+            gen_base_l2_ratio = 0.0
             count = 0
 
             for k, v in dynamic_weights.items():
+                base_param = self.get_parameter(k)
                 if isinstance(v, tuple) and len(v) == 2:
                     A, B = v
 
@@ -616,12 +620,25 @@ class RHN_ACTV1_Inner(nn.Module):
                         S = torch.linalg.svdvals(delta_W)
                         svd_ratio += (S[0] / (S.sum() + 1e-6))
 
+                        gen_base_l2_ratio += delta_W.norm() / (base_param.norm() + 1e-8)
+
+                    count += 1
+                else:
+                    A = v
+                    gen_norm += A[0].norm()
+
+                    if log_deep_metrics:
+                        delta_W = A[0].float()
+                        gen_base_l2_ratio += delta_W.norm() / (base_param.norm() + 1e-8)
+
                     count += 1
 
             step_metrics["gen_norm"] = (gen_norm / count) if count > 0 else torch.tensor(0.0, device=h_base.device)
             if log_deep_metrics:
                 step_metrics["svd_ratio"] = (svd_ratio / count) if count > 0 else torch.tensor(0.0,
                                                                                                device=h_base.device)
+                step_metrics["gen_base_l2_ratio"] = (gen_base_l2_ratio / count) if count > 0 else torch.tensor(0.0,
+                                                                                                         device=h_base.device)
 
         for i, layer in enumerate(self.L_level):
             layer_weights = [dynamic_weights[layer_name] for layer_name in dynamic_weights if
@@ -667,7 +684,7 @@ class RHN_ACTV1(nn.Module):
         new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
 
         # Forward inner model
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits), hypernet_l2, hypernet_kl, deep_metrics = self.inner(new_inner_carry, new_current_data)
+        new_inner_carry, logits, (q_halt_logits, q_continue_logits), hypernet_l2, hypernet_kl, deep_metrics = self.inner(new_inner_carry, new_current_data, log_deep_metrics)
 
         outputs = {
             "logits": logits,
