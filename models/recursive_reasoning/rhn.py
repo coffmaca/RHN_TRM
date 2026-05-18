@@ -73,6 +73,7 @@ class RHN_ACTV1Config(BaseModel):
     perceiver_heads: int
     hypernet_l2_lambda: float = 1e-4
     hypernet_kl_lambda: float = 1e-4
+    hypernet_grad_scale: float = 8.0
 
 class RHN_ACTV1Block(nn.Module):
     def __init__(self, config: RHN_ACTV1Config, attn: bool = True, use_spectral_norm : bool = False) -> None:
@@ -309,6 +310,8 @@ class RHN_Hypernetwork(nn.Module):
         combined_input = torch.cat([z_expanded, coords_expanded], dim=-1)
         generated_chunks = self.decoder(combined_input)
         generated_values = generated_chunks.view(batch_size, -1, self.config.hypernet_rank)
+
+        generated_values = generated_values * self.config.hypernet_grad_scale
 
         step_l2 = generated_values.view(batch_size, -1).pow(2).sum(dim=1)
 
@@ -586,7 +589,7 @@ class RHN_ACTV1_Inner(nn.Module):
         for layer in self.L_level:
             layer.clear_dynamic_adapter()
             h_base = layer(hidden_states=h_base, **seq_info)
-            activations = torch.cat((activations, h_base.detach()),
+            activations = torch.cat((activations, h_base),
                                     dim=2)  # TODO - Determine whether detaching is preferable here.
 
         # Dynamic weight output
