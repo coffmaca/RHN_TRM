@@ -537,7 +537,7 @@ class RHN_ACTV1_Inner(nn.Module):
         for layer in self.L_level:
             layer.clear_dynamic_adapter()
             h_base = layer(hidden_states=h_base, **seq_info)
-            activations = torch.cat((activations, h_base.detach()),
+            activations = torch.cat((activations, h_base), #.detach()),
                                     dim=2)  # TODO - Determine whether detaching is preferable here.
 
         # Dynamic weight output
