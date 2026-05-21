@@ -89,11 +89,12 @@ class ACTLossHead(nn.Module):
 
         lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
         q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
-        scaled_l2_loss = (outputs["hypernet_l2"] * valid_metrics).sum() * self.l2_lambda
+        scaled_l2_loss = (outputs["hypernet_l2"]).sum() * self.l2_lambda
+        scaled_l2_loss_metric = (outputs["hypernet_l2"] * valid_metrics).sum() * self.l2_lambda
         metrics.update({
             "lm_loss": lm_loss.detach(),
             "q_halt_loss": q_halt_loss.detach(),
-            "hypernet_l2_loss": scaled_l2_loss.detach(),
+            "hypernet_l2_loss": scaled_l2_loss_metric.detach(),
         })
         # Q continue (bootstrapping target loss); Alexia: This fits Q-learning, but seems totally unecessary
         q_continue_loss = 0
