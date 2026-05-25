@@ -72,22 +72,22 @@ class RHN_ACTV1Config(BaseModel):
     perceiver_heads: int
 
 class RHN_ACTV1Block(nn.Module):
-    def __init__(self, config: RHN_ACTV1Config, attn: bool = True) -> None:
+    def __init__(self, config: RHN_ACTV1Config, attn: bool = True, in_features: int = 512, out_features: int = 512) -> None:
         super().__init__()
 
         self.config = config
         self.attn = attn
         if self.attn:
             if self.config.mlp_t:
-                self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hypernet_hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
+                self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -in_features) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
                 self.mlp_t = SwiGLU(
                     hidden_size= self.config.perceiver_rank, # self.config.seq_len + self.puzzle_emb_len,
                     expansion=config.expansion,
                 )
             else:
                 self.self_attn = Attention(
-                    hidden_size=config.hypernet_hidden_size,
-                    head_dim=config.hypernet_hidden_size // config.num_heads,
+                    hidden_size=in_features,
+                    head_dim=in_features // config.num_heads,
                     num_heads=config.num_heads,
                     num_key_value_heads=config.num_heads,
                     causal=False
@@ -95,6 +95,8 @@ class RHN_ACTV1Block(nn.Module):
         self.mlp = SwiGLU(
             hidden_size=config.hypernet_hidden_size,
             expansion=config.expansion,
+            in_features=in_features,
+            out_features=out_features
         )
         self.norm_eps = config.rms_norm_eps
 
@@ -218,8 +220,17 @@ class RHN_Hypernetwork(nn.Module):
             )
         )
 
+        self.projection = SwiGLU(hidden_size=config.hypernet_hidden_size,
+                                 expansion=config.expansion,
+                                 in_features=self.config.hidden_size,
+                                 out_features=self.config.hypernet_hidden_size) if self.config.hidden_size != self.config.hypernet_hidden_size else None
+
         self.hypernet_base = nn.ModuleList(
-            [RHN_ACTV1Block(self.config, attn=False) for _i in range(self.config.H_layers)]
+            [RHN_ACTV1Block(self.config,
+                            attn=False,
+                            in_features=self.config.hypernet_hidden_size,
+                            out_features=self.config.hypernet_hidden_size) for _i in range(self.config.H_layers)
+             ]
         )
 
         self.output_head = CastedLinear(self.config.hypernet_hidden_size,
@@ -231,6 +242,8 @@ class RHN_Hypernetwork(nn.Module):
 
         hidden_states = self._attention(activations)
         # hidden_states = activations
+
+        hidden_states = self.projection(hidden_states) if self.config.hidden_size != self.config.hypernet_hidden_size else hidden_states
 
         for layer in self.hypernet_base:
             hidden_states = layer(hidden_states=hidden_states, **seq_info)
