@@ -45,6 +45,7 @@ class ACTLossHead(nn.Module):
         self.loss_fn = globals()[loss_type]
         self.l2_lambda = self.model.config.hypernet_l2_lambda
         self.kl_lambda = self.model.config.hypernet_kl_lambda
+        self.kl_warmup = self.model.config.hypernet_kl_warmup
 
     def initial_carry(self, *args, **kwargs):
         return self.model.initial_carry(*args, **kwargs)  # type: ignore
@@ -52,6 +53,8 @@ class ACTLossHead(nn.Module):
     def forward(
         self,
         return_keys: Sequence[str],
+        step: int,
+        total_steps: int,
         log_deep_metrics: bool = False,
         # Model args
         **model_kwargs,
@@ -97,6 +100,13 @@ class ACTLossHead(nn.Module):
 
         lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
         q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
+
+        kl_warmup_steps = total_steps * self.kl_warmup
+
+        if step < kl_warmup_steps:
+            current_kl_lambda = self.kl_lambda * (step / max(1, kl_warmup_steps))
+        else:
+            current_kl_lambda = self.kl_lambda
 
         scaled_l2_loss = (outputs["hypernet_l2"]).sum() * self.l2_lambda
         scaled_l2_loss_metric = (outputs["hypernet_l2"] * valid_metrics).sum() * self.l2_lambda

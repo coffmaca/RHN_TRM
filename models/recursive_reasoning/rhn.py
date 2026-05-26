@@ -72,6 +72,8 @@ class RHN_ACTV1Config(BaseModel):
     perceiver_heads: int
     hypernet_l2_lambda: float = 1e-4
     hypernet_kl_lambda: float = 1e-4
+    hypernet_kl_warmup: float = 0.125
+
 
 class RHN_ACTV1Block(nn.Module):
     def __init__(self, config: RHN_ACTV1Config, attn: bool = True, use_spectral_norm : bool = False) -> None:

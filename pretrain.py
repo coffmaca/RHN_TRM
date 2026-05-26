@@ -306,6 +306,8 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         carry=train_state.carry,
         batch=batch,
         return_keys=[],
+        step=train_state.step,
+        total_steps=train_state.total_steps,
         log_deep_metrics=log_deep_metrics
     )
 
