@@ -110,8 +110,8 @@ class ACTLossHead(nn.Module):
 
         scaled_l2_loss = (outputs["hypernet_l2"]).sum() * self.l2_lambda
         scaled_l2_loss_metric = (outputs["hypernet_l2"] * valid_metrics).sum() * self.l2_lambda
-        scaled_kl_loss = (outputs["hypernet_kl"]).sum() * self.kl_lambda
-        scaled_kl_loss_metric = (outputs["hypernet_kl"] * valid_metrics).sum() * self.kl_lambda
+        scaled_kl_loss = (outputs["hypernet_kl"]).sum() * current_kl_lambda
+        scaled_kl_loss_metric = (outputs["hypernet_kl"] * valid_metrics).sum() * current_kl_lambda
 
         metrics.update({
             "lm_loss": lm_loss.detach(),
