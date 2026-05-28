@@ -490,7 +490,11 @@ def evaluate(
             inference_steps = 0
             while True:
                 carry, loss, metrics, preds, all_finish = train_state.model(
-                    carry=carry, batch=batch, return_keys=return_keys
+                    carry=carry,
+                    batch=batch,
+                    return_keys=return_keys,
+                    step=train_state.step,
+                    total_steps=train_state.total_steps
                 )
                 inference_steps += 1
 
