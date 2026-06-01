@@ -34,3 +34,4 @@ perceiver_heads: 8
 
 hypernet_dropout: 0.2
 hypernet_l2_lambda: 1e-4
+hypernet_l2_cooldown: 0.25

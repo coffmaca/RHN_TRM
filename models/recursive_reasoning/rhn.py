@@ -73,6 +73,7 @@ class RHN_ACTV1Config(BaseModel):
 
     hypernet_dropout: float = 0.2
     hypernet_l2_lambda: float = 1e-4
+    hypernet_l2_cooldown: float = 0.25
 
 class RHN_ACTV1Block(nn.Module):
     def __init__(self, config: RHN_ACTV1Config, attn: bool = True) -> None:
