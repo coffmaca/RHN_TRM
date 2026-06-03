@@ -33,4 +33,4 @@ perceiver_rank: 32
 perceiver_heads: 8
 hypernet_l2_lambda: 1e-4
 hypernet_kl_lambda: 1e-4
-hypernet_kl_warmup: 0.125
+hypernet_kl_anneal_milestones: [[0.15,.1],[0.5,0.99]]

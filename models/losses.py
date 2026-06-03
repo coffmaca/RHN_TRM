@@ -45,10 +45,33 @@ class ACTLossHead(nn.Module):
         self.loss_fn = globals()[loss_type]
         self.l2_lambda = self.model.config.hypernet_l2_lambda
         self.kl_lambda = self.model.config.hypernet_kl_lambda
-        self.kl_warmup = self.model.config.hypernet_kl_warmup
+        if self.model.config.hypernet_kl_anneal_milestones is not None:
+            x1, y1 = self.model.config.hypernet_kl_anneal_milestones[0]
+            x2, y2 = self.model.config.hypernet_kl_anneal_milestones[1]
+            a, b = self.compute_annealing_params(x1, y1, x2, y2)
+            self.kl_annealing_params = {"a": a, "b": b}
+        else:
+            self.kl_annealing_params = None
 
     def initial_carry(self, *args, **kwargs):
         return self.model.initial_carry(*args, **kwargs)  # type: ignore
+
+    @staticmethod
+    def compute_annealing_params(x1, y1, x2, y2):
+        z1 = math.atanh(2 * y1 - 1)
+        z2 = math.atanh(2 * y2 - 1)
+        a = (x1 - x2) / (z1 - z2)
+        b = x1 - (a * z1)
+
+        return a, b
+
+    def compute_annealing_factor(self, step, total_steps):
+        a = self.kl_annealing_params["a"]
+        b = self.kl_annealing_params["b"]
+        x = step / total_steps
+        y = 0.5 * ((math.tanh((x - b) / a)) + 1)
+
+        return y
 
     def forward(
         self,
@@ -101,10 +124,9 @@ class ACTLossHead(nn.Module):
         lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
         q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
 
-        kl_warmup_steps = total_steps * self.kl_warmup
-
-        if step < kl_warmup_steps:
-            current_kl_lambda = self.kl_lambda * (step / max(1, kl_warmup_steps))
+        if self.kl_annealing_params is not None:
+            kl_annealing_factor = self.compute_annealing_factor(step, total_steps)
+            current_kl_lambda = self.kl_lambda * kl_annealing_factor
         else:
             current_kl_lambda = self.kl_lambda
 
@@ -117,7 +139,8 @@ class ACTLossHead(nn.Module):
             "lm_loss": lm_loss.detach(),
             "q_halt_loss": q_halt_loss.detach(),
             "hypernet_l2_loss": scaled_l2_loss_metric.detach(),
-            "hypernet_kl_loss": scaled_kl_loss_metric.detach()
+            "hypernet_kl_loss": scaled_kl_loss_metric.detach(),
+            "hypernet_kl_lambda": torch.tensor(current_kl_lambda, device=scaled_kl_loss.device).detach(),
         })
         # Q continue (bootstrapping target loss); Alexia: This fits Q-learning, but seems totally unecessary
         q_continue_loss = 0

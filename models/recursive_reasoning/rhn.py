@@ -72,7 +72,7 @@ class RHN_ACTV1Config(BaseModel):
     perceiver_heads: int
     hypernet_l2_lambda: float = 1e-4
     hypernet_kl_lambda: float = 1e-4
-    hypernet_kl_warmup: float = 0.125
+    hypernet_kl_anneal_milestones: Optional[Tuple[Tuple[float, float], Tuple[float, float]]]
 
 
 class RHN_ACTV1Block(nn.Module):
