@@ -140,7 +140,7 @@ class ACTLossHead(nn.Module):
             "q_halt_loss": q_halt_loss.detach(),
             "hypernet_l2_loss": scaled_l2_loss_metric.detach(),
             "hypernet_kl_loss": scaled_kl_loss_metric.detach(),
-            "hypernet_kl_lambda": torch.tensor(current_kl_lambda, device=scaled_kl_loss.device).detach(),
+            "hypernet_kl_lambda": torch.tensor(current_kl_lambda * valid_metrics.sum(), device=scaled_kl_loss.device).detach(),
         })
         # Q continue (bootstrapping target loss); Alexia: This fits Q-learning, but seems totally unecessary
         q_continue_loss = 0
