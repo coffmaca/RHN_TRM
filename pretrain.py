@@ -62,6 +62,9 @@ class PretrainConfig(pydantic.BaseModel):
     beta1: float
     beta2: float
 
+    hypernet_weight_decay: float
+    hypernet_srank_weight_decay: float
+
     # Puzzle embedding
     puzzle_emb_lr: float
     puzzle_emb_weight_decay: float
@@ -144,13 +147,34 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                 for param in list(model.parameters()) + list(model.buffers()):
                     dist.broadcast(param, src=0)
 
+    hypernet_params = []
+    s_rank_params = []
+    base_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        # Route parameters to their specific physics groups
+        if "S_rank" in name:
+            s_rank_params.append(param)
+        elif "hypernet" in name:
+            hypernet_params.append(param)
+        else:
+            base_params.append(param)
+
+    optim_groups = [
+        {"params": base_params, "weight_decay": config.weight_decay},
+        {"params": s_rank_params, "weight_decay": config.hypernet_srank_weight_decay},
+        {"params": hypernet_params, "weight_decay": config.hypernet_weight_decay}
+    ]
+
     # Optimizers and lr
     if config.arch.puzzle_emb_ndim == 0:
         optimizers = [
             AdamATan2(
-                model.parameters(),
+                optim_groups,
                 lr=0,  # Needs to be set by scheduler
-                weight_decay=config.weight_decay,
                 betas=(config.beta1, config.beta2)
             )
         ]
@@ -178,9 +202,8 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                 world_size=world_size
             ),
             AdamATan2(
-                model.parameters(),
+                optim_groups,
                 lr=0,  # Needs to be set by scheduler
-                weight_decay=config.weight_decay,
                 betas=(config.beta1, config.beta2)
             )
         ]

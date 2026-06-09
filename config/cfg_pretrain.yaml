@@ -40,3 +40,6 @@ min_eval_interval: 0 # when to start the eval
 ema: False # use Exponential-Moving-Average
 ema_rate: 0.999 # EMA-rate
 freeze_weights: False # If True, freeze weights and only learn the embeddings
+
+hypernet_weight_decay: 0.1
+hypernet_srank_weight_decay: 0.1

@@ -70,7 +70,7 @@ class RHN_ACTV1Config(BaseModel):
     hypernet_relative_scale: float
     perceiver_rank: int
     perceiver_heads: int
-    hypernet_l2_lambda: float = 1e-4
+    hypernet_l2_lambda: float
 
 class RHN_ACTV1Block(nn.Module):
     def __init__(self, config: RHN_ACTV1Config, attn: bool = True) -> None:
@@ -130,6 +130,7 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
                 self.mlp_t = DynamicSwiGLU(
                     hidden_size=self.config.seq_len + self.puzzle_emb_len,
                     expansion=config.expansion,
+                    rank=config.hypernet_rank
                 )
             else:
                 self.self_attn = DynamicAttention(
@@ -137,11 +138,13 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
                     head_dim=config.hidden_size // config.num_heads,
                     num_heads=config.num_heads,
                     num_key_value_heads=config.num_heads,
-                    causal=False
+                    causal=False,
+                    rank=config.hypernet_rank
                 )
         self.mlp = DynamicSwiGLU(
             hidden_size=config.hidden_size,
             expansion=config.expansion,
+            rank=config.hypernet_rank
         )
         self.norm_eps = config.rms_norm_eps
 
@@ -388,7 +391,7 @@ class RHN_ACTV1_Inner(nn.Module):
         self.layer_specs = []
         for name, param in self.named_parameters():
             name_tag = name.split(".")[0]
-            if name_tag != "L_level":
+            if name_tag != "L_level" or "S_rank" in name:
                 continue
             self.layer_specs.append((name, param.shape))
 
