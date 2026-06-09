@@ -216,9 +216,9 @@ class RHN_Hypernetwork(nn.Module):
         )
         for _ in range(self.config.hypernet_hidden_depth):
             module_list.append(SwiGLU(self.config.hypernet_hidden_size, self.config.expansion))
-            module_list.append(torch.nn.RMSNorm(self.config.hypernet_hidden_size,
-                                                eps=self.config.rms_norm_eps,
-                                                dtype=self.forward_dtype))
+            # module_list.append(torch.nn.RMSNorm(self.config.hypernet_hidden_size,
+            #                                     eps=self.config.rms_norm_eps,
+            #                                     dtype=self.forward_dtype))
 
         self.hypernet_base = nn.Sequential(*module_list)
 
@@ -235,7 +235,6 @@ class RHN_Hypernetwork(nn.Module):
 
         outputs = self.hypernet_base(inputs)
         outputs = self.output_head(outputs)
-        outputs = rms_norm(outputs, variance_epsilon=self.config.rms_norm_eps)
         outputs = self._expand_output(outputs)
 
         step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
@@ -255,11 +254,8 @@ class RHN_Hypernetwork(nn.Module):
                 output_index += shape[1] * self.config.hypernet_rank
 
             if self.config_per_layer[layer]["type"] == "vector":
-                outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
                 outputs_by_layer[layer] = outputs_a
             else:
-                outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
-                outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
                 outputs_by_layer[layer] = (outputs_a, outputs_b)
 
         return outputs_by_layer, step_l2
