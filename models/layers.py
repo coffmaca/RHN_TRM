@@ -296,6 +296,74 @@ class SwiGLU(nn.Module):
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
         return self.down_proj(F.silu(gate) * up)
 
+
+class VectorQuantizerEMA(nn.Module):
+    def __init__(self, num_embeddings: int, embedding_dim: int, commitment_cost: float = 0.25,
+                 decay: float = 0.99, epsilon: float = 1e-5):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.commitment_cost = commitment_cost
+        self.decay = decay
+        self.epsilon = epsilon
+
+        # Initialize the codebook embeddings (using Buffers so they aren't trained by Adam)
+        embed = torch.randn(num_embeddings, embedding_dim)
+        self.register_buffer("embedding", embed)
+        self.register_buffer("cluster_size", torch.zeros(num_embeddings))
+        self.register_buffer("ema_w", embed.clone())
+
+    def forward(self, x: torch.Tensor, update_codebook) -> Tuple[torch.Tensor, torch.Tensor]:
+        # x shape: [Batch, Perceiver_Rank, Dim]
+        flat_x = x.reshape(-1, self.embedding_dim)
+
+        emb = self.embedding.to(x.dtype)
+
+        # Compute distances: (x - e)^2 = x^2 - 2xe + e^2
+        distances = (torch.sum(flat_x ** 2, dim=1, keepdim=True)
+                     + torch.sum(emb ** 2, dim=1)
+                     - 2 * torch.matmul(flat_x, emb.t()))
+
+        # Find the closest vectors
+        encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
+        self.batch_active_codes = torch.unique(encoding_indices).numel()
+        encodings = torch.zeros(encoding_indices.shape[0], self.num_embeddings, device=x.device, dtype=x.dtype)
+        encodings.scatter_(1, encoding_indices, 1)
+
+        # Quantize the input
+        quantized = torch.matmul(encodings, emb).view(x.shape)
+
+        # Update the codebook using Exponential Moving Average (only in training)
+        if self.training and update_codebook:
+            with torch.no_grad():
+                self.cluster_size.data.mul_(self.decay).add_(
+                    encodings.sum(0), alpha=1 - self.decay
+                )
+
+                # Laplace smoothing to prevent dead codes
+                n = self.cluster_size.sum()
+                cluster_size = (
+                        (self.cluster_size + self.epsilon)
+                        / (n + self.num_embeddings * self.epsilon)
+                        * n
+                )
+
+                dw = torch.matmul(encodings.t(), flat_x)
+                self.ema_w.data.mul_(self.decay).add_(dw, alpha=1 - self.decay)
+
+                self.embedding.data.copy_(self.ema_w / cluster_size.unsqueeze(1))
+
+        # Commitment Loss: Forces the encoder to commit to the discrete codes
+        e_latent_loss = F.mse_loss(quantized.detach(), x, reduction='none')
+        # Average over Rank and Dim, keep Batch dimension to match ACT loop masking
+        loss = self.commitment_cost * e_latent_loss.mean(dim=[-2, -1])
+
+        # Straight-Through Estimator (STE): allows gradients to flow back through the non-differentiable argmin
+        quantized = x + (quantized - x).detach()
+
+        return quantized, loss
+
+
 def rms_norm(hidden_states: torch.Tensor, variance_epsilon: float) -> torch.Tensor:
     input_dtype = hidden_states.dtype
     hidden_states = hidden_states.to(torch.float32)

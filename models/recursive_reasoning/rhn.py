@@ -11,7 +11,7 @@ from pydantic import BaseModel
 import random
 from models.common import trunc_normal_init_
 from models.layers import (rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding,
-                           CastedParameter, CastedLinear, DynamicSwiGLU, DynamicAttention)
+                           CastedParameter, CastedLinear, DynamicSwiGLU, DynamicAttention, VectorQuantizerEMA)
 from models.sparse_embedding import CastedSparseEmbedding
 
 IGNORE_LABEL_ID = -100
@@ -71,6 +71,10 @@ class RHN_ACTV1Config(BaseModel):
     perceiver_rank: int
     perceiver_heads: int
     hypernet_l2_lambda: float = 1e-4
+
+    vq_codebook_size: int = 128
+    vq_commitment_cost: float = 0.25
+    vq_decay: float = 0.99
 
 class RHN_ACTV1Block(nn.Module):
     def __init__(self, config: RHN_ACTV1Config, attn: bool = True) -> None:
@@ -223,11 +227,18 @@ class RHN_Hypernetwork(nn.Module):
             [RHN_ACTV1Block(self.config, attn=True) for _i in range(self.config.H_layers)]
         )
 
+        self.vq = VectorQuantizerEMA(
+            num_embeddings=config.vq_codebook_size,
+            embedding_dim=config.hypernet_hidden_size,
+            commitment_cost=config.vq_commitment_cost,
+            decay=config.vq_decay
+        )
+
         self.output_head = CastedLinear(self.config.hypernet_hidden_size,
                                          self._output_dim(layer_specs),
                                          bias=False)
 
-    def forward(self, activations: torch.Tensor, **seq_info) -> Tuple[dict, torch.Tensor]:
+    def forward(self, activations: torch.Tensor, update_codebook: bool, **seq_info) -> Tuple[dict, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
 
         hidden_states = self._attention(activations)
@@ -235,6 +246,9 @@ class RHN_Hypernetwork(nn.Module):
 
         for layer in self.hypernet_base:
             hidden_states = layer(hidden_states=hidden_states, **seq_info)
+
+        hidden_states, step_vq = self.vq(hidden_states, update_codebook)
+
         outputs = self.output_head(hidden_states) # rms_norm(self.output_head(hidden_states), variance_epsilon=self.config.rms_norm_eps)
         outputs = rms_norm(self._expand_output(outputs), variance_epsilon=self.config.rms_norm_eps)
 
@@ -259,7 +273,7 @@ class RHN_Hypernetwork(nn.Module):
             else:
                 outputs_by_layer[layer] = (outputs_a, outputs_b)
 
-        return outputs_by_layer, step_l2
+        return outputs_by_layer, step_l2, step_vq
 
     def _is_vector_like(self, shape:list) -> bool:
         if len(shape) < 2:
@@ -439,7 +453,8 @@ class RHN_ACTV1_Inner(nn.Module):
         )
 
     def forward(self, carry: RHN_ACTV1InnerCarry, batch: Dict[str, torch.Tensor], log_deep_metrics: bool = False,
-                **kwargs) -> Tuple[RHN_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor, dict]:
+                **kwargs) -> Tuple[RHN_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor,
+                                    torch.Tensor, dict]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
@@ -477,44 +492,53 @@ class RHN_ACTV1_Inner(nn.Module):
             metric_calls += 1
 
         total_l2 = torch.zeros(z_L.shape[0], device=z_L.device, dtype=z_L.dtype)
+        total_vq = torch.zeros(z_L.shape[0], device=z_L.device, dtype=z_L.dtype)
 
         # H_cycles-1 without grad
         with torch.no_grad():
             for _H_step in range(self.config.H_cycles-1):
                 for _L_step in range(self.config.L_cycles):
                     prev_z_L = z_L
-                    z_L, _, step_m = self._dynamic_forward(z_L=z_L,
-                                                        z_H=z_H,
-                                                        input_embeddings=input_embeddings,
-                                                        log_deep_metrics=log_deep_metrics,
-                                                        **seq_info)
+                    z_L, _, _, step_m = self._dynamic_forward(z_L=z_L,
+                                                              z_H=z_H,
+                                                              input_embeddings=input_embeddings,
+                                                              log_deep_metrics=log_deep_metrics,
+                                                              update_codebook=False,
+                                                              **seq_info)
                     track_metrics(prev_z_L, z_L, step_m)
                 prev_z_H = z_H
-                z_H, _, step_m = self._dynamic_forward(z_L=z_L,
-                                                    z_H=z_H,
-                                                    input_embeddings=None,
-                                                    log_deep_metrics=log_deep_metrics,
-                                                    **seq_info)
+                z_H, _, _, step_m = self._dynamic_forward(z_L=z_L,
+                                                          z_H=z_H,
+                                                          input_embeddings=None,
+                                                          log_deep_metrics=log_deep_metrics,
+                                                          update_codebook=False,
+                                                          **seq_info)
                 track_metrics(prev_z_H, z_H, step_m)
 
         for _L_step in range(self.config.L_cycles):
             prev_z_L = z_L
-            z_L, step_l2, step_m = self._dynamic_forward(z_L=z_L,
-                                                z_H=z_H,
-                                                input_embeddings=input_embeddings,
-                                                log_deep_metrics=log_deep_metrics,
-                                                **seq_info)
+            z_L, step_l2, step_vq, step_m = self._dynamic_forward(z_L=z_L,
+                                                                  z_H=z_H,
+                                                                  input_embeddings=input_embeddings,
+                                                                  log_deep_metrics=log_deep_metrics,
+                                                                  update_codebook=True,
+                                                                  **seq_info)
             track_metrics(prev_z_L, z_L, step_m)
+            total_l2 += step_l2
+            total_vq += step_vq
 
         prev_z_H = z_H
-        z_H, step_l2, step_m = self._dynamic_forward(z_L=z_L,
-                                    z_H=z_H,
-                                    input_embeddings=None,
-                                    log_deep_metrics=log_deep_metrics,
-                                    **seq_info)
+        z_H, step_l2, step_vq, step_m = self._dynamic_forward(z_L=z_L,
+                                                              z_H=z_H,
+                                                              input_embeddings=None,
+                                                              log_deep_metrics=log_deep_metrics,
+                                                              update_codebook=True,
+                                                              **seq_info)
 
         total_l2 += step_l2
+        total_vq += step_vq
         avg_l2 = total_l2 / (self.config.L_cycles + 1)
+        avg_vq = total_vq / (self.config.L_cycles + 1)
 
         track_metrics(prev_z_H, z_H, step_m)
 
@@ -526,11 +550,10 @@ class RHN_ACTV1_Inner(nn.Module):
         new_carry = RHN_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
-        return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), avg_l2, total_metrics
+        return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), avg_l2, avg_vq, total_metrics
 
-    def _dynamic_forward(self, z_L, z_H, input_embeddings=None, log_deep_metrics=False, **seq_info) -> Tuple[
-        torch.Tensor, torch.Tensor, dict
-    ]:
+    def _dynamic_forward(self, z_L, z_H, input_embeddings=None, log_deep_metrics=False, update_codebook=False,
+                         **seq_info) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         h_base = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
         activations = torch.tensor([], dtype=h_base.dtype, device=h_base.device)
         # Base model output
@@ -542,7 +565,7 @@ class RHN_ACTV1_Inner(nn.Module):
 
         # Dynamic weight output
         h_dyn = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
-        dynamic_weights, step_l2 = self.hypernet(activations, **seq_info)
+        dynamic_weights, step_l2, step_vq = self.hypernet(activations, update_codebook, **seq_info)
 
         step_metrics = {}
         with torch.no_grad():
@@ -593,7 +616,7 @@ class RHN_ACTV1_Inner(nn.Module):
             layer.set_dynamic_adapter(*layer_weights)
             h_dyn = layer(hidden_states=h_dyn, **seq_info)
 
-        return h_base + h_dyn, step_l2, step_metrics
+        return h_base + h_dyn, step_l2, step_vq, step_metrics
 
 
 
@@ -631,14 +654,25 @@ class RHN_ACTV1(nn.Module):
         new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
 
         # Forward inner model
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits), hypernet_l2, deep_metrics = self.inner(new_inner_carry, new_current_data, log_deep_metrics)
+        new_inner_carry, logits, (q_halt_logits, q_continue_logits), hypernet_l2, hypernet_vq, deep_metrics = self.inner(new_inner_carry, new_current_data, log_deep_metrics)
 
         outputs = {
             "logits": logits,
             "q_halt_logits": q_halt_logits,
             "q_continue_logits": q_continue_logits,
             "hypernet_l2": hypernet_l2,
+            "hypernet_vq": hypernet_vq,
         }
+
+        if hasattr(self.inner.hypernet, 'vq'):
+            outputs["telemetry/vq_batch_active_codes"] = torch.tensor(
+                self.inner.hypernet.vq.batch_active_codes,
+                dtype=torch.float32,
+                device=logits.device
+            )
+            outputs["telemetry/vq_ema_active_codes"] = (
+                    self.inner.hypernet.vq.cluster_size > 1.0
+            ).sum().to(torch.float32)
 
         outputs.update(deep_metrics)
 
