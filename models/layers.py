@@ -307,6 +307,8 @@ class VectorQuantizerEMA(nn.Module):
         self.decay = decay
         self.epsilon = epsilon
 
+        self.pre_norm = nn.LayerNorm(embedding_dim, elementwise_affine=False)
+
         # Initialize the codebook embeddings (using Buffers so they aren't trained by Adam)
         embed = torch.randn(num_embeddings, embedding_dim)
         embed = F.normalize(embed, p=2, dim=1)
@@ -321,7 +323,8 @@ class VectorQuantizerEMA(nn.Module):
 
         # x shape: [Batch, Perceiver_Rank, Dim]
         flat_x = x.reshape(-1, self.embedding_dim)
-        flat_x_norm = F.normalize(flat_x, p=2, dim=1)
+        flat_x_centered = self.pre_norm(flat_x)
+        flat_x_norm = F.normalize(flat_x_centered, p=2, dim=1)
 
         emb = self.embedding.to(x.dtype)
         emb_norm = F.normalize(emb, p=2, dim=1)
@@ -330,7 +333,8 @@ class VectorQuantizerEMA(nn.Module):
         distances = 2.0 - 2.0 * torch.matmul(flat_x_norm, emb_norm.t())
 
         # Find the closest vectors
-        encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
+        min_distances, encoding_indices = torch.min(distances, dim=1)
+        encoding_indices = encoding_indices.unsqueeze(1)
         self.batch_active_codes = torch.unique(encoding_indices).numel()
         encodings = torch.zeros(encoding_indices.shape[0], self.num_embeddings, device=x.device, dtype=x.dtype)
         encodings.scatter_(1, encoding_indices, 1)
@@ -362,9 +366,13 @@ class VectorQuantizerEMA(nn.Module):
 
                 if len(dead_indices) > 0:
                     num_dead = len(dead_indices)
-                    rand_indices = torch.randperm(flat_x.shape[0], device=flat_x.device)[:num_dead]
 
-                    sampled_norm = flat_x_norm[rand_indices]
+                    if flat_x.shape[0] >= num_dead:
+                        worst_match_indices = torch.topk(min_distances, num_dead).indices
+                    else:
+                        worst_match_indices = torch.randint(0, flat_x.shape[0], (num_dead,), device=flat_x.device)
+
+                    sampled_norm = flat_x_norm[worst_match_indices]
                     self.embedding.data[dead_indices] = sampled_norm
 
                     self.cluster_size.data[dead_indices] = usage_threshold
