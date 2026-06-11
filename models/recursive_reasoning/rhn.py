@@ -107,17 +107,20 @@ class RHN_ACTV1Block(nn.Module):
         # B, L, D = hidden_states.shape
         # Post Norm
         if self.attn:
+            normed_states = rms_norm(hidden_states, variance_epsilon=self.norm_eps)
             if self.config.mlp_t:
-                hidden_states = hidden_states.transpose(1,2)
-                out = self.mlp_t(hidden_states)
-                hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
-                hidden_states = hidden_states.transpose(1,2)
+                normed_states = normed_states.transpose(1, 2)
+                out = self.mlp_t(normed_states)
+                out = out.transpose(1, 2)
+                hidden_states = hidden_states + out
             else:
                 # Self Attention
-                hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states), variance_epsilon=self.norm_eps)
+                out = self.self_attn(cos_sin=cos_sin, hidden_states=normed_states)
+                hidden_states = hidden_states + out
         # Fully Connected
-        out = self.mlp(hidden_states)
-        hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
+        normed_states = rms_norm(hidden_states, variance_epsilon=self.norm_eps)
+        out = self.mlp(normed_states)
+        hidden_states = hidden_states + out
         return hidden_states
 
 
@@ -176,18 +179,20 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.attn:
+            normed_states = rms_norm(hidden_states, variance_epsilon=self.norm_eps)
             if self.config.mlp_t:
-                hidden_states = hidden_states.transpose(1, 2)
-                out = self.mlp_t(hidden_states)
-                hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
-                hidden_states = hidden_states.transpose(1, 2)
+                normed_states = normed_states.transpose(1, 2)
+                out = self.mlp_t(normed_states)
+                out = out.transpose(1, 2)
+                hidden_states = hidden_states + out
             else:
                 # Self Attention
-                hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states),
-                                         variance_epsilon=self.norm_eps)
+                out = self.self_attn(cos_sin=cos_sin, hidden_states=normed_states)
+                hidden_states = hidden_states + out
         # Fully Connected
-        out = self.mlp(hidden_states)
-        hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
+        normed_states = rms_norm(hidden_states, variance_epsilon=self.norm_eps)
+        out = self.mlp(normed_states)
+        hidden_states = hidden_states + out
         return hidden_states
 
 
@@ -363,6 +368,7 @@ class RHN_ACTV1_Inner(nn.Module):
         super().__init__()
         self.config = config
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
+        self.norm_eps = config.rms_norm_eps
 
         # I/O
 
@@ -548,8 +554,10 @@ class RHN_ACTV1_Inner(nn.Module):
 
         # LM Outputs
         new_carry = RHN_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
-        output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
-        q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
+        
+        norm_z_H = rms_norm(z_H, variance_epsilon=self.norm_eps)
+        output = self.lm_head(norm_z_H)[:, self.puzzle_emb_len:]
+        q_logits = self.q_head(norm_z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), avg_l2, avg_vq, total_metrics
 
     def _dynamic_forward(self, z_L, z_H, input_embeddings=None, log_deep_metrics=False, update_codebook=False,
