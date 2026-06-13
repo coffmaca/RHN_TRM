@@ -243,6 +243,9 @@ class RHN_Hypernetwork(nn.Module):
                                          self._output_dim(layer_specs),
                                          bias=False)
 
+        with torch.no_grad():
+            self.output_head.weight.normal_(mean=0.0, std=1e-4)
+
     def forward(self, activations: torch.Tensor, update_codebook: bool, **seq_info) -> Tuple[dict, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
 
@@ -255,7 +258,7 @@ class RHN_Hypernetwork(nn.Module):
         hidden_states, step_vq = self.vq(hidden_states, update_codebook)
 
         outputs = self.output_head(hidden_states) # rms_norm(self.output_head(hidden_states), variance_epsilon=self.config.rms_norm_eps)
-        outputs = rms_norm(self._expand_output(outputs), variance_epsilon=self.config.rms_norm_eps)
+        # outputs = rms_norm(self._expand_output(outputs), variance_epsilon=self.config.rms_norm_eps)
 
         step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
 
