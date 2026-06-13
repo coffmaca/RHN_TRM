@@ -505,48 +505,51 @@ class RHN_ACTV1_Inner(nn.Module):
             for _H_step in range(self.config.H_cycles-1):
                 for _L_step in range(self.config.L_cycles):
                     prev_z_L = z_L
-                    z_L, _, _, step_m = self._dynamic_forward(z_L=z_L,
+                    delta, _, _, step_m = self._dynamic_forward(z_L=z_L,
                                                               z_H=z_H,
                                                               input_embeddings=input_embeddings,
                                                               log_deep_metrics=log_deep_metrics,
                                                               update_codebook=False,
                                                               **seq_info)
+                    z_L = z_L + delta
                     track_metrics(prev_z_L, z_L, step_m)
                 prev_z_H = z_H
-                z_H, _, _, step_m = self._dynamic_forward(z_L=z_L,
+                delta, _, _, step_m = self._dynamic_forward(z_L=z_L,
                                                           z_H=z_H,
                                                           input_embeddings=None,
                                                           log_deep_metrics=log_deep_metrics,
                                                           update_codebook=False,
                                                           **seq_info)
+                z_H = z_H + delta
                 track_metrics(prev_z_H, z_H, step_m)
 
         for _L_step in range(self.config.L_cycles):
             prev_z_L = z_L
-            z_L, step_l2, step_vq, step_m = self._dynamic_forward(z_L=z_L,
+            delta, step_l2, step_vq, step_m = self._dynamic_forward(z_L=z_L,
                                                                   z_H=z_H,
                                                                   input_embeddings=input_embeddings,
                                                                   log_deep_metrics=log_deep_metrics,
                                                                   update_codebook=True,
                                                                   **seq_info)
+            z_L = z_L + delta
             track_metrics(prev_z_L, z_L, step_m)
             total_l2 += step_l2
             total_vq += step_vq
 
         prev_z_H = z_H
-        z_H, step_l2, step_vq, step_m = self._dynamic_forward(z_L=z_L,
+        delta, step_l2, step_vq, step_m = self._dynamic_forward(z_L=z_L,
                                                               z_H=z_H,
                                                               input_embeddings=None,
                                                               log_deep_metrics=log_deep_metrics,
                                                               update_codebook=True,
                                                               **seq_info)
 
+        z_H = z_H + delta
+        track_metrics(prev_z_H, z_H, step_m)
         total_l2 += step_l2
         total_vq += step_vq
         avg_l2 = total_l2 / (self.config.L_cycles + 1)
         avg_vq = total_vq / (self.config.L_cycles + 1)
-
-        track_metrics(prev_z_H, z_H, step_m)
 
         if metric_calls > 0:
             for k in total_metrics:
@@ -562,17 +565,18 @@ class RHN_ACTV1_Inner(nn.Module):
 
     def _dynamic_forward(self, z_L, z_H, input_embeddings=None, log_deep_metrics=False, update_codebook=False,
                          **seq_info) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-        h_base = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
-        activations = torch.tensor([], dtype=h_base.dtype, device=h_base.device)
+        h_in = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
+
         # Base model output
+        h_base = h_in
+        activations = torch.tensor([], dtype=h_base.dtype, device=h_base.device)
         for layer in self.L_level:
             layer.clear_dynamic_adapter()
             h_base = layer(hidden_states=h_base, **seq_info)
-            activations = torch.cat((activations, h_base.detach()),
-                                    dim=2)  # TODO - Determine whether detaching is preferable here.
+            activations = torch.cat((activations, h_base.detach()), dim=2)
+        base_delta = h_base - h_in
 
         # Dynamic weight output
-        h_dyn = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
         dynamic_weights, step_l2, step_vq = self.hypernet(activations, update_codebook, **seq_info)
 
         step_metrics = {}
@@ -618,13 +622,17 @@ class RHN_ACTV1_Inner(nn.Module):
                 step_metrics["gen_base_l2_ratio"] = (gen_base_l2_ratio / count) if count > 0 else torch.tensor(0.0,
                                                                                                          device=h_base.device)
 
+        h_dyn = h_in
         for i, layer in enumerate(self.L_level):
             layer_weights = [dynamic_weights[layer_name] for layer_name in dynamic_weights if
                              f"L_level.{i}" in layer_name]
             layer.set_dynamic_adapter(*layer_weights)
             h_dyn = layer(hidden_states=h_dyn, **seq_info)
+        dyn_delta = h_dyn - h_in
 
-        return h_base + h_dyn, step_l2, step_vq, step_metrics
+        total_delta = base_delta + dyn_delta
+
+        return total_delta, step_l2, step_vq, step_metrics
 
 
 
