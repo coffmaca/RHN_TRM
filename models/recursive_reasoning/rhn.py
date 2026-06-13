@@ -258,7 +258,7 @@ class RHN_Hypernetwork(nn.Module):
         hidden_states, step_vq = self.vq(hidden_states, update_codebook)
 
         outputs = self.output_head(hidden_states) # rms_norm(self.output_head(hidden_states), variance_epsilon=self.config.rms_norm_eps)
-        # outputs = rms_norm(self._expand_output(outputs), variance_epsilon=self.config.rms_norm_eps)
+        outputs = self._expand_output(outputs)
 
         step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
 
