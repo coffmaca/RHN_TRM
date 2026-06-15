@@ -531,18 +531,18 @@ class RHN_ACTV1_Inner(nn.Module):
     def _dynamic_forward(self, z_L, z_H, input_embeddings=None, log_deep_metrics=False, **seq_info) -> Tuple[
         torch.Tensor, torch.Tensor, dict
     ]:
-        h_base = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
+        raw_state = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
+        h_base = raw_state
         activations = torch.tensor([], dtype=h_base.dtype, device=h_base.device)
         # Base model output
         for layer in self.L_level:
             layer.clear_dynamic_adapter()
             h_base = layer(hidden_states=h_base, **seq_info)
-            activations = torch.cat((activations, h_base.detach()),
-                                    dim=2)  # TODO - Determine whether detaching is preferable here.
+            # activations = torch.cat((activations, h_base.detach()), dim=2)
 
         # Dynamic weight output
-        h_dyn = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
-        dynamic_weights, step_l2 = self.hypernet(activations, **seq_info)
+        h_dyn = raw_state
+        dynamic_weights, step_l2 = self.hypernet(h_dyn, **seq_info)
 
         step_metrics = {}
         with torch.no_grad():
