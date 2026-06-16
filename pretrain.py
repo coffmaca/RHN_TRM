@@ -349,6 +349,8 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         for param_group in optim.param_groups:
             param_group['lr'] = lr_this_step
             
+        torch.nn.utils.clip_grad_norm_(train_state.model.parameters(), max_norm=1.0)
+
         optim.step()
         optim.zero_grad()
 
