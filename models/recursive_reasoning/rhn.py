@@ -146,22 +146,16 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
         )
         self.norm_eps = config.rms_norm_eps
 
-    def set_dynamic_adapter(self, up, down, attn_1=None, attn_2=None):
+    def set_dynamic_adapter(self, *weights):
         if self.attn:
-            # Swap argument to correct assignments
-            up, attn_1 = attn_1, up
-            down, attn_2 = attn_2, down
-
-            A_attn_1, B_attn_1 = attn_1
-            A_attn_2, B_attn_2 = attn_2
+            W_attn_qkv, W_attn_o, W_mlp_up, W_mlp_down = weights
 
             if self.config.mlp_t:
-                self.mlp_t.set_dynamic_adapter(A_attn_1, B_attn_1, A_attn_2, B_attn_2)
+                self.mlp_t.set_dynamic_adapter(W_attn_qkv, W_attn_o)
             else:
-                self.self_attn.set_dynamic_adapter(A_attn_1, B_attn_1, A_attn_2, B_attn_2)
-        A_up, B_up = up
-        A_down, B_down = down
-        self.mlp.set_dynamic_adapter(A_up, B_up, A_down, B_down)
+                self.self_attn.set_dynamic_adapter(W_attn_qkv, W_attn_o)
+        W_mlp_up, W_mlp_down = weights
+        self.mlp.set_dynamic_adapter(W_mlp_up, W_mlp_down)
 
     def clear_dynamic_adapter(self):
         self.mlp.clear_dynamic_adapter()
@@ -229,13 +223,13 @@ class RHN_Hypernetwork(nn.Module):
                                          bias=False)
 
     def forward(self, activations: torch.Tensor, **seq_info) -> Tuple[dict, torch.Tensor]:
-        batch_size, seq_len, _ = activations.shape
+        batch_size = activations.shape[0]
 
         hidden_states = self._attention(activations)
-        # hidden_states = activations
 
         for layer in self.hypernet_base:
             hidden_states = layer(hidden_states=hidden_states, **seq_info)
+
         outputs = self.output_head(hidden_states)
         outputs = outputs.reshape(batch_size, -1)
         outputs = outputs[:, :self.total_adapter_params]
@@ -248,19 +242,16 @@ class RHN_Hypernetwork(nn.Module):
         for layer in self.config_per_layer:
             shape = self.config_per_layer[layer]["shape"]
 
-            outputs_a = outputs[:, output_index : output_index + (shape[0] * self.config.hypernet_rank)]
-            outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
-            output_index += shape[0] * self.config.hypernet_rank
-
             if self.config_per_layer[layer]["type"] == "matrix":
-                outputs_b = outputs[:, output_index : output_index + (shape[1] * self.config.hypernet_rank)]
-                outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
-                output_index += shape[1] * self.config.hypernet_rank
-
-            if self.config_per_layer[layer]["type"] == "vector":
-                outputs_by_layer[layer] = outputs_a
+                num_params = shape[0] * shape[1]
+                layer_outputs = outputs[:, output_index: output_index + num_params]
+                outputs_by_layer[layer] = layer_outputs.view(batch_size, shape[0], shape[1])
             else:
-                outputs_by_layer[layer] = (outputs_a, outputs_b)
+                num_params = shape[0]
+                layer_outputs = outputs[:, output_index: output_index + num_params]
+                outputs_by_layer[layer] = layer_outputs.view(batch_size, shape[0])
+
+            output_index += num_params
 
         return outputs_by_layer, step_l2
 
@@ -281,9 +272,10 @@ class RHN_Hypernetwork(nn.Module):
     def _output_dim(self, layer_specs:dict) -> int:
         total_params = 0
         for name, shape in layer_specs:
-            total_params += shape[0] * self.config.hypernet_rank
-            if not self._is_vector_like(shape):
-                total_params += shape[1] * self.config.hypernet_rank
+            if self._is_vector_like(shape):
+                total_params += shape[0]
+            else:
+                total_params += shape[0] * shape[1]
 
         self.total_adapter_params = total_params
 
@@ -538,31 +530,21 @@ class RHN_ACTV1_Inner(nn.Module):
 
             for k, v in dynamic_weights.items():
                 base_param = self.get_parameter(k)
-                if isinstance(v, tuple) and len(v) == 2:
-                    A, B = v
 
-                    gen_norm += (A[0].norm() + B[0].norm())
+                gen_norm += delta_W[0].norm()
 
-                    if log_deep_metrics:
-                        delta_W = torch.matmul(A[0], B[0]).float()
-                        S = torch.linalg.svdvals(delta_W)
+                if log_deep_metrics:
+                    W_float = delta_W[0].float()
+                    if W_float.dim() >= 2:
+                        S = torch.linalg.svdvals(W_float)
                         svd_ratio += (S[0] / (S.sum() + 1e-6))
 
-                        gen_base_l2_ratio += delta_W.norm() / (base_param.norm() + 1e-8)
+                    gen_base_l2_ratio += delta_W.norm() / (base_param.norm() + 1e-8)
 
-                    count += 1
-                else:
-                    A = v
-                    gen_norm += A[0].norm()
-
-                    if log_deep_metrics:
-                        delta_W = A[0].float()
-                        gen_base_l2_ratio += delta_W.norm() / (base_param.norm() + 1e-8)
-
-                    count += 1
-
+                count += 1
 
             step_metrics["gen_norm"] = (gen_norm / count) if count > 0 else torch.tensor(0.0, device=h_base.device)
+
             if log_deep_metrics:
                 step_metrics["svd_ratio"] = (svd_ratio / count) if count > 0 else torch.tensor(0.0,
                                                                                                device=h_base.device)
