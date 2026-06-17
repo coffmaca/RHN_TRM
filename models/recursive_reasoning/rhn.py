@@ -236,10 +236,12 @@ class RHN_Hypernetwork(nn.Module):
 
         for layer in self.hypernet_base:
             hidden_states = layer(hidden_states=hidden_states, **seq_info)
-        outputs = self.output_head(hidden_states) # rms_norm(self.output_head(hidden_states), variance_epsilon=self.config.rms_norm_eps)
-        outputs = rms_norm(self._expand_output(outputs), variance_epsilon=self.config.rms_norm_eps)
+        outputs = self.output_head(hidden_states)
+        outputs = outputs.reshape(batch_size, -1)
+        outputs = outputs[:, :self.total_adapter_params]
+        outputs = rms_norm(outputs, variance_epsilon=self.config.rms_norm_eps)
 
-        step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
+        step_l2 = outputs.pow(2).sum(dim=1)
 
         outputs_by_layer = {}
         output_index = 0
@@ -277,19 +279,15 @@ class RHN_Hypernetwork(nn.Module):
             return True
 
     def _output_dim(self, layer_specs:dict) -> int:
-        base_param_dim_sum = 0
-        base_param_total = 0
-        for layer in layer_specs:
-            rows, cols = layer[1]
-            base_param_dim_sum += rows + cols
-            base_param_total += rows * cols
+        total_params = 0
+        for name, shape in layer_specs:
+            total_params += shape[0] * self.config.hypernet_rank
+            if not self._is_vector_like(shape):
+                total_params += shape[1] * self.config.hypernet_rank
 
-        base_param_total_low_rank = base_param_dim_sum * self.config.hypernet_rank
+        self.total_adapter_params = total_params
 
-        self.kron_dim = int(-(-base_param_total_low_rank ** (1 / 4) // 1))  # Square root twice (i.e., 1/4th root) and round up
-
-        vals_to_generate = math.ceil((self.kron_dim ** 2 * 2) / self.config.perceiver_rank)
-
+        vals_to_generate = math.ceil(total_params / self.config.perceiver_rank)
         return vals_to_generate
 
     def _attention(self, inputs) -> torch.Tensor:
