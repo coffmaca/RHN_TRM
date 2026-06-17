@@ -351,7 +351,8 @@ class RHN_ACTV1_Inner(nn.Module):
 
         # Base Model
         self.L_level = torch.nn.ModuleList(
-            [RHN_ACTV1Block_Dynamic(self.config, attn=True) for _i in range(self.config.L_layers)]
+            # [RHN_ACTV1Block_Dynamic(self.config, attn=True) for _i in range(self.config.L_layers)]
+            [CastedLinear(self.config.hidden_size, self.config.hidden_size, bias=False)]
         )
 
         # Turn off Base Model training
@@ -528,7 +529,7 @@ class RHN_ACTV1_Inner(nn.Module):
             gen_base_l2_ratio = 0.0
             count = 0
 
-            for k, v in dynamic_weights.items():
+            for k, delta_W in dynamic_weights.items():
                 base_param = self.get_parameter(k)
 
                 gen_norm += delta_W[0].norm()
