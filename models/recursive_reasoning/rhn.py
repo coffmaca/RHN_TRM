@@ -11,7 +11,7 @@ from pydantic import BaseModel
 import random
 from models.common import trunc_normal_init_
 from models.layers import (rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding,
-                           CastedParameter, CastedLinear, DynamicSwiGLU, DynamicAttention)
+                           CastedParameter, CastedLinear, DynamicSwiGLU, DynamicAttention, DynamicCastedLinear)
 from models.sparse_embedding import CastedSparseEmbedding
 
 IGNORE_LABEL_ID = -100
@@ -352,7 +352,7 @@ class RHN_ACTV1_Inner(nn.Module):
         # Base Model
         self.L_level = torch.nn.ModuleList(
             # [RHN_ACTV1Block_Dynamic(self.config, attn=True) for _i in range(self.config.L_layers)]
-            [CastedLinear(self.config.hidden_size, self.config.hidden_size, bias=False)for _i in range(self.config.L_layers)]
+            [DynamicCastedLinear(self.config.hidden_size, self.config.hidden_size, bias=False)for _i in range(self.config.L_layers)]
         )
 
         # Turn off Base Model training
@@ -511,7 +511,7 @@ class RHN_ACTV1_Inner(nn.Module):
         # Base model output
         for layer in self.L_level:
             layer.clear_dynamic_adapter()
-            h_base = layer(hidden_states=h_base, **seq_info)
+            h_base = layer(input=h_base) #, **seq_info)
             activations = torch.cat((activations, h_base.detach()),
                                     dim=2)  # TODO - Determine whether detaching is preferable here.
 
@@ -556,7 +556,7 @@ class RHN_ACTV1_Inner(nn.Module):
             layer_weights = [dynamic_weights[layer_name] for layer_name in dynamic_weights if
                              f"L_level.{i}" in layer_name]
             layer.set_dynamic_adapter(*layer_weights)
-            h_dyn = layer(hidden_states=h_dyn, **seq_info)
+            h_dyn = layer(input=h_dyn) #, **seq_info)
 
         return h_base + h_dyn, step_l2, step_metrics
 
