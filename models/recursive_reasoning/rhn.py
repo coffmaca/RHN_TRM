@@ -352,7 +352,7 @@ class RHN_ACTV1_Inner(nn.Module):
         # Base Model
         self.L_level = torch.nn.ModuleList(
             # [RHN_ACTV1Block_Dynamic(self.config, attn=True) for _i in range(self.config.L_layers)]
-            [CastedLinear(self.config.hidden_size, self.config.hidden_size, bias=False)]
+            [CastedLinear(self.config.hidden_size, self.config.hidden_size, bias=False)for _i in range(self.config.L_layers)]
         )
 
         # Turn off Base Model training
