@@ -563,30 +563,40 @@ class RHN_ACTV1_Inner(nn.Module):
         raw_state = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
         batch_size, seq_len, hidden_dim = raw_state.shape
 
-        base_enc = get_sinusoidal_encoding(global_step, hidden_dim, raw_state.device, raw_state.dtype)
+        # base_enc = get_sinusoidal_encoding(global_step, hidden_dim, raw_state.device, raw_state.dtype)
         hyper_enc = get_sinusoidal_encoding(global_step, self.config.depth_enc_dim, raw_state.device, raw_state.dtype)
         hyper_enc_expanded = hyper_enc.expand(batch_size, seq_len, -1)
 
-        h_base = raw_state + base_enc
-        for layer in self.L_level:
-            layer.clear_dynamic_adapter()
-            h_base = layer(hidden_states=h_base, **seq_info)
+        # h_base = raw_state + base_enc
+        # for layer in self.L_level:
+        #     layer.clear_dynamic_adapter()
+        #     h_base = layer(hidden_states=h_base, **seq_info)
 
         hyper_input = torch.cat([raw_state, hyper_enc_expanded], dim=-1)
         dynamic_weights, step_l2 = self.hypernet(hyper_input, **seq_info)
 
+        # Dynamic weight output
+        h_dyn = raw_state # + base_enc
+
+        for i, layer in enumerate(self.L_level):
+            layer_weights = [dynamic_weights[layer_name] for layer_name in dynamic_weights if
+                             f"L_level.{i}" in layer_name]
+            layer.set_dynamic_adapter(*layer_weights)
+            h_dyn = layer(hidden_states=h_dyn, **seq_info)
+
+        # Metrics
         step_metrics = {}
         with torch.no_grad():
-            step_metrics["sparsity"] = (h_base.abs() < 1e-3).float().mean()
-            step_metrics["saturation"] = (h_base.abs() > 5.0).float().mean()
+            step_metrics["sparsity"] = (h_dyn.abs() < 1e-3).float().mean()
+            step_metrics["saturation"] = (h_dyn.abs() > 5.0).float().mean()
 
             gen_norm = 0.0
             svd_ratio = 0.0
-            gen_base_l2_ratio = 0.0
+            # gen_base_l2_ratio = 0.0
             count = 0
 
             for k, v in dynamic_weights.items():
-                base_param = self.get_parameter(k)
+                # base_param = self.get_parameter(k)
                 if isinstance(v, tuple) and len(v) == 2:
                     A, B = v
 
@@ -597,37 +607,27 @@ class RHN_ACTV1_Inner(nn.Module):
                         S = torch.linalg.svdvals(delta_W)
                         svd_ratio += (S[0] / (S.sum() + 1e-6))
 
-                        gen_base_l2_ratio += delta_W.norm() / (base_param.norm() + 1e-8)
+                        # gen_base_l2_ratio += delta_W.norm() / (base_param.norm() + 1e-8)
 
                     count += 1
                 else:
                     A = v
                     gen_norm += A[0].norm()
 
-                    if log_deep_metrics:
-                        delta_W = A[0].float()
-                        gen_base_l2_ratio += delta_W.norm() / (base_param.norm() + 1e-8)
+                    # if log_deep_metrics:
+                    #     delta_W = A[0].float()
+                    #     gen_base_l2_ratio += delta_W.norm() / (base_param.norm() + 1e-8)
 
                     count += 1
 
-
-            step_metrics["gen_norm"] = (gen_norm / count) if count > 0 else torch.tensor(0.0, device=h_base.device)
+            step_metrics["gen_norm"] = (gen_norm / count) if count > 0 else torch.tensor(0.0, device=h_dyn.device)
             if log_deep_metrics:
                 step_metrics["svd_ratio"] = (svd_ratio / count) if count > 0 else torch.tensor(0.0,
-                                                                                               device=h_base.device)
-                step_metrics["gen_base_l2_ratio"] = (gen_base_l2_ratio / count) if count > 0 else torch.tensor(0.0,
-                                                                                                         device=h_base.device)
+                                                                                               device=h_dyn.device)
+                # step_metrics["gen_base_l2_ratio"] = (gen_base_l2_ratio / count) if count > 0 else torch.tensor(0.0,
+                #                                                                                                device=h_dyn.device)
 
-        # Dynamic weight output
-        h_dyn = raw_state + base_enc
-
-        for i, layer in enumerate(self.L_level):
-            layer_weights = [dynamic_weights[layer_name] for layer_name in dynamic_weights if
-                             f"L_level.{i}" in layer_name]
-            layer.set_dynamic_adapter(*layer_weights)
-            h_dyn = layer(hidden_states=h_dyn, **seq_info)
-
-        return h_base + h_dyn, step_l2, step_metrics
+        return h_dyn, step_l2, step_metrics
 
 
 
