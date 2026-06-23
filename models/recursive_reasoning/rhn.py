@@ -568,11 +568,14 @@ class RHN_ACTV1_Inner(nn.Module):
         hyper_enc_expanded = hyper_enc.expand(batch_size, seq_len, -1)
 
         h_base = raw_state + base_enc
+        activations = torch.tensor([], dtype=h_base.dtype, device=h_base.device)
         for layer in self.L_level:
             layer.clear_dynamic_adapter()
             h_base = layer(hidden_states=h_base, **seq_info)
+            activations = torch.cat((activations, h_base.detach()),
+                                    dim=2)
 
-        hyper_input = torch.cat([raw_state, hyper_enc_expanded], dim=-1)
+        hyper_input = torch.cat([activations, hyper_enc_expanded], dim=-1)
         dynamic_weights, step_l2 = self.hypernet(hyper_input, **seq_info)
 
         step_metrics = {}
