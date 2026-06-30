@@ -573,7 +573,7 @@ class RHN_ACTV1_Inner(nn.Module):
             h_base = layer(hidden_states=h_base, **seq_info)
 
         hyper_input = torch.cat([raw_state, hyper_enc_expanded], dim=-1)
-        dynamic_weights, step_l2 = self.hypernet(hyper_input, **seq_info)
+        dynamic_weights, step_l2 = self.hypernet(hyper_input.detach(), **seq_info)
 
         step_metrics = {}
         with torch.no_grad():
