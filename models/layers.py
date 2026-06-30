@@ -56,6 +56,8 @@ class DynamicCastedLinear(nn.Module):
 
         self.dynamic_adapter = None
 
+        self.dynamic_scale = nn.Parameter(torch.ones(1))
+
     def set_dynamic_adapter(self, A, B):
         self.dynamic_adapter = (A, B)
 
@@ -75,6 +77,8 @@ class DynamicCastedLinear(nn.Module):
 
             out = torch.einsum('abc,adc->abd', input, B.to(input.dtype)) # torch.matmul(input, B)
             out = torch.einsum('abd,aed->abe', out, A.to(input.dtype)) # torch.matmul(out, A)
+
+            out = out * self.dynamic_scale.to(out.dtype)
 
             if input.dim() == 2:
                 out = out.squeeze(1)

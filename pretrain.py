@@ -149,12 +149,27 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                     dist.broadcast(param, src=0)
 
     # Optimizers and lr
+    hypernet_params = []
+    base_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "hypernet" in name:
+            hypernet_params.append(param)
+        else:
+            base_params.append(param)
+
+    optim_groups = [
+        {"params": base_params, "weight_decay": config.weight_decay},
+        {"params": hypernet_params, "weight_decay": 0.0}  # Shielded from weight decay death
+    ]
+
     if config.arch.puzzle_emb_ndim == 0:
         optimizers = [
             AdamATan2(
-                model.parameters(),
+                optim_groups,
                 lr=0,  # Needs to be set by scheduler
-                weight_decay=config.weight_decay,
                 betas=(config.beta1, config.beta2)
             )
         ]
@@ -182,9 +197,8 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                 world_size=world_size
             ),
             AdamATan2(
-                model.parameters(),
+                optim_groups,
                 lr=0,  # Needs to be set by scheduler
-                weight_decay=config.weight_decay,
                 betas=(config.beta1, config.beta2)
             )
         ]

@@ -372,7 +372,7 @@ class RHN_ACTV1_Inner(nn.Module):
         self.layer_specs = []
         for name, param in self.named_parameters():
             name_tag = name.split(".")[0]
-            if name_tag != "L_level":
+            if name_tag != "L_level" or "dynamic_scale" in name:
                 continue
             self.layer_specs.append((name, param.shape))
 
