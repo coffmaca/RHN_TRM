@@ -34,4 +34,4 @@ perceiver_heads: 8
 
 vq_codebook_size: 128
 vq_commitment_cost: 0.25
-vq_decay: 0.99
+vq_decay: 0.8
