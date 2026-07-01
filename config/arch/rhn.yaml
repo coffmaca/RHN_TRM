@@ -31,3 +31,7 @@ layer_emb_dim: 32
 hypernet_relative_scale: 2
 perceiver_rank: 32
 perceiver_heads: 8
+
+vq_codebook_size: 128
+vq_commitment_cost: 0.25
+vq_decay: 0.99
