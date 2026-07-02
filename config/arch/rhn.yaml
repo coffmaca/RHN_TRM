@@ -34,3 +34,7 @@ perceiver_heads: 8
 
 hypernet_dropout: 0.2
 hypernet_l2_lambda: 1e-4
+
+vq_codebook_size: 128
+vq_commitment_cost: 0.25
+vq_decay: 0.8

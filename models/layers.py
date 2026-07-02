@@ -297,6 +297,101 @@ class SwiGLU(nn.Module):
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
         return self.down_proj(F.silu(gate) * up)
 
+
+class VectorQuantizerEMA(nn.Module):
+    def __init__(self, num_embeddings: int, embedding_dim: int, commitment_cost: float = 0.25,
+                 decay: float = 0.99, epsilon: float = 1e-5):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.commitment_cost = commitment_cost
+        self.decay = decay
+        self.epsilon = epsilon
+
+        self.pre_norm = nn.LayerNorm(embedding_dim, elementwise_affine=False)
+
+        # Initialize the codebook embeddings (using Buffers so they aren't trained by Adam)
+        embed = torch.randn(num_embeddings, embedding_dim)
+        embed = F.normalize(embed, p=2, dim=1)
+        self.register_buffer("embedding", embed)
+        self.register_buffer("cluster_size", torch.zeros(num_embeddings))
+        self.register_buffer("ema_w", embed.clone())
+
+    def forward(self, x: torch.Tensor, update_codebook) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.embedding.dtype != x.dtype:
+            self.embedding.data = self.embedding.data.to(x.dtype)
+            self.ema_w.data = self.ema_w.data.to(x.dtype)
+
+        # x shape: [Batch, Perceiver_Rank, Dim]
+        flat_x = x.reshape(-1, self.embedding_dim)
+        flat_x_centered = self.pre_norm(flat_x)
+        flat_x_norm = F.normalize(flat_x_centered, p=2, dim=1)
+
+        emb = self.embedding.to(x.dtype)
+        emb_norm = F.normalize(emb, p=2, dim=1)
+
+        # Compute distances: (x - e)^2 = x^2 - 2xe + e^2 in unit space simplifies to 2 - 2 * (x dot e)
+        distances = 2.0 - 2.0 * torch.matmul(flat_x_norm, emb_norm.t())
+
+        # Find the closest vectors
+        min_distances, encoding_indices = torch.min(distances, dim=1)
+        encoding_indices = encoding_indices.unsqueeze(1)
+        self.batch_active_codes = torch.unique(encoding_indices).numel()
+        encodings = torch.zeros(encoding_indices.shape[0], self.num_embeddings, device=x.device, dtype=x.dtype)
+        encodings.scatter_(1, encoding_indices, 1)
+
+        # Update the codebook using Exponential Moving Average (only in training)
+        if self.training and update_codebook:
+            with torch.no_grad():
+                self.cluster_size.data.mul_(self.decay).add_(
+                    encodings.sum(0), alpha=1 - self.decay
+                )
+
+                # Laplace smoothing to prevent dead codes
+                n = self.cluster_size.sum()
+                cluster_size = (
+                        (self.cluster_size + self.epsilon)
+                        / (n + self.num_embeddings * self.epsilon)
+                        * n
+                )
+
+                dw = torch.matmul(encodings.t(), flat_x_norm)
+                self.ema_w.data.mul_(self.decay).add_(dw, alpha=1 - self.decay)
+
+                self.embedding.data.copy_(self.ema_w / cluster_size.unsqueeze(1))
+                self.embedding.data = F.normalize(self.embedding.data, p=2, dim=1)
+
+                usage_threshold = 1.0
+
+                dead_indices = torch.nonzero(self.cluster_size < usage_threshold, as_tuple=False).squeeze(-1)
+
+                if len(dead_indices) > 0:
+                    num_dead = len(dead_indices)
+
+                    if flat_x.shape[0] >= num_dead:
+                        worst_match_indices = torch.topk(min_distances, num_dead).indices
+                    else:
+                        worst_match_indices = torch.randint(0, flat_x.shape[0], (num_dead,), device=flat_x.device)
+
+                    sampled_norm = flat_x_norm[worst_match_indices]
+                    self.embedding.data[dead_indices] = sampled_norm
+
+                    self.cluster_size.data[dead_indices] = usage_threshold
+
+                    self.ema_w.data[dead_indices] = sampled_norm * usage_threshold
+
+        quantized_discrete = torch.matmul(encodings, self.embedding.to(encodings.dtype)).view(x.shape)
+
+        x_norm = flat_x_norm.view(x.shape)
+
+        e_latent_loss = F.mse_loss(quantized_discrete.detach(), x_norm, reduction='none')
+        loss = self.commitment_cost * e_latent_loss.mean(dim=[-2, -1])
+
+        quantized_out = x_norm + (quantized_discrete - x_norm).detach()
+
+        return quantized_out, loss
+
+
 def rms_norm(hidden_states: torch.Tensor, variance_epsilon: float) -> torch.Tensor:
     input_dtype = hidden_states.dtype
     hidden_states = hidden_states.to(torch.float32)

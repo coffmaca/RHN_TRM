@@ -76,6 +76,7 @@ class ACTLossHead(nn.Module):
             
             # Metrics (halted)
             valid_metrics = new_carry.halted & (loss_counts > 0)
+            valid_sequences = (loss_counts > 0)
             metrics = {
                 "count": valid_metrics.sum(),
                 
@@ -99,13 +100,16 @@ class ACTLossHead(nn.Module):
         lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
         q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
 
-        scaled_l2_loss = (outputs["hypernet_l2"]).sum() * self.l2_lambda
+        scaled_l2_loss = (outputs["hypernet_l2"] * valid_sequences).sum() * self.l2_lambda
         scaled_l2_loss_metric = (outputs["hypernet_l2"] * valid_metrics).sum() * self.l2_lambda
+        scaled_vq_loss = (outputs["hypernet_vq"] * valid_sequences).sum()
+        scaled_vq_loss_metric = (outputs["hypernet_vq"] * valid_metrics).sum()
 
         metrics.update({
             "lm_loss": lm_loss.detach(),
             "q_halt_loss": q_halt_loss.detach(),
             "hypernet_l2_loss": scaled_l2_loss_metric.detach(),
+            "hypernet_vq_loss": scaled_vq_loss_metric.detach(),
         })
         # Q continue (bootstrapping target loss); Alexia: This fits Q-learning, but seems totally unecessary
         q_continue_loss = 0
@@ -117,7 +121,7 @@ class ACTLossHead(nn.Module):
         # Filter outputs for return
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
-        final_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss) + scaled_l2_loss
+        final_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss) + scaled_l2_loss + scaled_vq_loss
 
         return new_carry, final_loss, metrics, detached_outputs, new_carry.halted.all()
 
