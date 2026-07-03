@@ -71,6 +71,8 @@ class RHN_ACTV1Config(BaseModel):
     hypernet_relative_scale: float
     perceiver_rank: int
     perceiver_heads: int
+
+    hypernet_dropout: float = 0.2
     hypernet_l2_lambda: float = 1e-4
 
     depth_enc_dim: int = 64
@@ -222,6 +224,8 @@ class RHN_Hypernetwork(nn.Module):
             )
         )
 
+        self.dropout = nn.Dropout(p=self.config.hypernet_dropout)
+
         self.hypernet_base = nn.ModuleList(
             [RHN_ACTV1Block(self.config, attn=True) for _i in range(self.config.H_layers)]
         )
@@ -233,15 +237,20 @@ class RHN_Hypernetwork(nn.Module):
     def forward(self, activations: torch.Tensor, **seq_info) -> Tuple[dict, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
 
-        hidden_states = self._attention(activations)
+        activations = self.dropout(activations)
+
+        hidden_states = self.dropout(self._attention(activations))
         # hidden_states = activations
 
         for layer in self.hypernet_base:
-            hidden_states = layer(hidden_states=hidden_states, **seq_info)
+            hidden_states = self.dropout(layer(hidden_states=hidden_states, **seq_info))
         outputs = self.output_head(hidden_states) # rms_norm(self.output_head(hidden_states), variance_epsilon=self.config.rms_norm_eps)
         outputs = rms_norm(self._expand_output(outputs), variance_epsilon=self.config.rms_norm_eps)
 
-        step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
+        # Compute L2 Norm for generated weights
+        batch_size = outputs.shape[0]
+        step_l2 = torch.zeros(batch_size, device=outputs.device, dtype=outputs.dtype)
+        step_l2 += outputs.view(batch_size, -1).pow(2).sum(dim=1)
 
         outputs_by_layer = {}
         output_index = 0

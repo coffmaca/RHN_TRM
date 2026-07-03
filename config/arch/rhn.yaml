@@ -31,3 +31,6 @@ layer_emb_dim: 32
 hypernet_relative_scale: 2
 perceiver_rank: 32
 perceiver_heads: 8
+
+hypernet_dropout: 0.2
+hypernet_l2_lambda: 1e-4
