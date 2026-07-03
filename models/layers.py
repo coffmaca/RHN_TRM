@@ -57,8 +57,8 @@ class DynamicCastedLinear(nn.Module):
 
         self.dynamic_adapter = None
 
-    def set_dynamic_adapter(self, A, B):
-        self.dynamic_adapter = (A, B)
+    def set_dynamic_adapter(self, W):
+        self.dynamic_adapter = W
 
     def clear_dynamic_adapter(self):
         self.dynamic_adapter = None
@@ -67,18 +67,18 @@ class DynamicCastedLinear(nn.Module):
         if self.dynamic_adapter is None: # Base Out
             return F.linear(input, self.weight.to(input.dtype), bias=self.bias.to(input.dtype) if self.bias is not None else None)
         else: # Dynamic Out (using low-rank matrices)
-            A, B = self.dynamic_adapter
+            W = self.dynamic_adapter
 
+            # b: batch, s: seq_len, i: in_features, o: out_features
             if input.dim() == 2:
-                input_reshaped = input.unsqueeze(1)  # [Batch, 1, In]
+                # input: [B, I], W: [B, O, I] -> output: [B, O]
+                out = torch.einsum('bi,boi->bo', input, W.to(input.dtype))
+            elif input.dim() == 3:
+                # input: [B, S, I], W: [B, O, I] -> output: [B, S, O]
+                out = torch.einsum('bsi,boi->bso', input, W.to(input.dtype))
             else:
-                input_reshaped = input
-
-            out = torch.einsum('abc,adc->abd', input, B.to(input.dtype)) # torch.matmul(input, B)
-            out = torch.einsum('abd,aed->abe', out, A.to(input.dtype)) # torch.matmul(out, A)
-
-            if input.dim() == 2:
-                out = out.squeeze(1)
+                # Fallback for > 3 dimensions
+                out = torch.matmul(input, W.to(input.dtype).transpose(-1, -2))
 
             return out
 
@@ -177,9 +177,9 @@ class DynamicAttention(nn.Module):
         self.qkv_proj = DynamicCastedLinear(self.hidden_size, (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim, bias=False)
         self.o_proj = DynamicCastedLinear(self.output_size, self.hidden_size, bias=False)
 
-    def set_dynamic_adapter(self, A_qkv, B_qkv, A_o, B_o):
-        self.qkv_proj.set_dynamic_adapter(A_qkv, B_qkv)
-        self.o_proj.set_dynamic_adapter(A_o, B_o)
+    def set_dynamic_adapter(self, W_qkv, W_o):
+        self.qkv_proj.set_dynamic_adapter(W_qkv)
+        self.o_proj.set_dynamic_adapter(W_o)
 
     def clear_dynamic_adapter(self):
         self.qkv_proj.clear_dynamic_adapter()
@@ -272,9 +272,9 @@ class DynamicSwiGLU(nn.Module):
         self.gate_up_proj = DynamicCastedLinear(hidden_size, inter * 2, bias=False)
         self.down_proj    = DynamicCastedLinear(inter, hidden_size, bias=False)
 
-    def set_dynamic_adapter(self, A_up, B_up, A_down, B_down):
-        self.gate_up_proj.set_dynamic_adapter(A_up, B_up)
-        self.down_proj.set_dynamic_adapter(A_down, B_down)
+    def set_dynamic_adapter(self, W_up, W_down):
+        self.gate_up_proj.set_dynamic_adapter(W_up)
+        self.down_proj.set_dynamic_adapter(W_down)
 
     def clear_dynamic_adapter(self):
         self.gate_up_proj.clear_dynamic_adapter()

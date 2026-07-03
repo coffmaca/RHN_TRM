@@ -150,20 +150,13 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
 
     def set_dynamic_adapter(self, up, down, attn_1=None, attn_2=None):
         if self.attn:
-            # Swap argument to correct assignments
-            up, attn_1 = attn_1, up
-            down, attn_2 = attn_2, down
-
-            A_attn_1, B_attn_1 = attn_1
-            A_attn_2, B_attn_2 = attn_2
-
             if self.config.mlp_t:
-                self.mlp_t.set_dynamic_adapter(A_attn_1, B_attn_1, A_attn_2, B_attn_2)
+                self.mlp_t.set_dynamic_adapter(attn_1, attn_2)
             else:
-                self.self_attn.set_dynamic_adapter(A_attn_1, B_attn_1, A_attn_2, B_attn_2)
-        A_up, B_up = up
-        A_down, B_down = down
-        self.mlp.set_dynamic_adapter(A_up, B_up, A_down, B_down)
+                self.self_attn.set_dynamic_adapter(attn_1, attn_2)
+
+        # Pass the full-rank tensors directly
+        self.mlp.set_dynamic_adapter(up, down)
 
     def clear_dynamic_adapter(self):
         self.mlp.clear_dynamic_adapter()
@@ -197,12 +190,6 @@ class RHN_Hypernetwork(nn.Module):
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
 
         self.layer_specs = layer_specs
-        self.config_per_layer = {}
-        for name, shape in self.layer_specs:
-            self.config_per_layer[name] = {
-                "shape": shape,
-                "type": "vector" if self._is_vector_like(shape) else "matrix",
-            }
 
         self.embed_scale = math.sqrt(self.config.hypernet_hidden_size)
         embed_init_std = 1.0 / self.embed_scale
@@ -229,7 +216,7 @@ class RHN_Hypernetwork(nn.Module):
         )
 
         self.output_head = CastedLinear(self.config.hypernet_hidden_size,
-                                         self._output_dim(layer_specs),
+                                         self._output_dim(),
                                          bias=False)
 
     def forward(self, activations: torch.Tensor, **seq_info) -> Tuple[dict, torch.Tensor]:
@@ -253,26 +240,12 @@ class RHN_Hypernetwork(nn.Module):
         step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
 
         outputs_by_layer = {}
-        for i, (layer_name, layer_info) in enumerate(self.config_per_layer.items()):
-            shape = layer_info["shape"]
-            layer_params = outputs[:, i, :]  # Shape: (B, kron_dim^4)
+        for i, (name, shape) in enumerate(self.layer_specs):
+            tensor_params = outputs[:, i, :]  # Shape: (B, kron_dim^4)
 
-            output_index = 0
-
-            size_a = shape[0] * self.config.hypernet_rank
-            outputs_a = layer_params[:, output_index: output_index + size_a]
-            outputs_a = outputs_a.reshape(batch_size, shape[0], self.config.hypernet_rank)
-            output_index += size_a
-
-            if layer_info["type"] == "matrix":
-                size_b = shape[1] * self.config.hypernet_rank
-                outputs_b = layer_params[:, output_index: output_index + size_b]
-                outputs_b = outputs_b.reshape(batch_size, self.config.hypernet_rank, shape[1])
-                output_index += size_b
-
-                outputs_by_layer[layer_name] = (outputs_a, outputs_b)
-            else:
-                outputs_by_layer[layer_name] = outputs_a
+            num_elements = math.prod(shape)
+            sampled_params = tensor_params[:, :num_elements]
+            outputs_by_layer[name] = sampled_params.reshape(batch_size, *shape)
 
         return outputs_by_layer, step_l2
 
@@ -290,18 +263,13 @@ class RHN_Hypernetwork(nn.Module):
         else:
             return True
 
-    def _output_dim(self, layer_specs:dict) -> int:
+    def _output_dim(self) -> int:
         max_params = 0
 
-        # Identify the largest layer param count (handling both matrix and vector cases)
-        for name, shape in layer_specs:
-            if self._is_vector_like(shape):
-                params = shape[0] * self.config.hypernet_rank
-            else:
-                params = (shape[0] + shape[1]) * self.config.hypernet_rank
-
-            if params > max_params:
-                max_params = params
+        for name, shape in self.layer_specs:
+            total_params = math.prod(shape)
+            if total_params > max_params:
+                max_params = total_params
 
         self.kron_dim = int(math.ceil(max_params ** 0.25))
 
@@ -565,30 +533,22 @@ class RHN_ACTV1_Inner(nn.Module):
             count = 0
 
             for k, v in dynamic_weights.items():
+                # We skip non-weights that might have snuck into layer_specs (like biases) if any
+                if "weight" not in k: continue
+
                 base_param = self.get_parameter(k)
-                if isinstance(v, tuple) and len(v) == 2:
-                    A, B = v
+                W = v
+                gen_norm += W[0].norm()
 
-                    gen_norm += (A[0].norm() + B[0].norm())
-
-                    if log_deep_metrics:
-                        delta_W = torch.matmul(A[0], B[0]).float()
+                if log_deep_metrics:
+                    delta_W = W[0].float()
+                    # Only calculate SVD for matrices
+                    if delta_W.dim() >= 2:
                         S = torch.linalg.svdvals(delta_W)
                         svd_ratio += (S[0] / (S.sum() + 1e-6))
+                    gen_base_l2_ratio += delta_W.norm() / (base_param.norm() + 1e-8)
 
-                        gen_base_l2_ratio += delta_W.norm() / (base_param.norm() + 1e-8)
-
-                    count += 1
-                else:
-                    A = v
-                    gen_norm += A[0].norm()
-
-                    if log_deep_metrics:
-                        delta_W = A[0].float()
-                        gen_base_l2_ratio += delta_W.norm() / (base_param.norm() + 1e-8)
-
-                    count += 1
-
+                count += 1
 
             step_metrics["gen_norm"] = (gen_norm / count) if count > 0 else torch.tensor(0.0, device=h_base.device)
             if log_deep_metrics:
@@ -598,9 +558,24 @@ class RHN_ACTV1_Inner(nn.Module):
                                                                                                          device=h_base.device)
 
         for i, layer in enumerate(self.L_level):
-            layer_weights = [dynamic_weights[layer_name] for layer_name in dynamic_weights if
-                             f"L_level.{i}" in layer_name]
-            layer.set_dynamic_adapter(*layer_weights)
+            prefix = f"L_level.{i}."
+
+            # Explicitly extract the weights to guarantee strict ordering
+            gate_up = dynamic_weights[f"{prefix}mlp.gate_up_proj.weight"]
+            down = dynamic_weights[f"{prefix}mlp.down_proj.weight"]
+
+            if layer.attn:
+                if layer.config.mlp_t:
+                    qkv = dynamic_weights[f"{prefix}mlp_t.gate_up_proj.weight"]
+                    o = dynamic_weights[f"{prefix}mlp_t.down_proj.weight"]
+                else:
+                    qkv = dynamic_weights[f"{prefix}self_attn.qkv_proj.weight"]
+                    o = dynamic_weights[f"{prefix}self_attn.o_proj.weight"]
+
+                layer.set_dynamic_adapter(up=gate_up, down=down, attn_1=qkv, attn_2=o)
+            else:
+                layer.set_dynamic_adapter(up=gate_up, down=down)
+
             h_dyn = layer(hidden_states=h_dyn, **seq_info)
 
         return h_base + h_dyn, step_l2, step_metrics
