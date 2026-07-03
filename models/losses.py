@@ -82,6 +82,7 @@ class ACTLossHead(nn.Module):
 
                 "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum(),
                 "steps":          torch.where(valid_metrics, new_carry.steps, 0).sum(),
+                "total_inner_steps": torch.where(valid_metrics, new_carry.inner_carry.total_inner_steps, 0).sum(),
             }
 
             if "q_continue_logits" in outputs:
