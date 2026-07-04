@@ -737,12 +737,13 @@ class RHN_ACTV1(nn.Module):
         
     def forward(self, carry: RHN_ACTV1Carry, batch: Dict[str, torch.Tensor], log_deep_metrics: bool = False) -> Tuple[RHN_ACTV1Carry, Dict[str, torch.Tensor]]:
 
-        # Update data, carry (removing halted sequences)
-        new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
-        
-        new_steps = torch.where(carry.halted, 0, carry.steps)
+        is_first_step = (carry.steps == 0)
+        should_reset = carry.halted & (is_first_step | self.training)
 
-        new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
+        new_inner_carry = self.inner.reset_carry(should_reset, carry.inner_carry)
+        new_steps = torch.where(should_reset, 0, carry.steps)
+        new_current_data = {k: torch.where(should_reset.view((-1,) + (1,) * (batch[k].ndim - 1)), batch[k], v) for k, v
+                            in carry.current_data.items()}
 
         is_last_outer_step = (new_steps >= self.config.halt_max_steps - 1)
 
@@ -793,5 +794,8 @@ class RHN_ACTV1(nn.Module):
                         # Similar concept as PQN https://arxiv.org/abs/2407.04811
                         _, _, (next_q_halt_logits, next_q_continue_logits), _, _ = self.inner(new_inner_carry, new_current_data)
                         outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
+                else:
+                    eval_latch = carry.halted & (~is_first_step)
+                    halted = halted | eval_latch
 
         return RHN_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs
