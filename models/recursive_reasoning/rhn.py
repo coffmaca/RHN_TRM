@@ -310,7 +310,7 @@ class RHN_Hypernetwork(nn.Module):
             value=inputs
         )
 
-        return attn_output
+        return attn_output + queries
 
     def _expand_output(self, outputs) -> torch.Tensor:
         if len(self.intermediate_dims) == 0:
