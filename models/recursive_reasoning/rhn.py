@@ -73,13 +73,19 @@ class RHN_ACTV1Config(BaseModel):
     hypernet_l2_lambda: float = 1e-4
 
 class RHN_ACTV1Block(nn.Module):
-    def __init__(self, config: RHN_ACTV1Config, attn: bool = True) -> None:
+    def __init__(self, config: RHN_ACTV1Config, attn: bool = True, attn_type: str = None) -> None:
         super().__init__()
 
         self.config = config
         self.attn = attn
+        if attn_type is not None:
+            self.attn_type = attn_type
+        elif self.config.mlp_t:
+            self.attn_type = "mlp_t"
+        else:
+            self.attn_type = "attn"
         if self.attn:
-            if self.config.mlp_t:
+            if self.attn_type == "mlp_t":
                 self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hypernet_hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
                 self.mlp_t = SwiGLU(
                     hidden_size= self.config.perceiver_rank, # self.config.seq_len + self.puzzle_emb_len,
@@ -103,7 +109,7 @@ class RHN_ACTV1Block(nn.Module):
         # B, L, D = hidden_states.shape
         # Post Norm
         if self.attn:
-            if self.config.mlp_t:
+            if self.attn_type == "mlp_t":
                 hidden_states = hidden_states.transpose(1,2)
                 out = self.mlp_t(hidden_states)
                 hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
@@ -220,7 +226,7 @@ class RHN_Hypernetwork(nn.Module):
         )
 
         self.hypernet_base = nn.ModuleList(
-            [RHN_ACTV1Block(self.config, attn=True) for _i in range(self.config.H_layers)]
+            [RHN_ACTV1Block(self.config, attn=True, attn_type="attn") for _i in range(self.config.H_layers)]
         )
 
         self.output_head = CastedLinear(self.config.hypernet_hidden_size,
