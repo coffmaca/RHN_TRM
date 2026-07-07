@@ -303,11 +303,15 @@ class RHN_Hypernetwork(nn.Module):
 
     def _attention(self, inputs) -> torch.Tensor:
         batch_size = inputs.shape[0]
+
         queries = self.perceiver_queries.expand(batch_size, -1, -1) #.to(dtype=inputs.dtype)
+        norm_queries = rms_norm(queries, variance_epsilon=self.config.rms_norm_eps)
+        norm_inputs = rms_norm(inputs, variance_epsilon=self.config.rms_norm_eps)
+
         attn_output, _ = self.perceiver_attn(
-            query=queries,
-            key=inputs,
-            value=inputs
+            query=norm_queries,
+            key=norm_inputs,
+            value=norm_inputs
         )
 
         return attn_output + queries
