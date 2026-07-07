@@ -53,12 +53,13 @@ class ACTLossHead(nn.Module):
     def forward(
         self,
         return_keys: Sequence[str],
+        log_deep_metrics: bool = False,
         # Model args
         **model_kwargs,
     ) -> Tuple[Any, torch.Tensor, Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]], torch.Tensor]:
         # Model logits
         # B x SeqLen x D
-        new_carry, outputs = self.model(**model_kwargs)
+        new_carry, outputs = self.model(log_deep_metrics=log_deep_metrics, **model_kwargs)
         labels = new_carry.current_data["labels"]
 
         with torch.no_grad():
@@ -85,11 +86,21 @@ class ACTLossHead(nn.Module):
                 "steps":          torch.where(valid_metrics, new_carry.steps, 0).sum(),
             }
 
+            if "q_continue_logits" in outputs:
+                q_margin = torch.abs(outputs["q_halt_logits"] - outputs["q_continue_logits"])
+                metrics["telemetry/q_halt_margin"] = torch.where(valid_metrics, q_margin, 0).sum()
+
+            for k, v in outputs.items():
+                if k.startswith("telemetry/"):
+                    metrics[k] = v.detach()
+
         # Losses
 
         lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
         q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
+
         scaled_l2_loss = (outputs["hypernet_l2"] * valid_metrics).sum() * self.l2_lambda
+
         metrics.update({
             "lm_loss": lm_loss.detach(),
             "q_halt_loss": q_halt_loss.detach(),
