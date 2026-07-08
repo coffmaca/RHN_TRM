@@ -247,7 +247,29 @@ class RHN_Hypernetwork(nn.Module):
                                          self._output_dim(layer_specs),
                                          bias=False)
 
-        self.ab_norm = nn.RMSNorm(self.kron_dim ** 2, eps=self.config.rms_norm_eps).to(dtype=self.forward_dtype)
+        self.lora_norms = nn.ModuleDict()
+
+        for name, shape in self.layer_specs:
+            safe_name = name.replace(".", "_")
+
+            if self._is_vector_like(shape):
+                size = shape[0] * self.config.hypernet_rank
+                self.lora_norms[f"{safe_name}"] = nn.RMSNorm(size, eps=self.config.rms_norm_eps,
+                                                             elementwise_affine=True).to(dtype=self.forward_dtype)
+            else:
+                size_a = shape[0] * self.config.hypernet_rank
+                size_b = shape[1] * self.config.hypernet_rank
+
+                self.lora_norms[f"{safe_name}_A"] = nn.RMSNorm(size_a, eps=self.config.rms_norm_eps,
+                                                               elementwise_affine=True).to(dtype=self.forward_dtype)
+                self.lora_norms[f"{safe_name}_B"] = nn.RMSNorm(size_b, eps=self.config.rms_norm_eps,
+                                                               elementwise_affine=True).to(dtype=self.forward_dtype)
+
+        with torch.no_grad():
+            target_variance = 1.0 / self.config.hidden_size
+            symmetric_std = (target_variance / self.config.hypernet_rank) ** 0.25
+            for key, norm_module in self.lora_norms.items():
+                trunc_normal_init_(norm_module.weight, std=symmetric_std)
 
     def forward(self, activations: torch.Tensor, **seq_info) -> Tuple[dict, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
@@ -276,18 +298,26 @@ class RHN_Hypernetwork(nn.Module):
         outputs_by_layer = {}
         for i, (layer_name, layer_info) in enumerate(self.config_per_layer.items()):
             shape = layer_info["shape"]
+            safe_name = layer_name.replace(".", "_")
             layer_params = outputs[:, i, :]  # Shape: (B, kron_dim^4)
 
             output_index = 0
 
             size_a = shape[0] * self.config.hypernet_rank
             outputs_a = layer_params[:, output_index: output_index + size_a]
+
+            if layer_info["type"] == "matrix":
+                outputs_a = self.lora_norms[f"{safe_name}_A"](outputs_a)
+            else:
+                outputs_a = self.lora_norms[f"{safe_name}"](outputs_a)
+
             outputs_a = outputs_a.reshape(batch_size, shape[0], self.config.hypernet_rank)
             output_index += size_a
 
             if layer_info["type"] == "matrix":
                 size_b = shape[1] * self.config.hypernet_rank
                 outputs_b = layer_params[:, output_index: output_index + size_b]
+                outputs_b = self.lora_norms[f"{safe_name}_B"](outputs_b)
                 outputs_b = outputs_b.reshape(batch_size, self.config.hypernet_rank, shape[1])
                 output_index += size_b
 
@@ -346,11 +376,9 @@ class RHN_Hypernetwork(nn.Module):
         num_layers = outputs.shape[1]
 
         outputs_a = outputs[..., :self.kron_dim ** 2]
-        outputs_a = self.ab_norm(outputs_a)
         outputs_a = outputs_a.view(batch_size, num_layers, self.kron_dim, self.kron_dim)
 
         outputs_b = outputs[..., self.kron_dim ** 2: self.kron_dim ** 2 * 2]
-        outputs_b = self.ab_norm(outputs_b)
         outputs_b = outputs_b.view(batch_size, num_layers, self.kron_dim, self.kron_dim)
 
         # Apply Kronecker product dynamically per layer (b=batch, l=layer)
