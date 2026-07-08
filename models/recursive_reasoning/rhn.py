@@ -247,6 +247,8 @@ class RHN_Hypernetwork(nn.Module):
                                          self._output_dim(layer_specs),
                                          bias=False)
 
+        self.ab_norm = nn.RMSNorm(self.kron_dim ** 2, eps=self.config.rms_norm_eps).to(dtype=self.forward_dtype)
+
     def forward(self, activations: torch.Tensor, **seq_info) -> Tuple[dict, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
 
@@ -267,7 +269,7 @@ class RHN_Hypernetwork(nn.Module):
 
         # Output head now processes the expanded tensor: Shape (B, num_layers, perceiver_rank, out_features)
         outputs = self.output_head(hidden_states)
-        outputs = rms_norm(self._expand_output(outputs), variance_epsilon=self.config.rms_norm_eps)
+        outputs = self._expand_output(outputs)
 
         step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
 
@@ -343,14 +345,16 @@ class RHN_Hypernetwork(nn.Module):
         batch_size = outputs.shape[0]
         num_layers = outputs.shape[1]
 
-        used_outputs_a = outputs[..., :self.kron_dim ** 2]
-        used_outputs_a = used_outputs_a.view(batch_size, num_layers, self.kron_dim, self.kron_dim)
+        outputs_a = outputs[..., :self.kron_dim ** 2]
+        outputs_a = self.ab_norm(outputs_a)
+        outputs_a = outputs_a.view(batch_size, num_layers, self.kron_dim, self.kron_dim)
 
-        used_outputs_b = outputs[..., self.kron_dim ** 2: self.kron_dim ** 2 * 2]
-        used_outputs_b = used_outputs_b.view(batch_size, num_layers, self.kron_dim, self.kron_dim)
+        outputs_b = outputs[..., self.kron_dim ** 2: self.kron_dim ** 2 * 2]
+        outputs_b = self.ab_norm(outputs_b)
+        outputs_b = outputs_b.view(batch_size, num_layers, self.kron_dim, self.kron_dim)
 
         # Apply Kronecker product dynamically per layer (b=batch, l=layer)
-        expanded_outputs = torch.einsum('blij,blkm->blikjm', used_outputs_a, used_outputs_b)
+        expanded_outputs = torch.einsum('blij,blkm->blikjm', outputs_a, outputs_b)
 
         # Flatten spatial dims to produce (batch, num_layers, kron_dim^4)
         outputs = expanded_outputs.flatten(start_dim=2, end_dim=-1)
