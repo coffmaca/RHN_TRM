@@ -20,6 +20,7 @@ IGNORE_LABEL_ID = -100
 class RHN_ACTV1InnerCarry:
     z_H: torch.Tensor
     z_L: torch.Tensor
+    inner_steps: torch.Tensor
 
 
 @dataclass
@@ -75,6 +76,8 @@ class RHN_ACTV1Config(BaseModel):
     hypernet_l2_lambda: float = 1e-4
     hypernet_kl_lambda: float = 1e-4
 
+    depth_enc_dim: int = 64
+
 class RHN_ACTV1Block(nn.Module):
     def __init__(self, config: RHN_ACTV1Config) -> None:
         super().__init__()
@@ -88,14 +91,14 @@ class RHN_ACTV1Block(nn.Module):
             )
         else:
             self.self_attn = Attention(
-                hidden_size=config.hidden_size,
-                head_dim=config.hidden_size // config.num_heads,
+                hidden_size=config.hidden_size + config.depth_enc_dim,
+                head_dim=(config.hidden_size + config.depth_enc_dim) // config.num_heads,
                 num_heads=config.num_heads,
                 num_key_value_heads=config.num_heads,
                 causal=False
             )
         self.mlp = SwiGLU(
-            hidden_size=config.hidden_size,
+            hidden_size=config.hidden_size + config.depth_enc_dim,
             expansion=config.expansion,
         )
         self.norm_eps = config.rms_norm_eps
@@ -198,7 +201,7 @@ class RHN_Hypernetwork(nn.Module):
         self.embed_scale = math.sqrt(self.config.hypernet_hidden_size)
         embed_init_std = 1.0 / self.embed_scale
 
-        self.input_size = self.config.hidden_size * self.config.L_layers
+        self.input_size = (self.config.hidden_size * self.config.L_layers) + config.depth_enc_dim
 
         self.perceiver_queries = nn.Parameter(
             trunc_normal_init_(
@@ -210,19 +213,19 @@ class RHN_Hypernetwork(nn.Module):
         # TODO - Consider alternative initialization to 0's.  Classes below have built-in LeCun Normal initialization.
         module_list = nn.ModuleList(
             [CastedLinear(self.input_size,
-                          self.config.hypernet_hidden_size,
+                          self.config.hypernet_hidden_size + self.config.depth_enc_dim,
                           bias=False)] + \
             [nn.SiLU()]
         )
         for _ in range(self.config.hypernet_hidden_depth):
-            module_list.append(SwiGLU(self.config.hypernet_hidden_size, self.config.expansion))
-            module_list.append(torch.nn.RMSNorm(self.config.hypernet_hidden_size,
+            module_list.append(SwiGLU(self.config.hypernet_hidden_size + self.config.depth_enc_dim, self.config.expansion))
+            module_list.append(torch.nn.RMSNorm(self.config.hypernet_hidden_size + self.config.depth_enc_dim,
                                                 eps=self.config.rms_norm_eps,
                                                 dtype=self.forward_dtype))
 
         self.hypernet_base = nn.Sequential(*module_list)
 
-        self.output_head = CastedLinear(self.config.hypernet_hidden_size,
+        self.output_head = CastedLinear(self.config.hypernet_hidden_size + self.config.depth_enc_dim,
                                          self._output_dim(layer_specs),
                                          bias=False)
 
@@ -302,7 +305,7 @@ class RHN_Hypernetwork(nn.Module):
         Q = self.config.perceiver_rank
         head_dim = D // H
 
-        q = self.perceiver_queries.view(1, Q, H, head_dim).transpose(1, 2)
+        q = self.perceiver_queries.view(1, Q, H, head_dim).transpose(1, 2).contiguous()
         k = inputs.view(B, S, H, head_dim).transpose(1, 2)
         v = inputs.view(B, S, H, head_dim).transpose(1, 2)
 
@@ -336,6 +339,22 @@ class RHN_Hypernetwork(nn.Module):
 #         for layer in self.layers:
 #             hidden_states = layer(hidden_states=hidden_states, **kwargs)
 #         return hidden_states
+
+
+def get_sinusoidal_encoding(step_tensor: torch.Tensor, num_channels: int, device: torch.device,
+                            dtype: torch.dtype) -> torch.Tensor:
+    position = step_tensor.view(-1, 1).to(torch.float32)
+    div_term = torch.exp(
+        torch.arange(0, num_channels, 2, dtype=torch.float32, device=device) * -(math.log(10000.0) / num_channels))
+
+    pe = torch.zeros(step_tensor.shape[0], 1, num_channels, dtype=torch.float32, device=device)
+    pe[:, 0, 0::2] = torch.sin(position * div_term)
+    if num_channels % 2 == 1:
+        pe[:, 0, 1::2] = torch.cos(position * div_term[:-1])
+    else:
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+
+    return pe.to(dtype)
 
 
 class RHN_ACTV1_Inner(nn.Module):
@@ -418,12 +437,14 @@ class RHN_ACTV1_Inner(nn.Module):
         return RHN_ACTV1InnerCarry(
             z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
             z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            inner_steps=torch.zeros(batch_size, dtype=torch.int32, device="cuda" if torch.cuda.is_available() else "cpu"),
         )
         
     def reset_carry(self, reset_flag: torch.Tensor, carry: RHN_ACTV1InnerCarry):
         return RHN_ACTV1InnerCarry(
             z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
+            inner_steps=torch.where(reset_flag, 0, carry.inner_steps)
         )
 
     def forward(self, carry: RHN_ACTV1InnerCarry, batch: Dict[str, torch.Tensor],
@@ -439,6 +460,7 @@ class RHN_ACTV1_Inner(nn.Module):
 
         # Forward iterations
         z_H, z_L = carry.z_H, carry.z_L
+        inner_steps = carry.inner_steps
 
         total_metrics = {
             "telemetry/act_sparsity": torch.tensor(0.0, device=z_H.device),
@@ -475,34 +497,41 @@ class RHN_ACTV1_Inner(nn.Module):
                 for _L_step in range(self.config.L_cycles):
                     prev_z_L = z_L
                     z_L, _, step_m = self._dynamic_forward(z_L=z_L,
-                                                z_H=z_H,
-                                                input_embeddings=input_embeddings,
-                                                log_deep_metrics=log_deep_metrics,
-                                                **seq_info)
+                                                           z_H=z_H,
+                                                           input_embeddings=input_embeddings,
+                                                           log_deep_metrics=log_deep_metrics,
+                                                           global_step=inner_steps,
+                                                           **seq_info)
                     track_metrics(prev_z_L, z_L, step_m)
+                    inner_steps += 1
                 prev_z_H = z_H
                 z_H, _, step_m = self._dynamic_forward(z_L=z_L,
-                                            z_H=z_H,
-                                            input_embeddings=None,
-                                            log_deep_metrics=log_deep_metrics,
-                                            **seq_info)
+                                                       z_H=z_H,
+                                                       input_embeddings=None,
+                                                       log_deep_metrics=log_deep_metrics,
+                                                       global_step=inner_steps,
+                                                       **seq_info)
                 track_metrics(prev_z_H, z_H, step_m)
+                inner_steps += 1
 
         for _L_step in range(self.config.L_cycles):
             prev_z_L = z_L
             z_L, step_l2, step_m = self._dynamic_forward(z_L=z_L,
-                                        z_H=z_H,
-                                        input_embeddings=input_embeddings,
-                                        log_deep_metrics=log_deep_metrics,
-                                        **seq_info)
+                                                         z_H=z_H,
+                                                         input_embeddings=input_embeddings,
+                                                         log_deep_metrics=log_deep_metrics,
+                                                         global_step=inner_steps,
+                                                         **seq_info)
             track_metrics(prev_z_L, z_L, step_m)
+            inner_steps += 1
 
         prev_z_H = z_H
         z_H, step_l2, step_m = self._dynamic_forward(z_L=z_L,
-                                    z_H=z_H,
-                                    input_embeddings=None,
-                                    log_deep_metrics=log_deep_metrics,
-                                    **seq_info)
+                                                     z_H=z_H,
+                                                     input_embeddings=None,
+                                                     log_deep_metrics=log_deep_metrics,
+                                                     global_step=inner_steps,
+                                                     **seq_info)
 
         total_l2 += step_l2
         # total_kl += step_kl
@@ -511,32 +540,38 @@ class RHN_ACTV1_Inner(nn.Module):
         # avg_kl = total_kl / (self.config.L_cycles + 1)
 
         track_metrics(prev_z_H, z_H, step_m)
+        inner_steps += 1
 
         if metric_calls > 0:
             for k in total_metrics:
                 total_metrics[k] /= metric_calls
 
         # LM Outputs
-        new_carry = RHN_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
+        new_carry = RHN_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach(), inner_steps=inner_steps)  # New carry no grad
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), avg_l2, total_metrics #, avg_kl
 
-    def _dynamic_forward(self, z_L, z_H, input_embeddings=None, log_deep_metrics=False, **seq_info) -> Tuple[
-        torch.Tensor, torch.Tensor, dict
-    ]:
-        h_base = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
-        activations = torch.tensor([], dtype=h_base.dtype, device=h_base.device)
+    def _dynamic_forward(self, z_L, z_H, input_embeddings=None, log_deep_metrics=False, global_step=None,
+                         **seq_info) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        raw_state = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
+        batch_size, seq_len, hidden_dim = raw_state.shape
+
+        base_enc = get_sinusoidal_encoding(global_step, hidden_dim, raw_state.device, raw_state.dtype)
+        hyper_enc = get_sinusoidal_encoding(global_step, self.config.depth_enc_dim, raw_state.device, raw_state.dtype)
+        hyper_enc_expanded = hyper_enc.expand(batch_size, seq_len, -1)
+
         # Base model output
+        h_base = raw_state + base_enc
+        activations = torch.tensor([], dtype=h_base.dtype, device=h_base.device)
         for layer in self.L_level:
             layer.clear_dynamic_adapter()
             h_base = layer(hidden_states=h_base, **seq_info)
-            activations = torch.cat((activations, h_base.detach()),
-                                    dim=2)  # TODO - Determine whether detaching is preferable here.
+            activations = torch.cat((activations, h_base.detach()), dim=2)
 
         # Dynamic weight output
-        h_dyn = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
-        dynamic_weights, step_l2 = self.hypernet(activations)
+        hyper_input = torch.cat([activations, hyper_enc_expanded], dim=-1)
+        dynamic_weights, step_l2 = self.hypernet(hyper_input)
 
         step_metrics = {}
         with torch.no_grad():
@@ -579,6 +614,9 @@ class RHN_ACTV1_Inner(nn.Module):
                                                                                                device=h_base.device)
                 step_metrics["gen_base_l2_ratio"] = (gen_base_l2_ratio / count) if count > 0 else torch.tensor(0.0,
                                                                                                          device=h_base.device)
+
+        # Dynamic model output
+        h_dyn = raw_state + base_enc
 
         for i, layer in enumerate(self.L_level):
             layer_weights = [dynamic_weights[layer_name] for layer_name in dynamic_weights if
