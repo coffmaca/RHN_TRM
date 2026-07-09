@@ -243,6 +243,31 @@ class RHN_Hypernetwork(nn.Module):
                                          self._output_dim(layer_specs),
                                          bias=False)
 
+        self.lora_norms = nn.ModuleDict()
+
+        for name, shape in self.layer_specs:
+            safe_name = name.replace(".", "_")
+
+            if self._is_vector_like(shape):
+                size = shape[0] * self.config.hypernet_rank
+                self.lora_norms[f"{safe_name}"] = nn.RMSNorm(size, eps=self.config.rms_norm_eps,
+                                                             elementwise_affine=True).to(dtype=self.forward_dtype)
+            else:
+                size_a = shape[0] * self.config.hypernet_rank
+                size_b = shape[1] * self.config.hypernet_rank
+
+                self.lora_norms[f"{safe_name}_A"] = nn.RMSNorm(size_a, eps=self.config.rms_norm_eps,
+                                                               elementwise_affine=True).to(dtype=self.forward_dtype)
+                self.lora_norms[f"{safe_name}_B"] = nn.RMSNorm(size_b, eps=self.config.rms_norm_eps,
+                                                               elementwise_affine=True).to(dtype=self.forward_dtype)
+
+        with torch.no_grad():
+            target_variance = 1.0 / self.config.hidden_size
+            symmetric_std = (target_variance / self.config.hypernet_rank) ** 0.25
+            for key, norm_module in self.lora_norms.items():
+                trunc_normal_init_(norm_module.weight, std=symmetric_std)
+                norm_module.weight *= 10
+
     def forward(self, activations: torch.Tensor, **seq_info) -> Tuple[dict, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
 
@@ -261,25 +286,33 @@ class RHN_Hypernetwork(nn.Module):
 
         # Output head now processes the expanded tensor: Shape (B, num_layers, perceiver_rank, out_features)
         outputs = self.output_head(hidden_states)
-        outputs = rms_norm(self._expand_output(outputs), variance_epsilon=self.config.rms_norm_eps)
+        outputs = self._expand_output(outputs)
 
         step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
 
         outputs_by_layer = {}
         for i, (layer_name, layer_info) in enumerate(self.config_per_layer.items()):
             shape = layer_info["shape"]
+            safe_name = layer_name.replace(".", "_")
             layer_params = outputs[:, i, :]  # Shape: (B, kron_dim^4)
 
             output_index = 0
 
             size_a = shape[0] * self.config.hypernet_rank
             outputs_a = layer_params[:, output_index: output_index + size_a]
+
+            if layer_info["type"] == "matrix":
+                outputs_a = self.lora_norms[f"{safe_name}_A"](outputs_a)
+            else:
+                outputs_a = self.lora_norms[f"{safe_name}"](outputs_a)
+
             outputs_a = outputs_a.reshape(batch_size, shape[0], self.config.hypernet_rank)
             output_index += size_a
 
             if layer_info["type"] == "matrix":
                 size_b = shape[1] * self.config.hypernet_rank
                 outputs_b = layer_params[:, output_index: output_index + size_b]
+                outputs_b = self.lora_norms[f"{safe_name}_B"](outputs_b)
                 outputs_b = outputs_b.reshape(batch_size, self.config.hypernet_rank, shape[1])
                 output_index += size_b
 
@@ -337,14 +370,14 @@ class RHN_Hypernetwork(nn.Module):
         batch_size = outputs.shape[0]
         num_layers = outputs.shape[1]
 
-        used_outputs_a = outputs[..., :self.kron_dim ** 2]
-        used_outputs_a = used_outputs_a.view(batch_size, num_layers, self.kron_dim, self.kron_dim)
+        outputs_a = outputs[..., :self.kron_dim ** 2]
+        outputs_a = outputs_a.view(batch_size, num_layers, self.kron_dim, self.kron_dim)
 
-        used_outputs_b = outputs[..., self.kron_dim ** 2: self.kron_dim ** 2 * 2]
-        used_outputs_b = used_outputs_b.view(batch_size, num_layers, self.kron_dim, self.kron_dim)
+        outputs_b = outputs[..., self.kron_dim ** 2: self.kron_dim ** 2 * 2]
+        outputs_b = outputs_b.view(batch_size, num_layers, self.kron_dim, self.kron_dim)
 
         # Apply Kronecker product dynamically per layer (b=batch, l=layer)
-        expanded_outputs = torch.einsum('blij,blkm->blikjm', used_outputs_a, used_outputs_b)
+        expanded_outputs = torch.einsum('blij,blkm->blikjm', outputs_a, outputs_b)
 
         # Flatten spatial dims to produce (batch, num_layers, kron_dim^4)
         outputs = expanded_outputs.flatten(start_dim=2, end_dim=-1)
