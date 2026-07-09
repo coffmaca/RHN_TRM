@@ -1,5 +1,6 @@
 from typing import Tuple
 import einops
+import math
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -76,6 +77,12 @@ class DynamicCastedLinear(nn.Module):
 
             out = torch.einsum('abc,adc->abd', input, B.to(input.dtype)) # torch.matmul(input, B)
             out = torch.einsum('abd,aed->abe', out, A.to(input.dtype)) # torch.matmul(out, A)
+
+            in_features = input_reshaped.shape[-1]
+            rank = B.shape[1]
+            var_scale = math.sqrt(in_features * rank)
+
+            out = out / var_scale
 
             if input.dim() == 2:
                 out = out.squeeze(1)
