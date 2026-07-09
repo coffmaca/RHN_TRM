@@ -87,17 +87,40 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                     dist.broadcast(param, src=0)
 
     # Optimizers and lr
+    hypernet_params = []
+    base_model_params = []
+
+    for name, param in model.model.named_parameters():
+        if "puzzle_emb" in name:
+            continue  # Managed by CastedSparseEmbeddingSignSGD_Distributed
+        if "hypernet" in name:
+            hypernet_params.append(param)
+        else:
+            base_model_params.append(param)
+
+    param_groups = [
+        {
+            "params": hypernet_params,
+            "lr": 0,
+            "weight_decay": config.weight_decay # * 10
+        },
+        {
+            "params": base_model_params,
+            "lr": 0,
+            "weight_decay": config.weight_decay
+        }
+    ]
+
     if config.arch.puzzle_emb_ndim == 0:
         optimizers = [
             AdamATan2(
-                model.parameters(),
+                param_groups,
                 lr=0,  # Needs to be set by scheduler
-                weight_decay=config.weight_decay,
                 betas=(config.beta1, config.beta2)
             )
         ]
         optimizer_lrs = [
-            config.lr
+            config.lr * 100, config.lr
         ]
     elif config.freeze_weights:
         optimizers = [
@@ -120,15 +143,14 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                 world_size=world_size
             ),
             AdamATan2(
-                model.parameters(),
+                param_groups,
                 lr=0,  # Needs to be set by scheduler
-                weight_decay=config.weight_decay,
                 betas=(config.beta1, config.beta2)
             )
         ]
         optimizer_lrs = [
             config.puzzle_emb_lr,
-            config.lr
+            [config.lr * 100, config.lr]
         ]
 
     return model, optimizers, optimizer_lrs
@@ -205,6 +227,19 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
 
 
 def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
+    # Check if the incoming base_lr parameter is an array/list of group learning rates
+    if isinstance(base_lr, list):
+        return [
+            cosine_schedule_with_warmup_lr_lambda(
+                current_step=train_state.step,
+                base_lr=lr_element,
+                num_warmup_steps=round(config.lr_warmup_steps),
+                num_training_steps=train_state.total_steps,
+                min_ratio=config.lr_min_ratio
+            )
+            for lr_element in base_lr
+        ]
+
     return cosine_schedule_with_warmup_lr_lambda(
         current_step=train_state.step,
         base_lr=base_lr,
@@ -288,8 +323,12 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
         lr_this_step = compute_lr(base_lr, config, train_state)
 
-        for param_group in optim.param_groups:
-            param_group['lr'] = lr_this_step
+        if isinstance(lr_this_step, list):
+            for param_group, lr_val in zip(optim.param_groups, lr_this_step):
+                param_group['lr'] = lr_val
+        else:
+            for param_group in optim.param_groups:
+                param_group['lr'] = lr_this_step
             
         optim.step()
         optim.zero_grad()
