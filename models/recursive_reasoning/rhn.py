@@ -221,6 +221,13 @@ class RHN_Hypernetwork(nn.Module):
             )
         )
 
+        self.att_input_norm = nn.RMSNorm(self.input_size,
+                                         eps=self.config.rms_norm_eps,
+                                         elementwise_affine=True).to(dtype=self.forward_dtype)
+        self.att_query_norm = nn.RMSNorm(self.input_size,
+                                         eps=self.config.rms_norm_eps,
+                                         elementwise_affine=True).to(dtype=self.forward_dtype)
+
         self.hypernet_base = nn.ModuleList(
             [RHN_ACTV1Block(self.config, attn=True) for _i in range(self.config.H_layers)]
         )
@@ -335,14 +342,18 @@ class RHN_Hypernetwork(nn.Module):
 
     def _attention(self, inputs) -> torch.Tensor:
         batch_size = inputs.shape[0]
+
         queries = self.perceiver_queries.expand(batch_size, -1, -1) #.to(dtype=inputs.dtype)
+        norm_queries = self.attn_query_norm(queries)
+        norm_inputs = self.att_input_norm(inputs)
+
         attn_output, _ = self.perceiver_attn(
-            query=queries,
-            key=inputs,
-            value=inputs
+            query=norm_queries,
+            key=norm_inputs,
+            value=norm_inputs
         )
 
-        return attn_output
+        return queries + attn_output
 
     def _expand_output(self, outputs) -> torch.Tensor:
         batch_size = outputs.shape[0]
