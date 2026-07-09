@@ -266,7 +266,6 @@ class RHN_Hypernetwork(nn.Module):
             symmetric_std = (target_variance / self.config.hypernet_rank) ** 0.25
             for key, norm_module in self.lora_norms.items():
                 trunc_normal_init_(norm_module.weight, std=symmetric_std)
-                norm_module.weight *= 10
 
     def forward(self, activations: torch.Tensor, **seq_info) -> Tuple[dict, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
