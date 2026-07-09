@@ -206,6 +206,7 @@ class RHN_Hypernetwork(nn.Module):
         embed_init_std = 1.0 / self.embed_scale
 
         self.input_size = self.config.hidden_size * self.config.L_layers
+        self.num_layers = len(self.layer_specs)
 
         self.perceiver_attn = nn.MultiheadAttention(
             embed_dim=self.input_size,
@@ -215,28 +216,13 @@ class RHN_Hypernetwork(nn.Module):
 
         self.perceiver_queries = nn.Parameter(
             trunc_normal_init_(
-                torch.empty((1, self.config.perceiver_rank, self.input_size), dtype=self.forward_dtype),
+                torch.empty((1, self.num_layers, self.input_size), dtype=self.forward_dtype),
                 std=embed_init_std
             )
         )
 
         self.hypernet_base = nn.ModuleList(
             [RHN_ACTV1Block(self.config, attn=True) for _i in range(self.config.H_layers)]
-        )
-
-        self.num_layers = len(self.layer_specs)
-
-        self.layer_perceiver_attn = nn.MultiheadAttention(
-            embed_dim=self.config.hypernet_hidden_size,
-            num_heads=self.config.perceiver_heads,
-            batch_first=True,
-        ).to(dtype=self.forward_dtype)
-
-        self.layer_queries = nn.Parameter(
-            trunc_normal_init_(
-                torch.empty((1, self.num_layers, self.config.hypernet_hidden_size), dtype=self.forward_dtype),
-                std=embed_init_std
-            )
         )
 
         self.output_head = CastedLinear(self.config.hypernet_hidden_size,
@@ -277,14 +263,6 @@ class RHN_Hypernetwork(nn.Module):
         for layer in self.hypernet_base:
             hidden_states = layer(hidden_states=hidden_states, **seq_info)
 
-        layer_q = self.layer_queries.expand(batch_size, -1, -1)
-        hidden_states, _ = self.layer_perceiver_attn(
-            query=layer_q,
-            key=hidden_states,
-            value=hidden_states
-        )
-
-        # Output head now processes the expanded tensor: Shape (B, num_layers, perceiver_rank, out_features)
         outputs = self.output_head(hidden_states)
         outputs = self._expand_output(outputs)
 
