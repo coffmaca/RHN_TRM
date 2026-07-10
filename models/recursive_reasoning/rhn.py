@@ -511,7 +511,7 @@ class RHN_ACTV1_Inner(nn.Module):
 
         if log_deep_metrics:
             total_metrics["telemetry/gen_svd_ratio"] = torch.tensor(0.0, device=z_H.device)
-            total_metrics["telemetry/gen_base_l2_ratio"] = torch.tensor(0.0, device=z_H.device)
+            # total_metrics["telemetry/gen_base_l2_ratio"] = torch.tensor(0.0, device=z_H.device)
 
         metric_calls = 0
 
@@ -525,7 +525,7 @@ class RHN_ACTV1_Inner(nn.Module):
             # Low-Frequency (Every 100 Steps)
             if log_deep_metrics:
                 total_metrics["telemetry/gen_svd_ratio"] += step_metrics["svd_ratio"]
-                total_metrics["telemetry/gen_base_l2_ratio"] += step_metrics["gen_base_l2_ratio"]
+                # total_metrics["telemetry/gen_base_l2_ratio"] += step_metrics["gen_base_l2_ratio"]
             metric_calls += 1
 
         total_l2 = torch.zeros(z_L.shape[0], device=z_L.device, dtype=z_L.dtype)
