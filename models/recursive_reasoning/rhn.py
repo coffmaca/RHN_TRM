@@ -492,27 +492,27 @@ class RHN_ACTV1_Inner(nn.Module):
         # total_kl = torch.zeros(z_L.shape[0], device=z_L.device, dtype=z_L.dtype)
 
         # H_cycles-1 without grad
-        with torch.no_grad():
-            for _H_step in range(self.config.H_cycles-1):
-                for _L_step in range(self.config.L_cycles):
-                    prev_z_L = z_L
-                    z_L, _, step_m = self._dynamic_forward(z_L=z_L,
-                                                           z_H=z_H,
-                                                           input_embeddings=input_embeddings,
-                                                           log_deep_metrics=log_deep_metrics,
-                                                           global_step=inner_steps,
-                                                           **seq_info)
-                    track_metrics(prev_z_L, z_L, step_m)
-                    inner_steps += 1
-                prev_z_H = z_H
-                z_H, _, step_m = self._dynamic_forward(z_L=z_L,
+        # with torch.no_grad():
+        for _H_step in range(self.config.H_cycles-1):
+            for _L_step in range(self.config.L_cycles):
+                prev_z_L = z_L
+                z_L, _, step_m = self._dynamic_forward(z_L=z_L,
                                                        z_H=z_H,
-                                                       input_embeddings=None,
+                                                       input_embeddings=input_embeddings,
                                                        log_deep_metrics=log_deep_metrics,
                                                        global_step=inner_steps,
                                                        **seq_info)
-                track_metrics(prev_z_H, z_H, step_m)
+                track_metrics(prev_z_L, z_L, step_m)
                 inner_steps += 1
+            prev_z_H = z_H
+            z_H, _, step_m = self._dynamic_forward(z_L=z_L,
+                                                   z_H=z_H,
+                                                   input_embeddings=None,
+                                                   log_deep_metrics=log_deep_metrics,
+                                                   global_step=inner_steps,
+                                                   **seq_info)
+            track_metrics(prev_z_H, z_H, step_m)
+            inner_steps += 1
 
         for _L_step in range(self.config.L_cycles):
             prev_z_L = z_L
