@@ -344,7 +344,7 @@ class RHN_Hypernetwork(nn.Module):
         batch_size = inputs.shape[0]
 
         queries = self.perceiver_queries.expand(batch_size, -1, -1) #.to(dtype=inputs.dtype)
-        norm_queries = self.attn_query_norm(queries)
+        norm_queries = self.att_query_norm(queries)
         norm_inputs = self.att_input_norm(inputs)
 
         attn_output, _ = self.perceiver_attn(
