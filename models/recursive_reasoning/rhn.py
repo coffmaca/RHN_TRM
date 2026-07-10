@@ -75,7 +75,7 @@ class RHN_ACTV1Config(BaseModel):
     hypernet_l2_lambda: float = 1e-4
 
 class RHN_ACTV1Block(nn.Module):
-    def __init__(self, config: RHN_ACTV1Config, attn: bool = True) -> None:
+    def __init__(self, config: RHN_ACTV1Config, attn: bool = True, num_layers:int = None) -> None:
         super().__init__()
 
         self.config = config
@@ -84,7 +84,7 @@ class RHN_ACTV1Block(nn.Module):
             if self.config.mlp_t:
                 self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hypernet_hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
                 self.mlp_t = SwiGLU(
-                    hidden_size= self.config.perceiver_rank, # self.config.seq_len + self.puzzle_emb_len,
+                    hidden_size= num_layers, # self.config.seq_len + self.puzzle_emb_len,
                     expansion=config.expansion,
                 )
             else:
@@ -208,6 +208,7 @@ class RHN_Hypernetwork(nn.Module):
         embed_init_std = 1.0 / self.embed_scale
 
         self.input_size = self.config.hidden_size * self.config.L_layers
+        self.num_layers = len(self.layer_specs)
 
         self.perceiver_attn = nn.MultiheadAttention(
             embed_dim=self.input_size,
@@ -217,44 +218,22 @@ class RHN_Hypernetwork(nn.Module):
 
         self.perceiver_queries = nn.Parameter(
             trunc_normal_init_(
-                torch.empty((1, self.config.perceiver_rank, self.input_size), dtype=self.forward_dtype),
+                torch.empty((1, self.num_layers, self.input_size), dtype=self.forward_dtype),
                 std=embed_init_std
             )
         )
+
+        self.att_input_norm = nn.RMSNorm(self.input_size,
+                                         eps=self.config.rms_norm_eps,
+                                         elementwise_affine=True).to(dtype=self.forward_dtype)
+        self.att_query_norm = nn.RMSNorm(self.input_size,
+                                         eps=self.config.rms_norm_eps,
+                                         elementwise_affine=True).to(dtype=self.forward_dtype)
 
         self.dropout = nn.Dropout(p=self.config.hypernet_dropout)
 
-        self.att_input_norm_in = nn.RMSNorm(self.input_size,
-                                         eps=self.config.rms_norm_eps,
-                                         elementwise_affine=True).to(dtype=self.forward_dtype)
-        self.att_query_norm_in = nn.RMSNorm(self.input_size,
-                                         eps=self.config.rms_norm_eps,
-                                         elementwise_affine=True).to(dtype=self.forward_dtype)
-
-        self.att_input_norm_out = nn.RMSNorm(self.config.hypernet_hidden_size,
-                                         eps=self.config.rms_norm_eps,
-                                         elementwise_affine=True).to(dtype=self.forward_dtype)
-        self.att_query_norm_out = nn.RMSNorm(self.config.hypernet_hidden_size,
-                                         eps=self.config.rms_norm_eps,
-                                         elementwise_affine=True).to(dtype=self.forward_dtype)
-
         self.hypernet_base = nn.ModuleList(
-            [RHN_ACTV1Block(self.config, attn=True) for _i in range(self.config.H_layers)]
-        )
-
-        self.num_layers = len(self.layer_specs)
-
-        self.layer_perceiver_attn = nn.MultiheadAttention(
-            embed_dim=self.config.hypernet_hidden_size,
-            num_heads=self.config.perceiver_heads,
-            batch_first=True,
-        ).to(dtype=self.forward_dtype)
-
-        self.layer_queries = nn.Parameter(
-            trunc_normal_init_(
-                torch.empty((1, self.num_layers, self.config.hypernet_hidden_size), dtype=self.forward_dtype),
-                std=embed_init_std
-            )
+            [RHN_ACTV1Block(self.config, attn=True, num_layers=self.num_layers) for _i in range(self.config.H_layers)]
         )
 
         self.output_head = CastedLinear(self.config.hypernet_hidden_size,
@@ -297,19 +276,6 @@ class RHN_Hypernetwork(nn.Module):
         for layer in self.hypernet_base:
             hidden_states = self.dropout(layer(hidden_states=hidden_states, **seq_info))
 
-        layer_q = self.layer_queries.expand(batch_size, -1, -1)
-        norm_layer_q = self.att_query_norm_out(layer_q)
-        norm_hidden_states = self.att_input_norm_out(hidden_states)
-
-        hidden_states, _ = self.layer_perceiver_attn(
-            query=norm_layer_q,
-            key=norm_hidden_states,
-            value=norm_hidden_states
-        )
-
-        hidden_states = layer_q + hidden_states
-
-        # Output head now processes the expanded tensor: Shape (B, num_layers, perceiver_rank, out_features)
         outputs = self.output_head(hidden_states)
         outputs = self._expand_output(outputs)
 
@@ -384,8 +350,8 @@ class RHN_Hypernetwork(nn.Module):
         batch_size = inputs.shape[0]
 
         queries = self.perceiver_queries.expand(batch_size, -1, -1) #.to(dtype=inputs.dtype)
-        norm_queries = self.att_query_norm_in(queries)
-        norm_inputs = self.att_input_norm_in(inputs)
+        norm_queries = self.att_query_norm(queries)
+        norm_inputs = self.att_input_norm(inputs)
 
         attn_output, _ = self.perceiver_attn(
             query=norm_queries,

@@ -5,8 +5,6 @@ import torch.nn.functional as F
 from torch import nn
 import math
 
-from config_init import PretrainConfig
-
 IGNORE_LABEL_ID = -100
 
 
@@ -41,10 +39,10 @@ def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
 
 
 class ACTLossHead(nn.Module):
-    def __init__(self, model: nn.Module, config: PretrainConfig):
+    def __init__(self, model: nn.Module, loss_type: str):
         super().__init__()
         self.model = model
-        self.loss_fn = globals()[config.arch.loss.model_extra["loss_type"]]
+        self.loss_fn = globals()[loss_type]
         self.l2_lambda = self.model.config.hypernet_l2_lambda
 
     def initial_carry(self, *args, **kwargs):
@@ -117,7 +115,7 @@ class ACTLossHead(nn.Module):
         # Filter outputs for return
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
-        final_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss) + scaled_l2_loss
+        final_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss)
 
         return new_carry, final_loss, metrics, detached_outputs, new_carry.halted.all()
 
