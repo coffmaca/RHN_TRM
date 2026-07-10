@@ -224,6 +224,20 @@ class RHN_Hypernetwork(nn.Module):
 
         self.dropout = nn.Dropout(p=self.config.hypernet_dropout)
 
+        self.att_input_norm_in = nn.RMSNorm(self.input_size,
+                                         eps=self.config.rms_norm_eps,
+                                         elementwise_affine=True).to(dtype=self.forward_dtype)
+        self.att_query_norm_in = nn.RMSNorm(self.input_size,
+                                         eps=self.config.rms_norm_eps,
+                                         elementwise_affine=True).to(dtype=self.forward_dtype)
+
+        self.att_input_norm_out = nn.RMSNorm(self.config.hypernet_hidden_size,
+                                         eps=self.config.rms_norm_eps,
+                                         elementwise_affine=True).to(dtype=self.forward_dtype)
+        self.att_query_norm_out = nn.RMSNorm(self.config.hypernet_hidden_size,
+                                         eps=self.config.rms_norm_eps,
+                                         elementwise_affine=True).to(dtype=self.forward_dtype)
+
         self.hypernet_base = nn.ModuleList(
             [RHN_ACTV1Block(self.config, attn=True) for _i in range(self.config.H_layers)]
         )
@@ -284,11 +298,16 @@ class RHN_Hypernetwork(nn.Module):
             hidden_states = self.dropout(layer(hidden_states=hidden_states, **seq_info))
 
         layer_q = self.layer_queries.expand(batch_size, -1, -1)
+        norm_layer_q = self.att_query_norm_out(layer_q)
+        norm_hidden_states = self.att_input_norm_out(hidden_states)
+
         hidden_states, _ = self.layer_perceiver_attn(
-            query=layer_q,
-            key=hidden_states,
-            value=hidden_states
+            query=norm_layer_q,
+            key=norm_hidden_states,
+            value=norm_hidden_states
         )
+
+        hidden_states = layer_q + hidden_states
 
         # Output head now processes the expanded tensor: Shape (B, num_layers, perceiver_rank, out_features)
         outputs = self.output_head(hidden_states)
@@ -363,14 +382,18 @@ class RHN_Hypernetwork(nn.Module):
 
     def _attention(self, inputs) -> torch.Tensor:
         batch_size = inputs.shape[0]
+
         queries = self.perceiver_queries.expand(batch_size, -1, -1) #.to(dtype=inputs.dtype)
+        norm_queries = self.att_query_norm_in(queries)
+        norm_inputs = self.att_input_norm_in(inputs)
+
         attn_output, _ = self.perceiver_attn(
-            query=queries,
-            key=inputs,
-            value=inputs
+            query=norm_queries,
+            key=norm_inputs,
+            value=norm_inputs
         )
 
-        return attn_output
+        return queries + attn_output
 
     def _expand_output(self, outputs) -> torch.Tensor:
         batch_size = outputs.shape[0]
