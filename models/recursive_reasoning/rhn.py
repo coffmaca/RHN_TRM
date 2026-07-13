@@ -555,35 +555,40 @@ class RHN_ACTV1_Inner(nn.Module):
             for _H_step in range(self.config.H_cycles-1):
                 for _L_step in range(self.config.L_cycles):
                     prev_z_L = z_L
-                    z_L, _, step_m = self._dynamic_forward(z_L=z_L,
+                    deltas, _, step_m = self._dynamic_forward(z_L=z_L,
                                                         z_H=z_H,
                                                         input_embeddings=input_embeddings,
                                                         log_deep_metrics=log_deep_metrics,
                                                         **seq_info)
+                    z_L = z_L + deltas
                     track_metrics(prev_z_L, z_L, step_m)
                 prev_z_H = z_H
-                z_H, _, step_m = self._dynamic_forward(z_L=z_L,
+                deltas, _, step_m = self._dynamic_forward(z_L=z_L,
                                                     z_H=z_H,
                                                     input_embeddings=None,
                                                     log_deep_metrics=log_deep_metrics,
                                                     **seq_info)
+                z_H = z_H + deltas
                 track_metrics(prev_z_H, z_H, step_m)
 
         for _L_step in range(self.config.L_cycles):
             prev_z_L = z_L
-            z_L, step_l2, step_m = self._dynamic_forward(z_L=z_L,
+            deltas, step_l2, step_m = self._dynamic_forward(z_L=z_L,
                                                 z_H=z_H,
                                                 input_embeddings=input_embeddings,
                                                 log_deep_metrics=log_deep_metrics,
                                                 **seq_info)
+            z_L = z_L + deltas
             track_metrics(prev_z_L, z_L, step_m)
 
         prev_z_H = z_H
-        z_H, step_l2, step_m = self._dynamic_forward(z_L=z_L,
+        deltas, step_l2, step_m = self._dynamic_forward(z_L=z_L,
                                     z_H=z_H,
                                     input_embeddings=None,
                                     log_deep_metrics=log_deep_metrics,
                                     **seq_info)
+
+        z_H = z_H + deltas
 
         total_l2 += step_l2
         avg_l2 = total_l2 / (self.config.L_cycles + 1)
@@ -666,7 +671,9 @@ class RHN_ACTV1_Inner(nn.Module):
 
         # h_base + h_dyn = 2 * initial_state + base_deltas + dyn_deltas
         # Subtract initial_state to prevent doubling of residual stream
-        return h_base + h_dyn - initial_state, step_l2, step_metrics
+        base_deltas = h_base - initial_state
+        dyn_deltas = h_dyn - initial_state
+        return base_deltas + dyn_deltas, step_l2, step_metrics
 
 
 
