@@ -260,6 +260,7 @@ class RHN_Hypernetwork(nn.Module):
             }
 
         self.input_size = self.config.hidden_size * self.config.L_layers
+        self.num_layers = len(self.layer_specs)
 
         self.perceiver_attn = nn.MultiheadAttention(
             embed_dim=self.input_size,
@@ -267,10 +268,17 @@ class RHN_Hypernetwork(nn.Module):
             batch_first=True,
         ).to(dtype=self.forward_dtype)
 
-        self.perceiver_queries = nn.Parameter(
+        self.input_queries = nn.Parameter(
             trunc_normal_init_(
                 torch.empty((1, self.config.perceiver_rank, self.input_size), dtype=self.forward_dtype),
                 std=1.0 / math.sqrt(self.input_size),
+            )
+        )
+
+        self.layer_queries = nn.Parameter(
+            trunc_normal_init_(
+                torch.empty((1, self.num_layers, self.config.hypernet_hidden_size), dtype=self.forward_dtype),
+                std=1.0 / math.sqrt(self.config.hypernet_hidden_size),
             )
         )
 
@@ -287,6 +295,12 @@ class RHN_Hypernetwork(nn.Module):
                 "heads": self.config.perceiver_heads,
             })
         )
+        self.hypernet_base.append(
+            RHN_ACTV1Block(self.config, attn=True, attn_type="perceiver", attn_params={
+                "input_size": self.config.hypernet_hidden_size,
+                "heads": self.config.perceiver_heads,
+            })
+        )
 
         self.output_norm = nn.RMSNorm(self.config.hypernet_hidden_size,
                                       eps=self.config.rms_norm_eps,
@@ -296,6 +310,31 @@ class RHN_Hypernetwork(nn.Module):
                                          self._output_dim(layer_specs),
                                          bias=False)
 
+        self.lora_norms = nn.ModuleDict()
+
+        for name, shape in self.layer_specs:
+            safe_name = name.replace(".", "_")
+
+            if self._is_vector_like(shape):
+                size = shape[0] * self.config.hypernet_rank
+                self.lora_norms[f"{safe_name}"] = nn.RMSNorm(size, eps=self.config.rms_norm_eps,
+                                                             elementwise_affine=True).to(dtype=self.forward_dtype)
+            else:
+                size_a = shape[0] * self.config.hypernet_rank
+                size_b = shape[1] * self.config.hypernet_rank
+
+                self.lora_norms[f"{safe_name}_A"] = nn.RMSNorm(size_a, eps=self.config.rms_norm_eps,
+                                                               elementwise_affine=True).to(dtype=self.forward_dtype)
+                self.lora_norms[f"{safe_name}_B"] = nn.RMSNorm(size_b, eps=self.config.rms_norm_eps,
+                                                               elementwise_affine=True).to(dtype=self.forward_dtype)
+
+        with torch.no_grad():
+            target_variance = 1.0 / self.config.hidden_size
+            symmetric_std = (target_variance / self.config.hypernet_rank) ** 0.25
+            for key, norm_module in self.lora_norms.items():
+                trunc_normal_init_(norm_module.weight, std=symmetric_std)
+                # norm_module.weight *= 10
+
     def forward(self, activations: torch.Tensor, **seq_info) -> Tuple[dict, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
 
@@ -304,9 +343,11 @@ class RHN_Hypernetwork(nn.Module):
 
         for i, layer in enumerate(self.hypernet_base):
             if i == 0:
-                hidden_states = layer(hidden_states=self.perceiver_queries, kv=activations, **seq_info)
-            else:
+                hidden_states = layer(hidden_states=self.input_queries, kv=activations, **seq_info)
+            elif i < len(self.hypernet_base) - 1:
                 hidden_states = layer(hidden_states=hidden_states, kv=activations, **seq_info)
+            else:
+                hidden_states = layer(hidden_states=self.layer_queries, kv=hidden_states, **seq_info)
 
         hidden_states_norm = self.output_norm(hidden_states)
         outputs = self.output_head(hidden_states_norm)
