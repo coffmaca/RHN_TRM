@@ -163,7 +163,7 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
         if self.attn:
             self.post_attn_norm = nn.RMSNorm(self.config.hidden_size,
                                                     eps=self.config.rms_norm_eps,
-                                                    elementwise_affine=True).to(dtype=self.forward_dtype)
+                                                    elementwise_affine=False).to(dtype=self.forward_dtype)
             if self.attn_type == "mlp_t":
                 self.puzzle_emb_len = -(
                             self.config.puzzle_emb_ndim // -self.config.hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
