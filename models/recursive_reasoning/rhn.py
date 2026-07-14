@@ -329,14 +329,14 @@ class RHN_Hypernetwork(nn.Module):
                                                                elementwise_affine=True).to(dtype=self.forward_dtype)
 
         with torch.no_grad():
-            # target_variance = 1.0 / self.config.hidden_size
-            # symmetric_std = (target_variance / self.config.hypernet_rank) ** 0.25
+            target_variance = 1.0 / self.config.hidden_size
+            symmetric_std = (target_variance / self.config.hypernet_rank) ** 0.25
             for key, norm_module in self.lora_norms.items():
-                trunc_normal_init_(norm_module.weight, std=0.02)
+                # trunc_normal_init_(norm_module.weight, std=0.02)
                 # norm_module.weight.add_(1.0)
 
-                # trunc_normal_init_(norm_module.weight, std=symmetric_std)
-                # norm_module.weight *= 10
+                trunc_normal_init_(norm_module.weight, std=symmetric_std)
+                norm_module.weight *= 1.5
 
                 # if key.endswith("_B"):
                 #     # Initialize B matrices to 0.0 so dynamic output starts safely at zero
@@ -725,8 +725,10 @@ class RHN_ACTV1_Inner(nn.Module):
 
         # h_base + h_dyn = 2 * initial_state + base_deltas + dyn_deltas
         # Subtract initial_state to prevent doubling of residual stream
-        combined_deltas = h_dyn - initial_state
-        return combined_deltas, step_l2, step_metrics
+        delta_base = h_base - initial_state
+        delta_dyn = h_dyn - initial_state
+        # combined_deltas = h_dyn - initial_state
+        return delta_base + delta_dyn, step_l2, step_metrics
 
 
 
