@@ -332,18 +332,18 @@ class RHN_Hypernetwork(nn.Module):
             # target_variance = 1.0 / self.config.hidden_size
             # symmetric_std = (target_variance / self.config.hypernet_rank) ** 0.25
             for key, norm_module in self.lora_norms.items():
-                trunc_normal_init_(norm_module.weight, std=0.02)
+                # trunc_normal_init_(norm_module.weight, std=0.02)
                 # norm_module.weight.add_(1.0)
 
                 # trunc_normal_init_(norm_module.weight, std=symmetric_std)
                 # norm_module.weight *= 10
 
-                # if key.endswith("_B"):
-                #     # Initialize B matrices to 0.0 so dynamic output starts safely at zero
-                #     nn.init.zeros_(norm_module.weight)
-                # else:
-                #     # Initialize A matrices (and vectors) to 1.0 unit variance
-                #     nn.init.ones_(norm_module.weight)
+                if key.endswith("_B"):
+                    # Initialize B matrices to 0.0 so dynamic output starts safely at zero
+                    nn.init.zeros_(norm_module.weight)
+                else:
+                    # Initialize A matrices (and vectors) to 1.0 unit variance
+                    nn.init.ones_(norm_module.weight)
 
     def forward(self, activations: torch.Tensor, **seq_info) -> Tuple[dict, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
