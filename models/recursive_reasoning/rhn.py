@@ -310,40 +310,16 @@ class RHN_Hypernetwork(nn.Module):
                                          self._output_dim(layer_specs),
                                          bias=False)
 
-        self.lora_norms = nn.ModuleDict()
+        self.lora_scales = nn.ParameterDict()
 
         for name, shape in self.layer_specs:
             safe_name = name.replace(".", "_")
 
             if self._is_vector_like(shape):
-                size = shape[0] * self.config.hypernet_rank
-                self.lora_norms[f"{safe_name}"] = nn.RMSNorm(size, eps=self.config.rms_norm_eps,
-                                                             elementwise_affine=True).to(dtype=self.forward_dtype)
+                self.lora_scales[f"{safe_name}"] = nn.Parameter(torch.ones(1, dtype=self.forward_dtype))
             else:
-                size_a = shape[0] * self.config.hypernet_rank
-                size_b = shape[1] * self.config.hypernet_rank
-
-                self.lora_norms[f"{safe_name}_A"] = nn.RMSNorm(size_a, eps=self.config.rms_norm_eps,
-                                                               elementwise_affine=True).to(dtype=self.forward_dtype)
-                self.lora_norms[f"{safe_name}_B"] = nn.RMSNorm(size_b, eps=self.config.rms_norm_eps,
-                                                               elementwise_affine=True).to(dtype=self.forward_dtype)
-
-        with torch.no_grad():
-            # target_variance = 1.0 / self.config.hidden_size
-            # symmetric_std = (target_variance / self.config.hypernet_rank) ** 0.25
-            for key, norm_module in self.lora_norms.items():
-                trunc_normal_init_(norm_module.weight, std=0.02)
-                # norm_module.weight.add_(1.0)
-
-                # trunc_normal_init_(norm_module.weight, std=symmetric_std)
-                # norm_module.weight *= 10
-
-                # if key.endswith("_B"):
-                #     # Initialize B matrices to 0.0 so dynamic output starts safely at zero
-                #     nn.init.zeros_(norm_module.weight)
-                # else:
-                #     # Initialize A matrices (and vectors) to 1.0 unit variance
-                #     nn.init.ones_(norm_module.weight)
+                self.lora_scales[f"{safe_name}_A"] = nn.Parameter(torch.ones(1, dtype=self.forward_dtype))
+                self.lora_scales[f"{safe_name}_B"] = nn.Parameter(torch.zeros(1, dtype=self.forward_dtype))
 
     def forward(self, activations: torch.Tensor, **seq_info) -> Tuple[dict, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
@@ -377,9 +353,9 @@ class RHN_Hypernetwork(nn.Module):
             outputs_a = layer_params[:, output_index: output_index + size_a]
 
             if layer_info["type"] == "matrix":
-                outputs_a = self.lora_norms[f"{safe_name}_A"](outputs_a)
+                outputs_a = outputs_a * self.lora_scales[f"{safe_name}_A"]
             else:
-                outputs_a = self.lora_norms[f"{safe_name}"](outputs_a)
+                outputs_a = outputs_a * self.lora_scales[f"{safe_name}"]
 
             outputs_a = outputs_a.reshape(batch_size, shape[0], self.config.hypernet_rank)
             output_index += size_a
@@ -387,7 +363,7 @@ class RHN_Hypernetwork(nn.Module):
             if layer_info["type"] == "matrix":
                 size_b = shape[1] * self.config.hypernet_rank
                 outputs_b = layer_params[:, output_index: output_index + size_b]
-                outputs_b = self.lora_norms[f"{safe_name}_B"](outputs_b)
+                outputs_b = outputs_b * self.lora_scales[f"{safe_name}_B"]
                 outputs_b = outputs_b.reshape(batch_size, self.config.hypernet_rank, shape[1])
                 output_index += size_b
 
