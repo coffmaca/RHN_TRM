@@ -413,8 +413,8 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 
                     for name, param in train_state.model.named_parameters():
                         if param.requires_grad:
-                            reduced_metrics[f"telemetry/static_mean/{name}"] = param.mean().item()
-                            reduced_metrics[f"telemetry/static_std/{name}"] = param.std().item()
+                            reduced_metrics[f"telemetry/static_abs_mean/{name}"] = param.abs().mean().item()
+                            reduced_metrics[f"telemetry/static_abs_std/{name}"] = param.abs().std().item()
 
                             p_sum = param.sum().item()
                             p_sq_sum = (param ** 2).sum().item()
@@ -432,14 +432,14 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
                     if hypernet_count > 0:
                         h_mean = hypernet_sum / hypernet_count
                         h_var = (hypernet_sq_sum / hypernet_count) - (h_mean ** 2)
-                        reduced_metrics["telemetry/total_static_mean/hypernetwork"] = h_mean
-                        reduced_metrics["telemetry/total_static_std/hypernetwork"] = math.sqrt(max(h_var, 0.0))
+                        reduced_metrics["telemetry/total_static_abs_mean/hypernetwork"] = h_mean
+                        reduced_metrics["telemetry/total_static_abs_std/hypernetwork"] = math.sqrt(max(h_var, 0.0))
 
                     if base_count > 0:
                         b_mean = base_sum / base_count
                         b_var = (base_sq_sum / base_count) - (b_mean ** 2)
-                        reduced_metrics["telemetry/total_static_mean/base_model"] = b_mean
-                        reduced_metrics["telemetry/total_static_std/base_model"] = math.sqrt(max(b_var, 0.0))
+                        reduced_metrics["telemetry/total_static_abs_mean/base_model"] = b_mean
+                        reduced_metrics["telemetry/total_static_abs_std/base_model"] = math.sqrt(max(b_var, 0.0))
 
                 reduced_metrics.update(captured_metrics)
 

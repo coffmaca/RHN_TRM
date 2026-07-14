@@ -83,7 +83,7 @@ class RHN_ACTV1Block(nn.Module):
         self.attn_type = attn_type
 
         if self.attn:
-            self.hidden_states_norm_in = nn.RMSNorm(attn_params["input_size"],
+            self.post_attn_norm = nn.RMSNorm(attn_params["input_size"],
                                                 eps=self.config.rms_norm_eps,
                                                 elementwise_affine=True).to(dtype=self.forward_dtype)
             if self.attn_type == "mlp_t":
@@ -107,13 +107,7 @@ class RHN_ACTV1Block(nn.Module):
                     batch_first=True,
                 ).to(dtype=self.forward_dtype)
 
-                self.perc_kv_norm = nn.RMSNorm(attn_params["input_size"],
-                                                 eps=self.config.rms_norm_eps,
-                                                 elementwise_affine=True).to(dtype=self.forward_dtype)
-
-        self.attn_out_scale = nn.Parameter(torch.full((attn_params["input_size"],), 1e-4, dtype=self.forward_dtype))
-
-        self.hidden_states_norm_out = nn.RMSNorm(attn_params["input_size"],
+        self.post_mlp_norm = nn.RMSNorm(attn_params["input_size"],
                                                 eps=self.config.rms_norm_eps,
                                                 elementwise_affine=True).to(dtype=self.forward_dtype)
 
@@ -131,34 +125,30 @@ class RHN_ACTV1Block(nn.Module):
         # B, L, D = hidden_states.shape
         # Pre-Norm
         if self.attn:
-            hidden_states_norm = self.hidden_states_norm_in(hidden_states)
             if self.attn_type == "mlp_t":
-                attn_in = hidden_states_norm.transpose(1,2)
+                attn_in = hidden_states.transpose(1,2)
                 attn_out = self.mlp_t(attn_in).transpose(1,2)
             elif self.attn_type == "self":
-                attn_out = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states_norm)
+                attn_out = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
             elif self.attn_type == "perceiver":
-                queries_norm = hidden_states_norm
+                queries = hidden_states
 
-                if queries_norm.dim() == 2:
-                    queries_norm = queries_norm.unsqueeze(0)
-                if queries_norm.dim() == 3 and queries_norm.size(0) == 1:
+                if queries.dim() == 2:
+                    queries = queries.unsqueeze(0)
+                if queries.dim() == 3 and queries.size(0) == 1:
                     batch_size = kv.shape[0]
-                    queries_norm = queries_norm.expand(batch_size, -1, -1)
-
-                norm_kv = self.perc_kv_norm(kv)
+                    queries = queries.expand(batch_size, -1, -1)
 
                 attn_out, _ = self.perceiver_attn(
-                    query=queries_norm,
-                    key=norm_kv,
-                    value=norm_kv
+                    query=queries,
+                    key=kv,
+                    value=kv
                 )
 
-            hidden_states = hidden_states + self.attn_out_scale * attn_out
+            hidden_states = self.post_attn_norm(hidden_states + attn_out)
 
-        hidden_states_norm = self.hidden_states_norm_out(hidden_states)
-        out = self.mlp(hidden_states_norm)
-        hidden_states = hidden_states + self.mlp_out_scale * out
+        out = self.mlp(hidden_states)
+        hidden_states = self.post_mlp_norm(hidden_states + out)
         return hidden_states
 
 
@@ -171,7 +161,7 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
         self.attn = attn
         self.attn_type = attn_type
         if self.attn:
-            self.hidden_states_norm_in = nn.RMSNorm(self.config.hidden_size,
+            self.post_attn_norm = nn.RMSNorm(self.config.hidden_size,
                                                     eps=self.config.rms_norm_eps,
                                                     elementwise_affine=True).to(dtype=self.forward_dtype)
             if self.attn_type == "mlp_t":
@@ -189,9 +179,8 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
                     num_key_value_heads=config.num_heads,
                     causal=False
                 )
-            self.attn_out_scale = nn.Parameter(torch.full((self.config.hidden_size,), 1e-4, dtype=self.forward_dtype))
 
-        self.hidden_states_norm_out = nn.RMSNorm(self.config.hidden_size,
+        self.post_mlp_norm = nn.RMSNorm(self.config.hidden_size,
                                                 eps=self.config.rms_norm_eps,
                                                 elementwise_affine=True).to(dtype=self.forward_dtype)
 
@@ -199,8 +188,6 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
             hidden_size=config.hidden_size,
             expansion=config.expansion,
         )
-
-        self.mlp_out_scale = nn.Parameter(torch.full((self.config.hidden_size,), 1e-4, dtype=self.forward_dtype))
 
         self.norm_eps = config.rms_norm_eps
 
@@ -232,16 +219,14 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.attn:
-            hidden_states_norm = self.hidden_states_norm_in(hidden_states)
             if self.attn_type == "mlp_t":
-                attn_in = hidden_states_norm.transpose(1, 2)
+                attn_in = hidden_states.transpose(1, 2)
                 attn_out = self.mlp_t(attn_in).transpose(1, 2)
             else:
-                attn_out = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states_norm)
-            hidden_states = hidden_states + self.attn_out_scale * attn_out
-        hidden_states_norm = self.hidden_states_norm_out(hidden_states)
-        out = self.mlp(hidden_states_norm)
-        hidden_states = hidden_states + self.mlp_out_scale * out
+                attn_out = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
+            hidden_states = self.post_attn_norm(hidden_states + attn_out)
+        out = self.mlp(hidden_states)
+        hidden_states = self.post_mlp_norm(hidden_states + out)
         return hidden_states
 
 
@@ -302,10 +287,6 @@ class RHN_Hypernetwork(nn.Module):
             })
         )
 
-        self.output_norm = nn.RMSNorm(self.config.hypernet_hidden_size,
-                                      eps=self.config.rms_norm_eps,
-                                      elementwise_affine=True).to(dtype=self.forward_dtype)
-
         self.output_head = CastedLinear(self.config.hypernet_hidden_size,
                                          self._output_dim(layer_specs),
                                          bias=False)
@@ -359,8 +340,7 @@ class RHN_Hypernetwork(nn.Module):
             else:
                 hidden_states = layer(hidden_states=self.layer_queries, kv=hidden_states, **seq_info)
 
-        hidden_states_norm = self.output_norm(hidden_states)
-        outputs = self.output_head(hidden_states_norm)
+        outputs = self.output_head(hidden_states)
         outputs = self._expand_output(outputs)
 
         step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
@@ -513,13 +493,6 @@ class RHN_ACTV1_Inner(nn.Module):
 
         self.hypernet = RHN_Hypernetwork(self.config, self.layer_specs)
 
-        self.lm_norm = nn.RMSNorm(self.config.hidden_size,
-                                                    eps=self.config.rms_norm_eps,
-                                                    elementwise_affine=True).to(dtype=self.forward_dtype)
-        self.q_norm = nn.RMSNorm(self.config.hidden_size,
-                                  eps=self.config.rms_norm_eps,
-                                  elementwise_affine=True).to(dtype=self.forward_dtype)
-
         # Initial states
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
         self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
@@ -609,40 +582,35 @@ class RHN_ACTV1_Inner(nn.Module):
             for _H_step in range(self.config.H_cycles-1):
                 for _L_step in range(self.config.L_cycles):
                     prev_z_L = z_L
-                    deltas, _, step_m = self._dynamic_forward(z_L=z_L,
+                    z_L, _, step_m = self._dynamic_forward(z_L=z_L,
                                                         z_H=z_H,
                                                         input_embeddings=input_embeddings,
                                                         log_deep_metrics=log_deep_metrics,
                                                         **seq_info)
-                    z_L = z_L + deltas
                     track_metrics(prev_z_L, z_L, step_m)
                 prev_z_H = z_H
-                deltas, _, step_m = self._dynamic_forward(z_L=z_L,
+                z_H, _, step_m = self._dynamic_forward(z_L=z_L,
                                                     z_H=z_H,
                                                     input_embeddings=None,
                                                     log_deep_metrics=log_deep_metrics,
                                                     **seq_info)
-                z_H = z_H + deltas
                 track_metrics(prev_z_H, z_H, step_m)
 
         for _L_step in range(self.config.L_cycles):
             prev_z_L = z_L
-            deltas, step_l2, step_m = self._dynamic_forward(z_L=z_L,
+            z_L, step_l2, step_m = self._dynamic_forward(z_L=z_L,
                                                 z_H=z_H,
                                                 input_embeddings=input_embeddings,
                                                 log_deep_metrics=log_deep_metrics,
                                                 **seq_info)
-            z_L = z_L + deltas
             track_metrics(prev_z_L, z_L, step_m)
 
         prev_z_H = z_H
-        deltas, step_l2, step_m = self._dynamic_forward(z_L=z_L,
+        z_H, step_l2, step_m = self._dynamic_forward(z_L=z_L,
                                     z_H=z_H,
                                     input_embeddings=None,
                                     log_deep_metrics=log_deep_metrics,
                                     **seq_info)
-
-        z_H = z_H + deltas
 
         total_l2 += step_l2
         avg_l2 = total_l2 / (self.config.L_cycles + 1)
@@ -655,8 +623,8 @@ class RHN_ACTV1_Inner(nn.Module):
 
         # LM Outputs
         new_carry = RHN_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
-        output = self.lm_head(self.lm_norm(z_H))[:, self.puzzle_emb_len:]
-        q_logits = self.q_head(self.q_norm(z_H)[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
+        output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
+        q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), avg_l2, total_metrics
 
     def _dynamic_forward(self, z_L, z_H, input_embeddings=None, log_deep_metrics=False, **seq_info) -> Tuple[
@@ -725,8 +693,8 @@ class RHN_ACTV1_Inner(nn.Module):
 
         # h_base + h_dyn = 2 * initial_state + base_deltas + dyn_deltas
         # Subtract initial_state to prevent doubling of residual stream
-        combined_deltas = h_dyn - initial_state
-        return combined_deltas, step_l2, step_metrics
+        # combined_deltas = h_dyn - initial_state
+        return h_dyn, step_l2, step_metrics
 
 
 
