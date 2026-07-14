@@ -317,7 +317,7 @@ class RHN_Hypernetwork(nn.Module):
                 # norm_module.weight.add_(1.0)
 
                 trunc_normal_init_(norm_module.weight, std=symmetric_std)
-                norm_module.weight *= 1.5
+                norm_module.weight *= 10
 
                 # if key.endswith("_B"):
                 #     # Initialize B matrices to 0.0 so dynamic output starts safely at zero
