@@ -260,13 +260,6 @@ class RHN_Hypernetwork(nn.Module):
             )
         )
 
-        self.layer_queries = nn.Parameter(
-            trunc_normal_init_(
-                torch.empty((1, self.num_layers, self.config.hypernet_hidden_size), dtype=self.forward_dtype),
-                std=1.0 / math.sqrt(self.config.hypernet_hidden_size),
-            )
-        )
-
         self.hypernet_base = nn.ModuleList()
         self.hypernet_base.append(
             RHN_ACTV1Block(self.config, attn=True, attn_type="perceiver", attn_params={
@@ -309,7 +302,7 @@ class RHN_Hypernetwork(nn.Module):
                 self.lora_norms[f"{safe_name}_B"] = nn.RMSNorm(size_b, eps=self.config.rms_norm_eps,
                                                                elementwise_affine=True).to(dtype=self.forward_dtype)
 
-        # with torch.no_grad():
+        with torch.no_grad():
         #     # target_variance = 1.0 / self.config.hidden_size
         #     # symmetric_std = (target_variance / self.config.hypernet_rank) ** 0.25
             for key, norm_module in self.lora_norms.items():
@@ -335,10 +328,8 @@ class RHN_Hypernetwork(nn.Module):
         for i, layer in enumerate(self.hypernet_base):
             if i == 0:
                 hidden_states = layer(hidden_states=self.input_queries, kv=activations, **seq_info)
-            elif i < len(self.hypernet_base) - 1:
-                hidden_states = layer(hidden_states=hidden_states, kv=activations, **seq_info)
             else:
-                hidden_states = layer(hidden_states=self.layer_queries, kv=hidden_states, **seq_info)
+                hidden_states = layer(hidden_states=hidden_states, kv=activations, **seq_info)
 
         outputs = self.output_head(hidden_states)
         outputs = self._expand_output(outputs)
@@ -377,7 +368,7 @@ class RHN_Hypernetwork(nn.Module):
 
         return outputs_by_layer, step_l2
 
-    def _is_vector_like(self, shape:list) -> bool:
+    def _is_vector_like(self, shape: list) -> bool:
         if len(shape) < 2:
             return True
 
@@ -391,7 +382,7 @@ class RHN_Hypernetwork(nn.Module):
         else:
             return True
 
-    def _output_dim(self, layer_specs:dict) -> int:
+    def _output_dim(self, layer_specs: dict) -> int:
         max_params = 0
 
         # Identify the largest layer param count (handling both matrix and vector cases)
@@ -406,21 +397,43 @@ class RHN_Hypernetwork(nn.Module):
 
         self.kron_dim = int(math.ceil(max_params ** 0.25))
 
-        vals_to_generate_per_layer = self.kron_dim ** 2 * 2
+        min_perceiver_split = self.config.perceiver_rank // 2
+        if min_perceiver_split == 0:
+            raise ValueError("Config `perceiver_rank` must be at least 2 to split output into 2 tensors.")
 
-        return vals_to_generate_per_layer
+        # Total elements required per split to populate num_layers * (kron_dim^2)
+        elements_per_split = self.num_layers * (self.kron_dim ** 2)
 
-    def _expand_output(self, outputs) -> torch.Tensor:
+        # Calculate how large the output_head needs to be to fit the elements_per_split
+        output_dim = int(math.ceil(elements_per_split / min_perceiver_split))
+
+        return output_dim
+
+    def _expand_output(self, outputs: torch.Tensor) -> torch.Tensor:
         batch_size = outputs.shape[0]
-        num_layers = outputs.shape[1]
 
-        outputs_a = outputs[..., :self.kron_dim ** 2]
-        outputs_a = outputs_a.reshape(batch_size, num_layers, self.kron_dim, self.kron_dim)
+        # 1) Split outputs at the perceiver_rank dimension into two separate tensors
+        split_size = self.config.perceiver_rank // 2
 
-        outputs_b = outputs[..., self.kron_dim ** 2: self.kron_dim ** 2 * 2]
-        outputs_b = outputs_b.reshape(batch_size, num_layers, self.kron_dim, self.kron_dim)
+        # Take the first half for A and the second half for B
+        outputs_a = outputs[:, :split_size, :]
+        outputs_b = outputs[:, split_size:split_size * 2, :]
 
-        # Apply Kronecker product dynamically per layer (b=batch, l=layer)
+        # 2) Flatten spatial/sequence dimensions to slice out the exact number of values required
+        outputs_a = outputs_a.reshape(batch_size, -1)
+        outputs_b = outputs_b.reshape(batch_size, -1)
+
+        needed_elements = self.num_layers * (self.kron_dim ** 2)
+
+        # Slice to the exact element count (in case output_dim rounded up)
+        outputs_a = outputs_a[:, :needed_elements]
+        outputs_b = outputs_b[:, :needed_elements]
+
+        # 3) Reshape such that the final two dimensions are equal (kron_dim, kron_dim)
+        outputs_a = outputs_a.reshape(batch_size, self.num_layers, self.kron_dim, self.kron_dim)
+        outputs_b = outputs_b.reshape(batch_size, self.num_layers, self.kron_dim, self.kron_dim)
+
+        # 4) Apply Kronecker product dynamically per layer (b=batch, l=layer)
         expanded_outputs = torch.einsum('blij,blkm->blikjm', outputs_a, outputs_b)
 
         # Flatten spatial dims to produce (batch, num_layers, kron_dim^4)
