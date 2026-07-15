@@ -306,9 +306,9 @@ class RHN_Hypernetwork(nn.Module):
                 self.lora_norms[f"{safe_name}_B"] = nn.RMSNorm(size_b, eps=self.config.rms_norm_eps,
                                                                elementwise_affine=True).to(dtype=self.forward_dtype)
 
-        # with torch.no_grad():
-        #     # target_variance = 1.0 / self.config.hidden_size
-        #     # symmetric_std = (target_variance / self.config.hypernet_rank) ** 0.25
+        with torch.no_grad():
+            target_variance = 1.0 / self.config.hidden_size
+            symmetric_std = (target_variance / self.config.hypernet_rank) ** 0.25
             for key, norm_module in self.lora_norms.items():
         #         trunc_normal_init_(norm_module.weight, std=0.02)
                 # norm_module.weight.add_(1.0)
@@ -318,7 +318,8 @@ class RHN_Hypernetwork(nn.Module):
 
                 if key.endswith("_B"):
                     # Initialize B matrices to 0.0 so dynamic output starts safely at zero
-                    nn.init.zeros_(norm_module.weight)
+                    # nn.init.zeros_(norm_module.weight)
+                    trunc_normal_init_(norm_module.weight, std=symmetric_std)
                 else:
                     # Initialize A matrices (and vectors) to 1.0 unit variance
                     nn.init.ones_(norm_module.weight)
@@ -511,6 +512,8 @@ class RHN_ACTV1_Inner(nn.Module):
             self.layer_specs.append((name, param.shape))
 
         self.hypernet = RHN_Hypernetwork(self.config, self.layer_specs)
+
+        self.dyn_scale = nn.Parameter(torch.full((self.config.hidden_size,), 1e-4, dtype=self.forward_dtype))
 
         # Initial states
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
@@ -714,7 +717,7 @@ class RHN_ACTV1_Inner(nn.Module):
             layer.set_dynamic_adapter(dynamic_weights, layer_idx=i)
             h_dyn = layer(hidden_states=h_dyn, **seq_info)
 
-        h_combined_norm = self.dynamic_out_norm(h_base + h_dyn)
+        h_combined_norm = self.dynamic_out_norm(h_base + self.dyn_scale * h_dyn)
         return h_combined_norm, step_l2, step_metrics
 
 
