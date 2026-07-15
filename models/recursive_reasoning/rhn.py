@@ -195,6 +195,8 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
 
         self.norm_eps = config.rms_norm_eps
 
+        self.dyn_scale = nn.Parameter(torch.zeros(self.config.hidden_size).to(dtype=self.forward_dtype))
+
     def set_dynamic_adapter(self, dynamic_weights: Dict[str, torch.Tensor], layer_idx: int):
         if self.attn:
             if self.config.mlp_t:
@@ -231,7 +233,7 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
             hidden_states = self.post_attn_norm(hidden_states + attn_out)
         out = self.mlp(hidden_states)
         hidden_states = self.post_mlp_norm(hidden_states + out)
-        return hidden_states
+        return hidden_states * self.dyn_scale
 
 
 class RHN_Hypernetwork(nn.Module):
