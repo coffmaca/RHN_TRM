@@ -513,8 +513,6 @@ class RHN_ACTV1_Inner(nn.Module):
 
         self.hypernet = RHN_Hypernetwork(self.config, self.layer_specs)
 
-        self.dyn_scale = nn.Parameter(torch.full((self.config.hidden_size,), 1e-4, dtype=self.forward_dtype))
-
         # Initial states
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
         self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
@@ -717,7 +715,7 @@ class RHN_ACTV1_Inner(nn.Module):
             layer.set_dynamic_adapter(dynamic_weights, layer_idx=i)
             h_dyn = layer(hidden_states=h_dyn, **seq_info)
 
-        h_combined_norm = self.dynamic_out_norm(h_base + self.dyn_scale * h_dyn)
+        h_combined_norm = self.dynamic_out_norm(h_base + h_dyn)
         return h_combined_norm, step_l2, step_metrics
 
 
