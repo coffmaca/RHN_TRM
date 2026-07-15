@@ -220,42 +220,93 @@ class DynamicAttention(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False):
+    def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, kdim=None, vdim=None, causal=False):
         super().__init__()
 
-        self.hidden_size = hidden_size
+        self.embed_dim = hidden_size
+        self.kdim = kdim if kdim is not None else embed_dim
+        self.vdim = vdim if vdim is not None else embed_dim
+
         self.head_dim = head_dim
         self.output_size = head_dim * num_heads
         self.num_heads = num_heads
         self.num_key_value_heads = num_key_value_heads
         self.causal = causal
 
-        self.qkv_proj = CastedLinear(self.hidden_size, (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim, bias=False)
-        self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False)
+        self.use_fused_qkv = (kdim is None and vdim is None)
 
-    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, _ = hidden_states.shape
+        if self.use_fused_qkv:
+            self.qkv_proj = CastedLinear(
+                self.embed_dim,
+                (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim,
+                bias=False
+            )
+        else:
+            self.q_proj = CastedLinear(self.embed_dim, self.num_heads * self.head_dim, bias=False)
+            self.k_proj = CastedLinear(self.kdim, self.num_key_value_heads * self.head_dim, bias=False)
+            self.v_proj = CastedLinear(self.vdim, self.num_key_value_heads * self.head_dim, bias=False)
 
-        # hidden_states: [bs, seq_len, num_heads, head_dim]
-        qkv = self.qkv_proj(hidden_states)
+        self.o_proj = CastedLinear(self.output_size, self.embed_dim, bias=False)
 
-        # Split head
-        qkv = qkv.view(batch_size, seq_len, self.num_heads + 2 * self.num_key_value_heads, self.head_dim)
-        query = qkv[:, :, :self.num_heads]
-        key = qkv[:, :, self.num_heads: self.num_heads + self.num_key_value_heads]
-        value = qkv[:, :, self.num_heads + self.num_key_value_heads:]
+    def forward(
+        self,
+        cos_sin: CosSin,
+        query: torch.Tensor,
+        key: torch.Tensor = None,
+        value: torch.Tensor = None
+    ) -> torch.Tensor:
+
+        batch_size = query.shape[0]
+        q_len = query.shape[1]
+
+        if self.use_fused_qkv:
+            # --- FUSED PATH (Self-Attention) ---
+            if key is not None and key is not query:
+                raise ValueError("Fused projection requires query == key == value. Instantiate with explicit kdim/vdim for cross-attention.")
+
+            qkv = self.qkv_proj(query)
+            qkv = qkv.view(batch_size, q_len, self.num_heads + 2 * self.num_key_value_heads, self.head_dim)
+
+            query_states = qkv[:, :, :self.num_heads]
+            key_states = qkv[:, :, self.num_heads: self.num_heads + self.num_key_value_heads]
+            value_states = qkv[:, :, self.num_heads + self.num_key_value_heads:]
+
+        else:
+            # --- SPLIT PATH (Mismatched Dimensions / Cross-Attention) ---
+            if key is None:
+                key = query
+            if value is None:
+                value = query
+
+            kv_len = key.shape[1]
+
+            query_states = self.q_proj(query).view(batch_size, q_len, self.num_heads, self.head_dim)
+            key_states = self.k_proj(key).view(batch_size, kv_len, self.num_key_value_heads, self.head_dim)
+            value_states = self.v_proj(value).view(batch_size, kv_len, self.num_key_value_heads, self.head_dim)
 
         # RoPE
         if cos_sin is not None:
             cos, sin = cos_sin
-            query, key = apply_rotary_pos_emb(query, key, cos, sin)
+            # Ensure apply_rotary_pos_emb supports handling q and k with potentially different sequence lengths
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # Attention
-        # TODO - Reinstate flash-attn (optional)
-        query, key, value = map(lambda t: einops.rearrange(t, 'B S H D -> B H S D'), (query, key, value)) # needed for scaled_dot_product_attention but not flash_attn_func
-        attn_output = scaled_dot_product_attention(query=query, key=key, value=value, is_causal=self.causal)
+        # Attention Mapping
+        query_states, key_states, value_states = map(
+            lambda t: einops.rearrange(t, 'B S H D -> B H S D'),
+            (query_states, key_states, value_states)
+        )
+
+        attn_output = scaled_dot_product_attention(
+            query=query_states,
+            key=key_states,
+            value=value_states,
+            is_causal=self.causal
+        )
+
+        # Output Projection
         attn_output = einops.rearrange(attn_output, 'B H S D -> B S H D')
-        attn_output = attn_output.reshape(batch_size, seq_len, self.output_size)  # type: ignore
+        attn_output = attn_output.reshape(batch_size, q_len, self.output_size)
+
         return self.o_proj(attn_output)
 
 class LinearSwish(nn.Module):

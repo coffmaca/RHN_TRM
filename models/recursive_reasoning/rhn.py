@@ -95,14 +95,18 @@ class RHN_ACTV1Block(nn.Module):
             elif self.attn_type == "self":
                 self.self_attn = Attention(
                     hidden_size=attn_params["input_size"],
+                    kdim=attn_params["kv_size"],
+                    vdim=attn_params["kv_size"],
                     head_dim=attn_params["input_size"] // attn_params["heads"],
                     num_heads=attn_params["heads"],
                     num_key_value_heads=attn_params["heads"],
-                    causal=False
+                    causal=False,
                 )
             elif self.attn_type == "perceiver":
                 self.perceiver_attn = nn.MultiheadAttention(
                     embed_dim=attn_params["input_size"],
+                    kdim=attn_params["kv_size"],
+                    vdim=attn_params["kv_size"],
                     num_heads=attn_params["heads"],
                     batch_first=True,
                 ).to(dtype=self.forward_dtype)
@@ -250,34 +254,39 @@ class RHN_Hypernetwork(nn.Module):
         self.num_queries = self.num_layers * self.config.kron_dims
 
         self.perceiver_attn = nn.MultiheadAttention(
-            embed_dim=self.input_size,
+            embed_dim=self.config.hypernet_hidden_size,
             num_heads=self.config.perceiver_heads,
             batch_first=True,
+            kdim=self.input_size,
+            vdim=self.input_size,
         ).to(dtype=self.forward_dtype)
 
         self.input_queries = nn.Parameter(
             trunc_normal_init_(
-                torch.empty((1, self.num_queries, self.input_size), dtype=self.forward_dtype),
-                std=1.0 / math.sqrt(self.input_size),
+                torch.empty((1, self.num_queries, self.config.hypernet_hidden_size), dtype=self.forward_dtype),
+                std=1.0 / math.sqrt(self.config.hypernet_hidden_size),
             )
         )
 
         self.hypernet_base = nn.ModuleList()
         self.hypernet_base.append(
             RHN_ACTV1Block(self.config, attn=True, attn_type="perceiver", attn_params={
-                "input_size": self.input_size,
+                "input_size": self.config.hypernet_hidden_size,
+                "kv_size": self.input_size,
                 "heads": self.config.perceiver_heads,
             })
         )
         for _i in range(self.config.H_layers):
             self.hypernet_base.append(RHN_ACTV1Block(self.config, attn=True, attn_type="perceiver", attn_params={
                 "input_size": self.config.hypernet_hidden_size,
+                "kv_size": self.input_size,
                 "heads": self.config.perceiver_heads,
             })
         )
         self.hypernet_base.append(
             RHN_ACTV1Block(self.config, attn=True, attn_type="perceiver", attn_params={
                 "input_size": self.config.hypernet_hidden_size,
+                "kv_size": self.input_size,
                 "heads": self.config.perceiver_heads,
             })
         )
