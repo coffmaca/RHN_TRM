@@ -713,7 +713,7 @@ class RHN_ACTV1_Inner(nn.Module):
         # h_base + h_dyn = 2 * initial_state + base_deltas + dyn_deltas
         # Subtract initial_state to prevent doubling of residual stream
         # combined_deltas = h_dyn - initial_state
-        return h_dyn, step_l2, step_metrics
+        return h_base + h_dyn, step_l2, step_metrics
 
 
 
