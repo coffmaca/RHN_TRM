@@ -207,14 +207,16 @@ class RHN_Hypernetwork(nn.Module):
         self.input_size = self.config.hidden_size * self.config.L_layers
 
         self.perceiver_attn = nn.MultiheadAttention(
-            embed_dim=self.input_size,
+            embed_dim=self.config.hypernet_hidden_size,
             num_heads=self.config.perceiver_heads,
             batch_first=True,
+            kdim=self.input_size,
+            vdim=self.input_size,
         ).to(dtype=self.forward_dtype)
 
         self.perceiver_queries = nn.Parameter(
             trunc_normal_init_(
-                torch.empty((1, self.config.perceiver_rank, self.input_size), dtype=self.forward_dtype),
+                torch.empty((1, self.config.perceiver_rank, self.config.hypernet_hidden_size), dtype=self.forward_dtype),
                 std=embed_init_std
             )
         )
