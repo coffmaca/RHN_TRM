@@ -195,8 +195,6 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
 
         self.norm_eps = config.rms_norm_eps
 
-        self.dyn_scale = nn.Parameter(torch.zeros(self.config.hidden_size).to(dtype=self.forward_dtype))
-
     def set_dynamic_adapter(self, dynamic_weights: Dict[str, torch.Tensor], layer_idx: int):
         if self.attn:
             if self.config.mlp_t:
@@ -233,7 +231,7 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
             hidden_states = self.post_attn_norm(hidden_states + attn_out)
         out = self.mlp(hidden_states)
         hidden_states = self.post_mlp_norm(hidden_states + out)
-        return hidden_states * self.dyn_scale
+        return hidden_states
 
 
 class RHN_Hypernetwork(nn.Module):
@@ -515,6 +513,8 @@ class RHN_ACTV1_Inner(nn.Module):
 
         self.hypernet = RHN_Hypernetwork(self.config, self.layer_specs)
 
+        self.dyn_scale = nn.Parameter(torch.full((self.config.hidden_size,), 1e-4, dtype=self.forward_dtype))
+
         # Initial states
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
         self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
@@ -713,10 +713,7 @@ class RHN_ACTV1_Inner(nn.Module):
             layer.set_dynamic_adapter(dynamic_weights, layer_idx=i)
             h_dyn = layer(hidden_states=h_dyn, **seq_info)
 
-        # h_base + h_dyn = 2 * initial_state + base_deltas + dyn_deltas
-        # Subtract initial_state to prevent doubling of residual stream
-        # combined_deltas = h_dyn - initial_state
-        return h_base + h_dyn, step_l2, step_metrics
+        return h_base + self.dyn_scale * h_dyn, step_l2, step_metrics
 
 
 
