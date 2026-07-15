@@ -522,6 +522,10 @@ class RHN_ACTV1_Inner(nn.Module):
             self.q_head.weight.zero_()
             self.q_head.bias.fill_(-5)  # type: ignore
 
+        self.dynamic_out_norm = nn.RMSNorm(self.config.hidden_size,
+                                           eps=self.config.rms_norm_eps,
+                                           elementwise_affine=False).to(dtype=self.forward_dtype)
+
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # Token embedding
         embedding = self.embed_tokens(input.to(torch.int32))
@@ -710,10 +714,8 @@ class RHN_ACTV1_Inner(nn.Module):
             layer.set_dynamic_adapter(dynamic_weights, layer_idx=i)
             h_dyn = layer(hidden_states=h_dyn, **seq_info)
 
-        # h_base + h_dyn = 2 * initial_state + base_deltas + dyn_deltas
-        # Subtract initial_state to prevent doubling of residual stream
-        # combined_deltas = h_dyn - initial_state
-        return h_base + h_dyn, step_l2, step_metrics
+        h_combined_norm = self.dynamic_out_norm(h_base + h_dyn)
+        return h_combined_norm, step_l2, step_metrics
 
 
 
