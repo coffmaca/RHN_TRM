@@ -292,7 +292,7 @@ class RHN_Hypernetwork(nn.Module):
 
         self.pre_expansion_norm = nn.RMSNorm([self.config.batch_size, self.config.perceiver_rank, self.output_dim],
                                              eps=self.config.rms_norm_eps,
-                                             elementwise_affine=False).to(dtype=self.forward_dtype)
+                                             elementwise_affine=True).to(dtype=self.forward_dtype)
 
         self.lora_norms = nn.ModuleDict()
 
