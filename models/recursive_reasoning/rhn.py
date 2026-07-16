@@ -248,7 +248,7 @@ class RHN_Hypernetwork(nn.Module):
                 "type": "vector" if self._is_vector_like(shape) else "matrix",
             }
 
-        self.input_size = self.config.hidden_size * self.config.L_layers
+        self.input_size = self.config.hidden_size
         self.num_layers = len(self.layer_specs)
 
         self.num_queries = self.num_layers * self.config.kron_dims
@@ -663,7 +663,7 @@ class RHN_ACTV1_Inner(nn.Module):
             layer.clear_dynamic_adapter()
             h_base = layer(hidden_states=h_base, **seq_info)
             activations = torch.cat((activations, h_base.detach()),
-                                    dim=2)  # TODO - Determine whether detaching is preferable here.
+                                    dim=1)  # TODO - Determine whether detaching is preferable here.
 
         # Dynamic weight output
         h_dyn = initial_state
