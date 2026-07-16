@@ -337,22 +337,28 @@ class RHN_Hypernetwork(nn.Module):
 
         outputs_by_layer = {}
         output_index = 0
-        for layer in self.config_per_layer:
-            shape = self.config_per_layer[layer]["shape"]
+        for i, (layer_name, layer_info) in enumerate(self.config_per_layer.items()):
+            shape = layer_info["shape"]
+            safe_name = layer_name.replace(".", "_")
 
             outputs_a = outputs[:, output_index : output_index + (shape[0] * self.config.hypernet_rank)]
+            if layer_info["type"] == "matrix":
+                outputs_a = self.lora_norms[f"{safe_name}_A"](outputs_a)
+            else:
+                outputs_a = self.lora_norms[f"{safe_name}"](outputs_a)
             outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
             output_index += shape[0] * self.config.hypernet_rank
 
-            if self.config_per_layer[layer]["type"] == "matrix":
+            if layer_info["type"] == "matrix":
                 outputs_b = outputs[:, output_index : output_index + (shape[1] * self.config.hypernet_rank)]
+                outputs_b = self.lora_norms[f"{safe_name}_B"](outputs_b)
                 outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
                 output_index += shape[1] * self.config.hypernet_rank
 
-            if self.config_per_layer[layer]["type"] == "vector":
-                outputs_by_layer[layer] = outputs_a
+            if layer_info["type"] == "vector":
+                outputs_by_layer[layer_name] = outputs_a
             else:
-                outputs_by_layer[layer] = (outputs_a, outputs_b)
+                outputs_by_layer[layer_name] = (outputs_a, outputs_b)
 
         return outputs_by_layer, step_l2
 
