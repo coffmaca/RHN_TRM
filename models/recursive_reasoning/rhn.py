@@ -337,7 +337,6 @@ class RHN_Hypernetwork(nn.Module):
                 hidden_states = layer(hidden_states=hidden_states, kv=activations, **seq_info)
 
         outputs = self.output_head(hidden_states)
-        outputs = rms_norm(outputs, variance_epsilon=self.config.rms_norm_eps)
         outputs = self._expand_output(outputs)
 
         step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
