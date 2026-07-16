@@ -292,25 +292,25 @@ class RHN_Hypernetwork(nn.Module):
 
         self.pre_expansion_norm = nn.RMSNorm([self.config.batch_size, self.config.perceiver_rank, self.output_dim],
                                              eps=self.config.rms_norm_eps,
-                                             elementwise_affine=False).to(dtype=self.forward_dtype)
+                                             elementwise_affine=True).to(dtype=self.forward_dtype)
 
-        self.lora_norms = nn.ModuleDict()
-
-        for name, shape in self.layer_specs:
-            safe_name = name.replace(".", "_")
-
-            if self._is_vector_like(shape):
-                size = shape[0] * self.config.hypernet_rank
-                self.lora_norms[f"{safe_name}"] = nn.RMSNorm(size, eps=self.config.rms_norm_eps,
-                                                             elementwise_affine=True).to(dtype=self.forward_dtype)
-            else:
-                size_a = shape[0] * self.config.hypernet_rank
-                size_b = shape[1] * self.config.hypernet_rank
-
-                self.lora_norms[f"{safe_name}_A"] = nn.RMSNorm(size_a, eps=self.config.rms_norm_eps,
-                                                               elementwise_affine=True).to(dtype=self.forward_dtype)
-                self.lora_norms[f"{safe_name}_B"] = nn.RMSNorm(size_b, eps=self.config.rms_norm_eps,
-                                                               elementwise_affine=True).to(dtype=self.forward_dtype)
+        # self.lora_norms = nn.ModuleDict()
+        #
+        # for name, shape in self.layer_specs:
+        #     safe_name = name.replace(".", "_")
+        #
+        #     if self._is_vector_like(shape):
+        #         size = shape[0] * self.config.hypernet_rank
+        #         self.lora_norms[f"{safe_name}"] = nn.RMSNorm(size, eps=self.config.rms_norm_eps,
+        #                                                      elementwise_affine=True).to(dtype=self.forward_dtype)
+        #     else:
+        #         size_a = shape[0] * self.config.hypernet_rank
+        #         size_b = shape[1] * self.config.hypernet_rank
+        #
+        #         self.lora_norms[f"{safe_name}_A"] = nn.RMSNorm(size_a, eps=self.config.rms_norm_eps,
+        #                                                        elementwise_affine=True).to(dtype=self.forward_dtype)
+        #         self.lora_norms[f"{safe_name}_B"] = nn.RMSNorm(size_b, eps=self.config.rms_norm_eps,
+        #                                                        elementwise_affine=True).to(dtype=self.forward_dtype)
 
         with torch.no_grad():
             target_variance = 1.0 / self.config.hidden_size
