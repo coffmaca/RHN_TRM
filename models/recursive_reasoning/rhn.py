@@ -290,6 +290,10 @@ class RHN_Hypernetwork(nn.Module):
                                          self.output_dim,
                                          bias=False)
 
+        self.pre_expansion_norm = nn.RMSNorm([self.config.batch_size, self.config.perceiver_rank, self.output_dim],
+                                             eps=self.config.rms_norm_eps,
+                                             elementwise_affine=False).to(dtype=self.forward_dtype)
+
         self.lora_norms = nn.ModuleDict()
 
         for name, shape in self.layer_specs:
@@ -331,6 +335,7 @@ class RHN_Hypernetwork(nn.Module):
                 hidden_states = layer(hidden_states=hidden_states, kv=activations, **seq_info)
 
         outputs = self.output_head(hidden_states)
+        outputs = self.pre_expansion_norm(outputs)
         outputs = self._expand_output(outputs)
 
         step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
