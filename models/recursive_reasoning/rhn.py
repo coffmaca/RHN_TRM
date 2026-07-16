@@ -95,8 +95,8 @@ class RHN_ACTV1Block(nn.Module):
             elif self.attn_type == "self":
                 self.self_attn = Attention(
                     hidden_size=attn_params["input_size"],
-                    kdim=attn_params["kv_size"],
-                    vdim=attn_params["kv_size"],
+                    kdim=attn_params["kv_size"] if attn_params["kv_size"] != attn_params["input_size"] else None,
+                    vdim=attn_params["kv_size"] if attn_params["kv_size"] != attn_params["input_size"] else None,
                     head_dim=attn_params["input_size"] // attn_params["heads"],
                     num_heads=attn_params["heads"],
                     num_key_value_heads=attn_params["heads"],
@@ -133,7 +133,10 @@ class RHN_ACTV1Block(nn.Module):
                 attn_in = hidden_states.transpose(1,2)
                 attn_out = self.mlp_t(attn_in).transpose(1,2)
             elif self.attn_type == "self":
-                attn_out = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
+                attn_out = self.self_attn(cos_sin=cos_sin,
+                                          query=hidden_states,
+                                          key=hidden_states,
+                                          value=hidden_states)
             elif self.attn_type == "perceiver":
                 queries = hidden_states
 

@@ -222,8 +222,8 @@ class Attention(nn.Module):
         super().__init__()
 
         self.embed_dim = hidden_size
-        self.kdim = kdim if kdim is not None else embed_dim
-        self.vdim = vdim if vdim is not None else embed_dim
+        self.kdim = kdim if kdim is not None else hidden_size
+        self.vdim = vdim if vdim is not None else hidden_size
 
         self.head_dim = head_dim
         self.output_size = head_dim * num_heads
