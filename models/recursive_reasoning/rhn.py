@@ -68,7 +68,7 @@ class RHN_ACTV1Config(BaseModel):
     hypernet_rank: int
     layer_emb_dim: int
     hypernet_relative_scale: float
-    kron_dims: int
+    perceiver_rank: int
     perceiver_heads: int
     hypernet_l2_lambda: float = 1e-4
 
@@ -251,7 +251,7 @@ class RHN_Hypernetwork(nn.Module):
         self.input_size = self.config.hidden_size * self.config.L_layers
         self.num_layers = len(self.layer_specs)
 
-        self.num_queries = self.num_layers * self.config.kron_dims
+        self.num_queries = self.config.perceiver_rank
 
         self.perceiver_attn = nn.MultiheadAttention(
             embed_dim=self.config.hypernet_hidden_size,
@@ -284,8 +284,10 @@ class RHN_Hypernetwork(nn.Module):
             })
         )
 
+        self.output_dim = self._output_dim(layer_specs)
+
         self.output_head = CastedLinear(self.config.hypernet_hidden_size,
-                                         self._output_dim(layer_specs),
+                                         self.output_dim,
                                          bias=False)
 
         self.lora_norms = nn.ModuleDict()
@@ -296,33 +298,25 @@ class RHN_Hypernetwork(nn.Module):
             if self._is_vector_like(shape):
                 size = shape[0] * self.config.hypernet_rank
                 self.lora_norms[f"{safe_name}"] = nn.RMSNorm(size, eps=self.config.rms_norm_eps,
-                                                             elementwise_affine=True).to(dtype=self.forward_dtype)
+                                                             elementwise_affine=False).to(dtype=self.forward_dtype)
             else:
                 size_a = shape[0] * self.config.hypernet_rank
                 size_b = shape[1] * self.config.hypernet_rank
 
                 self.lora_norms[f"{safe_name}_A"] = nn.RMSNorm(size_a, eps=self.config.rms_norm_eps,
-                                                               elementwise_affine=True).to(dtype=self.forward_dtype)
+                                                               elementwise_affine=False).to(dtype=self.forward_dtype)
                 self.lora_norms[f"{safe_name}_B"] = nn.RMSNorm(size_b, eps=self.config.rms_norm_eps,
-                                                               elementwise_affine=True).to(dtype=self.forward_dtype)
+                                                               elementwise_affine=False).to(dtype=self.forward_dtype)
 
-        with torch.no_grad():
-            target_variance = 1.0 / self.config.hidden_size
-            symmetric_std = (target_variance / self.config.hypernet_rank) ** 0.25
-            for key, norm_module in self.lora_norms.items():
-        #         trunc_normal_init_(norm_module.weight, std=0.02)
-                # norm_module.weight.add_(1.0)
-
-                # trunc_normal_init_(norm_module.weight, std=symmetric_std)
-                # norm_module.weight *= 10
-
-                if key.endswith("_B"):
-                    # Initialize B matrices to 0.0 so dynamic output starts safely at zero
-                    # nn.init.zeros_(norm_module.weight)
-                    trunc_normal_init_(norm_module.weight, std=symmetric_std)
-                else:
-                    # Initialize A matrices (and vectors) to 1.0 unit variance
-                    nn.init.ones_(norm_module.weight)
+        # with torch.no_grad():
+        #     target_variance = 1.0 / self.config.hidden_size
+        #     symmetric_std = (target_variance / self.config.hypernet_rank) ** 0.25
+        #     for key, norm_module in self.lora_norms.items():
+        #
+        #         if key.endswith("_B"):
+        #             trunc_normal_init_(norm_module.weight, std=symmetric_std)
+        #         else:
+        #             nn.init.ones_(norm_module.weight)
 
     def forward(self, activations: torch.Tensor, **seq_info) -> Tuple[dict, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
@@ -337,39 +331,28 @@ class RHN_Hypernetwork(nn.Module):
                 hidden_states = layer(hidden_states=hidden_states, kv=activations, **seq_info)
 
         outputs = self.output_head(hidden_states)
-        outputs = self._expand_output(outputs)
+        outputs = rms_norm(self._expand_output(outputs), variance_epsilon=self.config.rms_norm_eps)
 
         step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
 
         outputs_by_layer = {}
-        for i, (layer_name, layer_info) in enumerate(self.config_per_layer.items()):
-            shape = layer_info["shape"]
-            safe_name = layer_name.replace(".", "_")
-            layer_params = outputs[:, i, :]  # Shape: (B, kron_dim^4)
+        output_index = 0
+        for layer in self.config_per_layer:
+            shape = self.config_per_layer[layer]["shape"]
 
-            output_index = 0
+            outputs_a = outputs[:, output_index : output_index + (shape[0] * self.config.hypernet_rank)]
+            outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
+            output_index += shape[0] * self.config.hypernet_rank
 
-            size_a = shape[0] * self.config.hypernet_rank
-            outputs_a = layer_params[:, output_index: output_index + size_a]
+            if self.config_per_layer[layer]["type"] == "matrix":
+                outputs_b = outputs[:, output_index : output_index + (shape[1] * self.config.hypernet_rank)]
+                outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
+                output_index += shape[1] * self.config.hypernet_rank
 
-            if layer_info["type"] == "matrix":
-                outputs_a = self.lora_norms[f"{safe_name}_A"](outputs_a)
+            if self.config_per_layer[layer]["type"] == "vector":
+                outputs_by_layer[layer] = outputs_a
             else:
-                outputs_a = self.lora_norms[f"{safe_name}"](outputs_a)
-
-            outputs_a = outputs_a.reshape(batch_size, shape[0], self.config.hypernet_rank)
-            output_index += size_a
-
-            if layer_info["type"] == "matrix":
-                size_b = shape[1] * self.config.hypernet_rank
-                outputs_b = layer_params[:, output_index: output_index + size_b]
-                outputs_b = self.lora_norms[f"{safe_name}_B"](outputs_b)
-                outputs_b = outputs_b.reshape(batch_size, self.config.hypernet_rank, shape[1])
-                output_index += size_b
-
-                outputs_by_layer[layer_name] = (outputs_a, outputs_b)
-            else:
-                outputs_by_layer[layer_name] = outputs_a
+                outputs_by_layer[layer] = (outputs_a, outputs_b)
 
         return outputs_by_layer, step_l2
 
@@ -387,65 +370,49 @@ class RHN_Hypernetwork(nn.Module):
         else:
             return True
 
-    def _output_dim(self, layer_specs: dict) -> int:
-        max_params = 0
+    def _output_dim(self, layer_specs:dict) -> int:
+        # seq_len = self.config.seq_len + self.config.puzzle_emb_len
+        base_param_dim_sum = 0
+        base_param_total = 0
+        for layer in layer_specs:
+            rows, cols = layer[1]
+            base_param_dim_sum += rows + cols
+            base_param_total += rows * cols
+        base_param_total_low_rank = base_param_dim_sum * self.config.hypernet_rank
+        vals_to_generate = base_param_total_low_rank
+        output_head_dim = math.ceil(vals_to_generate / self.config.perceiver_rank)
+        hypernet_output_head_params = output_head_dim * self.config.hypernet_hidden_size
+        max_hypernet_output_head_params = base_param_total * self.config.hypernet_relative_scale
+        self.reductions = 0
+        self.intermediate_dims = []
+        if hypernet_output_head_params > max_hypernet_output_head_params:
+            output_head_dim = vals_to_generate
+            while hypernet_output_head_params > max_hypernet_output_head_params:
+                self.reductions += 1
+                new_dim = math.ceil(output_head_dim**(1/2))
+                self.intermediate_dims.insert(0, new_dim)
+                output_head_dim = new_dim * self.config.hypernet_rank * 2
+                hypernet_output_head_params = (output_head_dim / self.config.perceiver_rank) * self.config.hypernet_hidden_size
+            output_head_dim /= self.config.perceiver_rank
+        return int(output_head_dim)
 
-        # Identify the largest layer param count (handling both matrix and vector cases)
-        for name, shape in layer_specs:
-            if self._is_vector_like(shape):
-                params = shape[0] * self.config.hypernet_rank
+    def _expand_output(self, outputs) -> torch.Tensor:
+        if len(self.intermediate_dims) == 0:
+            return outputs.flatten(start_dim=-2, end_dim=-1)
+        for i, dim in enumerate(self.intermediate_dims):
+            if i==0:
+                dim_1 = int(dim*(self.config.hypernet_rank/self.config.perceiver_rank)) # TODO - Cleanup.  Assumes hypernet_rank / perceiver_rank are multiples.
+                used_outputs_a = outputs[..., :dim_1]
+                used_outputs_a = used_outputs_a.unsqueeze(-1).reshape(-1, dim, self.config.hypernet_rank)
+                used_outputs_b = outputs[..., dim_1: dim_1 * 2]
+                used_outputs_b = used_outputs_b.unsqueeze(-1).reshape(-1, self.config.hypernet_rank, dim)
             else:
-                params = (shape[0] + shape[1]) * self.config.hypernet_rank
-
-            if params > max_params:
-                max_params = params
-
-        self.kron_dim = int(math.ceil(max_params ** 0.25))
-
-        min_kron_split = self.config.kron_dims // 2
-        if min_kron_split == 0:
-            raise ValueError("Config `kron_dims` must be at least 2 to split output into 2 tensors.")
-
-        elements_per_split_per_layer = self.kron_dim ** 2
-
-        output_dim = int(math.ceil(elements_per_split_per_layer / min_kron_split))
-
-        return output_dim
-
-    def _expand_output(self, outputs: torch.Tensor) -> torch.Tensor:
-        batch_size = outputs.shape[0]
-        output_dim = outputs.shape[-1]
-
-        # 1) Slice the input_queries sized dim into a number of tensors equal to L_level parameters (num_layers).
-        # This breaks (batch, num_layers * kron_dims, output_dim) into (batch, num_layers, kron_dims, output_dim)
-        outputs = outputs.reshape(batch_size, self.num_layers, self.config.kron_dims, output_dim)
-
-        # 2) Split each divided tensor into two tensors at the kron_dims dimension
-        split_size = self.config.kron_dims // 2
-
-        outputs_a = outputs[:, :, :split_size, :]
-        outputs_b = outputs[:, :, split_size:split_size * 2, :]
-
-        # 3) Flatten spatial dims to slice the exact number of values required per layer
-        outputs_a = outputs_a.reshape(batch_size, self.num_layers, -1)
-        outputs_b = outputs_b.reshape(batch_size, self.num_layers, -1)
-
-        needed_elements = self.kron_dim ** 2
-
-        # Slice to the exact element count (in case output_dim rounded up)
-        outputs_a = outputs_a[:, :, :needed_elements]
-        outputs_b = outputs_b[:, :, :needed_elements]
-
-        # 4) Reshape such that the final two dimensions are equal (kron_dim, kron_dim)
-        outputs_a = outputs_a.reshape(batch_size, self.num_layers, self.kron_dim, self.kron_dim)
-        outputs_b = outputs_b.reshape(batch_size, self.num_layers, self.kron_dim, self.kron_dim)
-
-        # 5) Multiply via Kronecker product dynamically per layer (b=batch, l=layer)
-        expanded_outputs = torch.einsum('blij,blkm->blikjm', outputs_a, outputs_b)
-
-        # Flatten spatial dims to produce the final populated LoRA values: (batch, num_layers, kron_dim^4)
-        outputs = expanded_outputs.flatten(start_dim=2, end_dim=-1)
-
+                used_outputs_a = outputs[...,:dim * self.config.hypernet_rank]
+                used_outputs_a = used_outputs_a.unsqueeze(-1).view(-1, dim, self.config.hypernet_rank)
+                used_outputs_b = outputs[...,dim * self.config.hypernet_rank : dim * self.config.hypernet_rank * 2]
+                used_outputs_b = used_outputs_b.unsqueeze(-1).view(-1, self.config.hypernet_rank, dim)
+            expanded_outputs = torch.matmul(used_outputs_a, used_outputs_b)
+            outputs = expanded_outputs.flatten(start_dim=-2, end_dim=-1)
         return outputs
 
 
