@@ -280,9 +280,9 @@ class RHN_Hypernetwork(nn.Module):
             })
         )
         for _i in range(self.config.H_layers):
-            self.hypernet_base.append(RHN_ACTV1Block(self.config, attn=True, attn_type="perceiver", attn_params={
+            self.hypernet_base.append(RHN_ACTV1Block(self.config, attn=True, attn_type="self", attn_params={
                 "input_size": self.config.hypernet_hidden_size,
-                "kv_size": self.input_size,
+                "kv_size": self.config.hypernet_hidden_size,
                 "heads": self.config.perceiver_heads,
             })
         )
