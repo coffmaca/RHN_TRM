@@ -284,9 +284,15 @@ class RHN_Hypernetwork(nn.Module):
             })
         )
 
+        self.output_dim = self._output_dim(layer_specs)
+
         self.output_head = CastedLinear(self.config.hypernet_hidden_size,
-                                         self._output_dim(layer_specs),
+                                         self.output_dim,
                                          bias=False)
+
+        self.pre_expansion_norm = nn.RMSNorm([self.config.batch_size, self.config.perceiver_rank, self.output_dim],
+                                             eps=self.config.rms_norm_eps,
+                                             elementwise_affine=False).to(dtype=self.forward_dtype)
 
         self.lora_norms = nn.ModuleDict()
 
@@ -337,6 +343,7 @@ class RHN_Hypernetwork(nn.Module):
                 hidden_states = layer(hidden_states=hidden_states, kv=activations, **seq_info)
 
         outputs = self.output_head(hidden_states)
+        outputs = self.pre_expansion_norm(outputs)
         outputs = self._expand_output(outputs)
 
         step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
