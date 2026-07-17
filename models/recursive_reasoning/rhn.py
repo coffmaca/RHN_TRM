@@ -439,6 +439,10 @@ class RHN_Hypernetwork(nn.Module):
         outputs_a = outputs_a[:, :, :needed_elements]
         outputs_b = outputs_b[:, :, :needed_elements]
 
+        # Normalize each factor individually
+        outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
+        outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
+
         # 4) Reshape such that the final two dimensions are equal (kron_dim, kron_dim)
         outputs_a = outputs_a.reshape(batch_size, self.num_layers, self.kron_dim, self.kron_dim)
         outputs_b = outputs_b.reshape(batch_size, self.num_layers, self.kron_dim, self.kron_dim)
