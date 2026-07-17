@@ -73,58 +73,101 @@ class RHN_ACTV1Config(BaseModel):
     hypernet_l2_lambda: float = 1e-4
 
 class RHN_ACTV1Block(nn.Module):
-    def __init__(self, config: RHN_ACTV1Config, attn: bool = True) -> None:
+    def __init__(self, config: RHN_ACTV1Config, attn: bool = True, attn_type: str = "self",
+                 attn_params: dict = None) -> None:
         super().__init__()
 
         self.config = config
+        self.forward_dtype = getattr(torch, self.config.forward_dtype)
         self.attn = attn
+        self.attn_type = attn_type
+
         if self.attn:
-            if self.config.mlp_t:
+            self.post_attn_norm = nn.RMSNorm(attn_params["input_size"],
+                                                eps=self.config.rms_norm_eps,
+                                                elementwise_affine=True).to(dtype=self.forward_dtype)
+            if self.attn_type == "mlp_t":
                 self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hypernet_hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
                 self.mlp_t = SwiGLU(
                     hidden_size= self.config.perceiver_rank, # self.config.seq_len + self.puzzle_emb_len,
                     expansion=config.expansion,
                 )
-            else:
+            elif self.attn_type == "self":
                 self.self_attn = Attention(
-                    hidden_size=config.hypernet_hidden_size,
-                    head_dim=config.hypernet_hidden_size // config.num_heads,
-                    num_heads=config.num_heads,
-                    num_key_value_heads=config.num_heads,
-                    causal=False
+                    hidden_size=attn_params["input_size"],
+                    kdim=attn_params["kv_size"] if attn_params["kv_size"] != attn_params["input_size"] else None,
+                    vdim=attn_params["kv_size"] if attn_params["kv_size"] != attn_params["input_size"] else None,
+                    head_dim=attn_params["input_size"] // attn_params["heads"],
+                    num_heads=attn_params["heads"],
+                    num_key_value_heads=attn_params["heads"],
+                    causal=False,
                 )
+            elif self.attn_type == "perceiver":
+                self.perceiver_attn = nn.MultiheadAttention(
+                    embed_dim=attn_params["input_size"],
+                    kdim=attn_params["kv_size"],
+                    vdim=attn_params["kv_size"],
+                    num_heads=attn_params["heads"],
+                    batch_first=True,
+                ).to(dtype=self.forward_dtype)
+
+        self.post_mlp_norm = nn.RMSNorm(attn_params["input_size"],
+                                                eps=self.config.rms_norm_eps,
+                                                elementwise_affine=True).to(dtype=self.forward_dtype)
+
         self.mlp = SwiGLU(
-            hidden_size=config.hypernet_hidden_size,
+            hidden_size=attn_params["input_size"],
             expansion=config.expansion,
         )
         self.norm_eps = config.rms_norm_eps
 
-    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor, kv: torch.Tensor = None) -> torch.Tensor:
         # B, L, D = hidden_states.shape
         # Post Norm
         if self.attn:
-            if self.config.mlp_t:
-                hidden_states = hidden_states.transpose(1,2)
-                out = self.mlp_t(hidden_states)
-                hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
-                hidden_states = hidden_states.transpose(1,2)
-            else:
-                # Self Attention
-                hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states), variance_epsilon=self.norm_eps)
-        # Fully Connected
+            if self.attn_type == "mlp_t":
+                attn_in = hidden_states.transpose(1,2)
+                attn_out = self.mlp_t(attn_in).transpose(1,2)
+            elif self.attn_type == "self":
+                attn_out = self.self_attn(cos_sin=cos_sin,
+                                          query=hidden_states,
+                                          key=hidden_states,
+                                          value=hidden_states)
+            elif self.attn_type == "perceiver":
+                queries = hidden_states
+
+                if queries.dim() == 2:
+                    queries = queries.unsqueeze(0)
+                if queries.dim() == 3 and queries.size(0) == 1:
+                    batch_size = kv.shape[0]
+                    queries = queries.expand(batch_size, -1, -1)
+
+                attn_out, _ = self.perceiver_attn(
+                    query=queries,
+                    key=kv,
+                    value=kv
+                )
+
+            hidden_states = self.post_attn_norm(hidden_states + attn_out)
+
         out = self.mlp(hidden_states)
-        hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
+        hidden_states = self.post_mlp_norm(hidden_states + out)
         return hidden_states
 
 
 class RHN_ACTV1Block_Dynamic(nn.Module):
-    def __init__(self, config: RHN_ACTV1Config, attn: bool = True) -> None:
+    def __init__(self, config: RHN_ACTV1Config, attn: bool = True, attn_type: str = "self") -> None:
         super().__init__()
 
         self.config = config
+        self.forward_dtype = getattr(torch, self.config.forward_dtype)
         self.attn = attn
+        self.attn_type = attn_type
         if self.attn:
-            if self.config.mlp_t:
+            self.post_attn_norm = nn.RMSNorm(self.config.hidden_size,
+                                                    eps=self.config.rms_norm_eps,
+                                                    elementwise_affine=True).to(dtype=self.forward_dtype)
+            if self.attn_type == "mlp_t":
                 self.puzzle_emb_len = -(
                             self.config.puzzle_emb_ndim // -self.config.hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
                 self.mlp_t = DynamicSwiGLU(
@@ -139,28 +182,35 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
                     num_key_value_heads=config.num_heads,
                     causal=False
                 )
+
+        self.post_mlp_norm = nn.RMSNorm(self.config.hidden_size,
+                                                eps=self.config.rms_norm_eps,
+                                                elementwise_affine=True).to(dtype=self.forward_dtype)
+
         self.mlp = DynamicSwiGLU(
             hidden_size=config.hidden_size,
             expansion=config.expansion,
         )
+
         self.norm_eps = config.rms_norm_eps
 
-    def set_dynamic_adapter(self, up, down, attn_1=None, attn_2=None):
+    def set_dynamic_adapter(self, dynamic_weights: Dict[str, torch.Tensor], layer_idx: int):
         if self.attn:
-            # Swap argument to correct assignments
-            up, attn_1 = attn_1, up
-            down, attn_2 = attn_2, down
-
-            A_attn_1, B_attn_1 = attn_1
-            A_attn_2, B_attn_2 = attn_2
-
             if self.config.mlp_t:
-                self.mlp_t.set_dynamic_adapter(A_attn_1, B_attn_1, A_attn_2, B_attn_2)
+                gate_up = dynamic_weights[f"L_level.{layer_idx}.mlp_t.gate_up_proj.weight"]
+                down = dynamic_weights[f"L_level.{layer_idx}.mlp_t.down_proj.weight"]
+
+                self.mlp_t.set_dynamic_adapter(gate_up[0], gate_up[1], down[0], down[1])
             else:
-                self.self_attn.set_dynamic_adapter(A_attn_1, B_attn_1, A_attn_2, B_attn_2)
-        A_up, B_up = up
-        A_down, B_down = down
-        self.mlp.set_dynamic_adapter(A_up, B_up, A_down, B_down)
+                qkv = dynamic_weights[f"L_level.{layer_idx}.self_attn.qkv_proj.weight"]
+                o = dynamic_weights[f"L_level.{layer_idx}.self_attn.o_proj.weight"]
+
+                self.self_attn.set_dynamic_adapter(qkv[0], qkv[1], o[0], o[1])
+
+        mlp_gate_up = dynamic_weights[f"L_level.{layer_idx}.mlp.gate_up_proj.weight"]
+        mlp_down = dynamic_weights[f"L_level.{layer_idx}.mlp.down_proj.weight"]
+
+        self.mlp.set_dynamic_adapter(mlp_gate_up[0], mlp_gate_up[1], mlp_down[0], mlp_down[1])
 
     def clear_dynamic_adapter(self):
         self.mlp.clear_dynamic_adapter()
@@ -172,18 +222,14 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.attn:
-            if self.config.mlp_t:
-                hidden_states = hidden_states.transpose(1, 2)
-                out = self.mlp_t(hidden_states)
-                hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
-                hidden_states = hidden_states.transpose(1, 2)
+            if self.attn_type == "mlp_t":
+                attn_in = hidden_states.transpose(1, 2)
+                attn_out = self.mlp_t(attn_in).transpose(1, 2)
             else:
-                # Self Attention
-                hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states),
-                                         variance_epsilon=self.norm_eps)
-        # Fully Connected
+                attn_out = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
+            hidden_states = self.post_attn_norm(hidden_states + attn_out)
         out = self.mlp(hidden_states)
-        hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
+        hidden_states = self.post_mlp_norm(hidden_states + out)
         return hidden_states
 
 
@@ -201,10 +247,10 @@ class RHN_Hypernetwork(nn.Module):
                 "type": "vector" if self._is_vector_like(shape) else "matrix",
             }
 
-        self.embed_scale = math.sqrt(self.config.hypernet_hidden_size)
-        embed_init_std = 1.0 / self.embed_scale
-
         self.input_size = self.config.hidden_size * self.config.L_layers
+        self.num_layers = len(self.layer_specs)
+
+        self.num_queries = self.config.perceiver_rank
 
         self.perceiver_attn = nn.MultiheadAttention(
             embed_dim=self.config.hypernet_hidden_size,
@@ -214,31 +260,78 @@ class RHN_Hypernetwork(nn.Module):
             vdim=self.input_size,
         ).to(dtype=self.forward_dtype)
 
-        self.perceiver_queries = nn.Parameter(
+        self.input_queries = nn.Parameter(
             trunc_normal_init_(
-                torch.empty((1, self.config.perceiver_rank, self.config.hypernet_hidden_size), dtype=self.forward_dtype),
-                std=embed_init_std
+                torch.empty((1, self.num_queries, self.config.hypernet_hidden_size), dtype=self.forward_dtype),
+                std=1.0 / math.sqrt(self.config.hypernet_hidden_size),
             )
         )
 
-        self.hypernet_base = nn.ModuleList(
-            [RHN_ACTV1Block(self.config, attn=True) for _i in range(self.config.H_layers)]
+        self.hypernet_base = nn.ModuleList()
+        self.hypernet_base.append(
+            RHN_ACTV1Block(self.config, attn=True, attn_type="perceiver", attn_params={
+                "input_size": self.config.hypernet_hidden_size,
+                "kv_size": self.input_size,
+                "heads": self.config.perceiver_heads,
+            })
+        )
+        for _i in range(self.config.H_layers):
+            self.hypernet_base.append(RHN_ACTV1Block(
+                self.config,
+                attn=True,
+                attn_type="mlp_t" if self.config.mlp_t else "perceiver",
+                attn_params={
+                    "input_size": self.config.hypernet_hidden_size,
+                    "kv_size": self.input_size,
+                    "heads": self.config.perceiver_heads,
+            })
         )
 
         self.output_head = CastedLinear(self.config.hypernet_hidden_size,
                                          self._output_dim(layer_specs),
                                          bias=False)
 
+        self.lora_norms = nn.ModuleDict()
+
+        for name, shape in self.layer_specs:
+            safe_name = name.replace(".", "_")
+
+            if self._is_vector_like(shape):
+                size = shape[0] * self.config.hypernet_rank
+                self.lora_norms[f"{safe_name}"] = nn.RMSNorm(size, eps=self.config.rms_norm_eps,
+                                                             elementwise_affine=True).to(dtype=self.forward_dtype)
+            else:
+                size_a = shape[0] * self.config.hypernet_rank
+                size_b = shape[1] * self.config.hypernet_rank
+
+                self.lora_norms[f"{safe_name}_A"] = nn.RMSNorm(size_a, eps=self.config.rms_norm_eps,
+                                                               elementwise_affine=True).to(dtype=self.forward_dtype)
+                self.lora_norms[f"{safe_name}_B"] = nn.RMSNorm(size_b, eps=self.config.rms_norm_eps,
+                                                               elementwise_affine=True).to(dtype=self.forward_dtype)
+
+        with torch.no_grad():
+            target_variance = 1.0 / self.config.hidden_size
+            symmetric_std = (target_variance / self.config.hypernet_rank) ** 0.25
+            for key, norm_module in self.lora_norms.items():
+                if key.endswith("_B"):
+                    trunc_normal_init_(norm_module.weight, std=symmetric_std)
+                else:
+                    nn.init.ones_(norm_module.weight)
+
     def forward(self, activations: torch.Tensor, **seq_info) -> Tuple[dict, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
 
-        hidden_states = self._attention(activations)
-        # hidden_states = activations
+        # hidden_states = self._attention(activations)
+        hidden_states = activations
 
-        for layer in self.hypernet_base:
-            hidden_states = layer(hidden_states=hidden_states, **seq_info)
-        outputs = self.output_head(hidden_states) # rms_norm(self.output_head(hidden_states), variance_epsilon=self.config.rms_norm_eps)
-        outputs = rms_norm(self._expand_output(outputs), variance_epsilon=self.config.rms_norm_eps)
+        for i, layer in enumerate(self.hypernet_base):
+            if i == 0:
+                hidden_states = layer(hidden_states=self.input_queries, kv=activations, **seq_info)
+            else:
+                hidden_states = layer(hidden_states=hidden_states, kv=activations, **seq_info)
+
+        outputs = self.output_head(hidden_states)
+        outputs = self._expand_output(outputs)
 
         step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
 
@@ -246,14 +339,22 @@ class RHN_Hypernetwork(nn.Module):
         output_index = 0
         for layer in self.config_per_layer:
             shape = self.config_per_layer[layer]["shape"]
+            safe_name = layer.replace(".", "_")
 
             outputs_a = outputs[:, output_index : output_index + (shape[0] * self.config.hypernet_rank)]
-            outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
+
+            if self.config_per_layer[layer]["type"] == "matrix":
+                outputs_a = self.lora_norms[f"{safe_name}_A"](outputs_a)
+            else:
+                outputs_a = self.lora_norms[f"{safe_name}"](outputs_a)
+
+            outputs_a = outputs_a.reshape(batch_size, shape[0], self.config.hypernet_rank)
             output_index += shape[0] * self.config.hypernet_rank
 
             if self.config_per_layer[layer]["type"] == "matrix":
                 outputs_b = outputs[:, output_index : output_index + (shape[1] * self.config.hypernet_rank)]
-                outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
+                outputs_b = self.lora_norms[f"{safe_name}_B"](outputs_b)
+                outputs_b = outputs_b.reshape(batch_size, self.config.hypernet_rank, shape[1])
                 output_index += shape[1] * self.config.hypernet_rank
 
             if self.config_per_layer[layer]["type"] == "vector":
@@ -321,13 +422,17 @@ class RHN_Hypernetwork(nn.Module):
             if i==0:
                 dim_1 = int(dim*(self.config.hypernet_rank/self.config.perceiver_rank)) # TODO - Cleanup.  Assumes hypernet_rank / perceiver_rank are multiples.
                 used_outputs_a = outputs[..., :dim_1]
+                used_outputs_a = rms_norm(used_outputs_a.flatten(start_dim=-2, end_dim=-1), variance_epsilon=self.config.rms_norm_eps)
                 used_outputs_a = used_outputs_a.unsqueeze(-1).reshape(-1, dim, self.config.hypernet_rank)
                 used_outputs_b = outputs[..., dim_1: dim_1 * 2]
+                used_outputs_b = rms_norm(used_outputs_b.flatten(start_dim=-2, end_dim=-1), variance_epsilon=self.config.rms_norm_eps)
                 used_outputs_b = used_outputs_b.unsqueeze(-1).reshape(-1, self.config.hypernet_rank, dim)
             else:
                 used_outputs_a = outputs[...,:dim * self.config.hypernet_rank]
+                used_outputs_a = rms_norm(used_outputs_a, variance_epsilon=self.config.rms_norm_eps)
                 used_outputs_a = used_outputs_a.unsqueeze(-1).view(-1, dim, self.config.hypernet_rank)
                 used_outputs_b = outputs[...,dim * self.config.hypernet_rank : dim * self.config.hypernet_rank * 2]
+                used_outputs_b = rms_norm(used_outputs_b, variance_epsilon=self.config.rms_norm_eps)
                 used_outputs_b = used_outputs_b.unsqueeze(-1).view(-1, self.config.hypernet_rank, dim)
             expanded_outputs = torch.matmul(used_outputs_a, used_outputs_b)
             outputs = expanded_outputs.flatten(start_dim=-2, end_dim=-1)
@@ -378,8 +483,9 @@ class RHN_ACTV1_Inner(nn.Module):
             pass
 
         # Base Model
+        attn_type = "mlp_t" if self.config.mlp_t else "self"
         self.L_level = torch.nn.ModuleList(
-            [RHN_ACTV1Block_Dynamic(self.config, attn=True) for _i in range(self.config.L_layers)]
+            [RHN_ACTV1Block_Dynamic(self.config, attn=True, attn_type=attn_type) for _i in range(self.config.L_layers)]
         )
 
         # Turn off Base Model training
@@ -389,8 +495,9 @@ class RHN_ACTV1_Inner(nn.Module):
         # Hypernetwork
         self.layer_specs = []
         for name, param in self.named_parameters():
-            name_tag = name.split(".")[0]
-            if name_tag != "L_level":
+            if not name.startswith("L_level."):
+                continue
+            if "norm" in name.lower() or "scale" in name.lower():
                 continue
             self.layer_specs.append((name, param.shape))
 
@@ -405,6 +512,10 @@ class RHN_ACTV1_Inner(nn.Module):
         with torch.no_grad():
             self.q_head.weight.zero_()
             self.q_head.bias.fill_(-5)  # type: ignore
+
+        self.dynamic_out_norm = nn.RMSNorm(self.config.hidden_size,
+                                           eps=self.config.rms_norm_eps,
+                                           elementwise_affine=False).to(dtype=self.forward_dtype)
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # Token embedding
@@ -533,7 +644,9 @@ class RHN_ACTV1_Inner(nn.Module):
     def _dynamic_forward(self, z_L, z_H, input_embeddings=None, log_deep_metrics=False, **seq_info) -> Tuple[
         torch.Tensor, torch.Tensor, dict
     ]:
-        h_base = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
+        initial_state = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
+
+        h_base = initial_state
         activations = torch.tensor([], dtype=h_base.dtype, device=h_base.device)
         # Base model output
         for layer in self.L_level:
@@ -543,7 +656,7 @@ class RHN_ACTV1_Inner(nn.Module):
                                     dim=2)  # TODO - Determine whether detaching is preferable here.
 
         # Dynamic weight output
-        h_dyn = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
+        h_dyn = initial_state
         dynamic_weights, step_l2 = self.hypernet(activations, **seq_info)
 
         step_metrics = {}
@@ -581,7 +694,6 @@ class RHN_ACTV1_Inner(nn.Module):
 
                     count += 1
 
-
             step_metrics["gen_norm"] = (gen_norm / count) if count > 0 else torch.tensor(0.0, device=h_base.device)
             if log_deep_metrics:
                 step_metrics["svd_ratio"] = (svd_ratio / count) if count > 0 else torch.tensor(0.0,
@@ -590,12 +702,11 @@ class RHN_ACTV1_Inner(nn.Module):
                                                                                                          device=h_base.device)
 
         for i, layer in enumerate(self.L_level):
-            layer_weights = [dynamic_weights[layer_name] for layer_name in dynamic_weights if
-                             f"L_level.{i}" in layer_name]
-            layer.set_dynamic_adapter(*layer_weights)
+            layer.set_dynamic_adapter(dynamic_weights, layer_idx=i)
             h_dyn = layer(hidden_states=h_dyn, **seq_info)
 
-        return h_base + h_dyn, step_l2, step_metrics
+        h_combined_norm = self.dynamic_out_norm(h_base + h_dyn)
+        return h_combined_norm, step_l2, step_metrics
 
 
 
