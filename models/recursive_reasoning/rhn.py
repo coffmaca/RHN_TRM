@@ -72,6 +72,8 @@ class RHN_ACTV1Config(BaseModel):
     perceiver_heads: int
     hypernet_l2_lambda: float = 1e-4
 
+    hypernet_dropout_p: float
+
 class RHN_ACTV1Block(nn.Module):
     def __init__(self, config: RHN_ACTV1Config, attn: bool = True, attn_type: str = "self",
                  attn_params: dict = None) -> None:
@@ -309,6 +311,8 @@ class RHN_Hypernetwork(nn.Module):
                 self.lora_norms[f"{safe_name}_B"] = nn.RMSNorm(size_b, eps=self.config.rms_norm_eps,
                                                                elementwise_affine=True).to(dtype=self.forward_dtype)
 
+        self.hypernet_dropout_num = int(self.config.hypernet_dropout_p * self.config.hypernet_rank)
+
         with torch.no_grad():
             target_variance = 1.0 / self.config.hidden_size
             symmetric_std = (target_variance / self.config.hypernet_rank) ** 0.25
@@ -346,6 +350,7 @@ class RHN_Hypernetwork(nn.Module):
 
         outputs_by_layer = {}
         for i, (layer_name, layer_info) in enumerate(self.config_per_layer.items()):
+            scaled_mask, raw_mask = self._get_dropout_masks(batch_size, outputs.dtype, outputs.device)
             shape = layer_info["shape"]
             safe_name = layer_name.replace(".", "_")
             layer_params = outputs[:, i, :]  # Shape: (B, kron_dim^4)
@@ -363,12 +368,18 @@ class RHN_Hypernetwork(nn.Module):
             outputs_a = outputs_a.reshape(batch_size, shape[0], self.config.hypernet_rank)
             output_index += size_a
 
+            if scaled_mask is not None:
+                outputs_a = outputs_a * scaled_mask.unsqueeze(1)
+
             if layer_info["type"] == "matrix":
                 size_b = shape[1] * self.config.hypernet_rank
                 outputs_b = layer_params[:, output_index: output_index + size_b]
                 outputs_b = self.lora_norms[f"{safe_name}_B"](outputs_b)
                 outputs_b = outputs_b.reshape(batch_size, self.config.hypernet_rank, shape[1])
                 output_index += size_b
+
+                if raw_mask is not None:
+                    outputs_b = outputs_b * raw_mask.unsqueeze(2)
 
                 outputs_by_layer[layer_name] = (outputs_a, outputs_b)
             else:
@@ -450,6 +461,22 @@ class RHN_Hypernetwork(nn.Module):
         outputs = expanded_outputs.flatten(start_dim=2, end_dim=-1)
 
         return outputs
+
+    def _get_dropout_masks(self, batch_size, dtype, device):
+        if self.training and self.hypernet_dropout_num > 0:
+            # Randomly pick ranks to drop per batch item
+            noise = torch.rand(batch_size, self.config.hypernet_rank, device=device)
+            raw_mask = torch.ones(batch_size, self.config.hypernet_rank, dtype=dtype, device=device)
+            drop_indices = noise.argsort(dim=1)[:, :self.hypernet_dropout_num]
+            raw_mask.scatter_(1, drop_indices, 0.0)
+
+            # Scale factor applied to preserve expected magnitude
+            scale = self.config.hypernet_rank / (self.config.hypernet_rank - self.hypernet_dropout_num)
+            scaled_mask = raw_mask * scale
+        else:
+            raw_mask = None
+            scaled_mask = None
+        return scaled_mask, raw_mask
 
 
 # class RHN_ACTV1ReasoningModule(nn.Module):

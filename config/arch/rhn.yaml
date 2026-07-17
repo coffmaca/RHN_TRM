@@ -31,3 +31,5 @@ layer_emb_dim: 32
 hypernet_relative_scale: 2
 kron_dims: 4
 perceiver_heads: 8
+
+hypernet_dropout_p: 0.1
