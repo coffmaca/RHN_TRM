@@ -72,6 +72,7 @@ class RHN_ACTV1Config(BaseModel):
     perceiver_heads: int
     hypernet_l2_lambda: float = 1e-4
 
+    hypernet_dropout: float
     hypernet_dropout_p: float
 
 class RHN_ACTV1Block(nn.Module):
@@ -208,6 +209,8 @@ class RHN_Hypernetwork(nn.Module):
 
         self.input_size = self.config.hidden_size * self.config.L_layers
 
+        self.dropout = nn.Dropout(p=self.config.hypernet_dropout)
+
         self.perceiver_attn = nn.MultiheadAttention(
             embed_dim=self.input_size,
             num_heads=self.config.perceiver_heads,
@@ -234,11 +237,13 @@ class RHN_Hypernetwork(nn.Module):
     def forward(self, activations: torch.Tensor, **seq_info) -> Tuple[dict, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
 
-        hidden_states = self._attention(activations)
+        activations = self.dropout(activations)
+
+        hidden_states = self.dropout(self._attention(activations))
         # hidden_states = activations
 
         for layer in self.hypernet_base:
-            hidden_states = layer(hidden_states=hidden_states, **seq_info)
+            hidden_states = self.dropout(layer(hidden_states=hidden_states, **seq_info))
         outputs = self.output_head(hidden_states) # rms_norm(self.output_head(hidden_states), variance_epsilon=self.config.rms_norm_eps)
         outputs = rms_norm(self._expand_output(outputs), variance_epsilon=self.config.rms_norm_eps)
 
