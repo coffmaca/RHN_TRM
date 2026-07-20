@@ -73,15 +73,20 @@ class RHN_ACTV1Config(BaseModel):
     perceiver_heads: int
     hypernet_l2_lambda: float = 1e-4
 
+    hypernet_attn: bool
+    hypernet_attn_type: str
+    hypernet_rmsnorm: bool
+
 class RHN_ACTV1Block(nn.Module):
     def __init__(self, config: RHN_ACTV1Config, attn: bool = True, attn_type: str = "self",
-                 attn_params: dict = None) -> None:
+                 attn_params: dict = None, rmsnorm: bool = True) -> None:
         super().__init__()
 
         self.config = config
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
         self.attn = attn
         self.attn_type = attn_type
+        self.rmsnorm = rmsnorm
 
         if self.attn:
             self.post_attn_norm = nn.RMSNorm(attn_params["input_size"],
@@ -112,17 +117,15 @@ class RHN_ACTV1Block(nn.Module):
                     batch_first=True,
                 ).to(dtype=self.forward_dtype)
 
-        self.post_mlp_norm = nn.RMSNorm(attn_params["input_size"],
-                                                eps=self.config.rms_norm_eps,
-                                                elementwise_affine=True).to(dtype=self.forward_dtype)
+        if self.rmsnorm:
+            self.post_mlp_norm = nn.RMSNorm(attn_params["input_size"],
+                                            eps=self.config.rms_norm_eps,
+                                            elementwise_affine=True).to(dtype=self.forward_dtype)
 
         self.mlp = SwiGLU(
             hidden_size=attn_params["input_size"],
             expansion=config.expansion,
         )
-
-        self.mlp_out_scale = nn.Parameter(
-            torch.full((attn_params["input_size"],), 1e-4, dtype=self.forward_dtype))
 
         self.norm_eps = config.rms_norm_eps
 
@@ -156,7 +159,10 @@ class RHN_ACTV1Block(nn.Module):
             hidden_states = self.post_attn_norm(hidden_states + attn_out)
 
         out = self.mlp(hidden_states)
-        hidden_states = self.post_mlp_norm(hidden_states + out)
+        if self.rmsnorm:
+            hidden_states = self.post_mlp_norm(hidden_states + out)
+        else:
+            hidden_states = out
         return hidden_states
 
 
@@ -284,7 +290,11 @@ class RHN_Hypernetwork(nn.Module):
             })
         )
         for _i in range(self.config.H_layers):
-            self.hypernet_base.append(RHN_ACTV1Block(self.config, attn=True, attn_type="perceiver", attn_params={
+            self.hypernet_base.append(RHN_ACTV1Block(self.config,
+                                                     rmsnorm=self.config.hypernet_rmsnorm,
+                                                     attn=self.config.hypernet_attn,
+                                                     attn_type=self.config.hypernet_attn_type,
+                                                     attn_params={
                 "input_size": self.config.hypernet_hidden_size,
                 "kv_size": self.input_size,
                 "heads": self.config.perceiver_heads,
