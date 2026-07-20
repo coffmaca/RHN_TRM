@@ -30,4 +30,5 @@ hypernet_rank: 32
 layer_emb_dim: 32
 hypernet_relative_scale: 2
 kron_dims: 4
+kron_dims_mult: False
 perceiver_heads: 8

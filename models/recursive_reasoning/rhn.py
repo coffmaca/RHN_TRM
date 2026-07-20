@@ -69,6 +69,7 @@ class RHN_ACTV1Config(BaseModel):
     layer_emb_dim: int
     hypernet_relative_scale: float
     kron_dims: int
+    kron_dims_mult: bool
     perceiver_heads: int
     hypernet_l2_lambda: float = 1e-4
 
@@ -254,7 +255,10 @@ class RHN_Hypernetwork(nn.Module):
         self.input_size = self.config.hidden_size * self.config.L_layers
         self.num_layers = len(self.layer_specs)
 
-        self.num_queries = self.num_layers * self.config.kron_dims
+        if self.config.kron_dims_mult:
+            self.num_queries = self.num_layers * self.config.kron_dims
+        else:
+            self.num_queries = self.config.kron_dims
 
         self.perceiver_attn = nn.MultiheadAttention(
             embed_dim=self.config.hypernet_hidden_size,
@@ -405,13 +409,10 @@ class RHN_Hypernetwork(nn.Module):
 
         self.kron_dim = int(math.ceil(max_params ** 0.25))
 
-        min_kron_split = self.config.kron_dims // 2
-        if min_kron_split == 0:
-            raise ValueError("Config `kron_dims` must be at least 2 to split output into 2 tensors.")
+        elements_per_matrix = self.kron_dim ** 2
+        total_elements_needed = self.num_layers * 2 * elements_per_matrix
 
-        elements_per_split_per_layer = self.kron_dim ** 2
-
-        output_dim = int(math.ceil(elements_per_split_per_layer / min_kron_split))
+        output_dim = int(math.ceil(total_elements_needed / self.num_queries))
 
         return output_dim
 
@@ -419,25 +420,22 @@ class RHN_Hypernetwork(nn.Module):
         batch_size = outputs.shape[0]
         output_dim = outputs.shape[-1]
 
-        # 1) Slice the input_queries sized dim into a number of tensors equal to L_level parameters (num_layers).
-        # This breaks (batch, num_layers * kron_dims, output_dim) into (batch, num_layers, kron_dims, output_dim)
-        outputs = outputs.reshape(batch_size, self.num_layers, self.config.kron_dims, output_dim)
+        # 1) Flatten outputs to a single 1D vector per batch (batch_size, num_queries * output_dim)
+        outputs = outputs.flatten(start_dim=1)
 
-        # 2) Split each divided tensor into two tensors at the kron_dims dimension
-        split_size = self.config.kron_dims // 2
+        # 2) Calculate exact total elements needed
+        needed_elements_per_matrix = self.kron_dim ** 2
+        needed_elements_per_layer = 2 * needed_elements_per_matrix
+        total_needed = self.num_layers * needed_elements_per_layer
 
-        outputs_a = outputs[:, :, :split_size, :]
-        outputs_b = outputs[:, :, split_size:split_size * 2, :]
+        # 3) Slice away any trailing padded elements from the math.ceil operation
+        outputs = outputs[:, :total_needed]
 
-        # 3) Flatten spatial dims to slice the exact number of values required per layer
-        outputs_a = outputs_a.reshape(batch_size, self.num_layers, -1)
-        outputs_b = outputs_b.reshape(batch_size, self.num_layers, -1)
+        # 4) Reshape seamlessly into (batch, num_layers, 2 (for A and B matrices), needed_elements)
+        outputs = outputs.reshape(batch_size, self.num_layers, 2, needed_elements_per_matrix)
 
-        needed_elements = self.kron_dim ** 2
-
-        # Slice to the exact element count (in case output_dim rounded up)
-        outputs_a = outputs_a[:, :, :needed_elements]
-        outputs_b = outputs_b[:, :, :needed_elements]
+        outputs_a = outputs[:, :, 0, :]
+        outputs_b = outputs[:, :, 1, :]
 
         # Normalize each factor individually
         outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
