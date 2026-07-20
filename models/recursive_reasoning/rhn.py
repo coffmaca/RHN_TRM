@@ -517,6 +517,9 @@ class RHN_ACTV1_Inner(nn.Module):
                                            eps=self.config.rms_norm_eps,
                                            elementwise_affine=False).to(dtype=self.forward_dtype)
 
+        self.lm_head_scale = nn.Parameter(torch.ones(self.config.hidden_size, dtype=self.forward_dtype))
+        self.q_head_scale = nn.Parameter(torch.ones(self.config.hidden_size, dtype=self.forward_dtype))
+
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # Token embedding
         embedding = self.embed_tokens(input.to(torch.int32))
@@ -637,8 +640,8 @@ class RHN_ACTV1_Inner(nn.Module):
 
         # LM Outputs
         new_carry = RHN_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
-        output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
-        q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
+        output = self.lm_head(z_H * self.lm_head_scale)[:, self.puzzle_emb_len:]
+        q_logits = self.q_head((z_H * self.q_head_scale)[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), avg_l2, total_metrics
 
     def _dynamic_forward(self, z_L, z_H, input_embeddings=None, log_deep_metrics=False, **seq_info) -> Tuple[
