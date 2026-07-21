@@ -252,7 +252,7 @@ class RHN_Hypernetwork(nn.Module):
                 "type": "vector" if self._is_vector_like(shape) else "matrix",
             }
 
-        self.input_size = self.config.hidden_size * self.config.L_layers
+        self.input_size = self.config.hidden_size # * self.config.L_layers
         self.num_layers = len(self.layer_specs)
 
         if self.config.kron_dims_mult:
@@ -662,17 +662,17 @@ class RHN_ACTV1_Inner(nn.Module):
         initial_state = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
 
         h_base = initial_state
-        activations = torch.tensor([], dtype=h_base.dtype, device=h_base.device)
+        # activations = torch.tensor([], dtype=h_base.dtype, device=h_base.device)
         # Base model output
         for layer in self.L_level:
             layer.clear_dynamic_adapter()
             h_base = layer(hidden_states=h_base, **seq_info)
-            activations = torch.cat((activations, h_base.detach()),
-                                    dim=2)  # TODO - Determine whether detaching is preferable here.
+            # activations = torch.cat((activations, h_base.detach()),
+            #                         dim=2)  # TODO - Determine whether detaching is preferable here.
 
         # Dynamic weight output
         h_dyn = initial_state
-        dynamic_weights, step_l2 = self.hypernet(activations, **seq_info)
+        dynamic_weights, step_l2 = self.hypernet(h_dyn.detach(), **seq_info)
 
         step_metrics = {}
         with torch.no_grad():
