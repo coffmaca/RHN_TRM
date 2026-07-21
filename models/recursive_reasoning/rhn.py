@@ -76,6 +76,7 @@ class RHN_ACTV1Config(BaseModel):
     hypernet_attn: bool
     hypernet_attn_type: str
     hypernet_rmsnorm: bool
+    hypernet_rmsaffine: bool
 
 class RHN_ACTV1Block(nn.Module):
     def __init__(self, config: RHN_ACTV1Config, attn: bool = True, attn_type: str = "self",
@@ -91,7 +92,7 @@ class RHN_ACTV1Block(nn.Module):
         if self.attn:
             self.post_attn_norm = nn.RMSNorm(attn_params["input_size"],
                                                 eps=self.config.rms_norm_eps,
-                                                elementwise_affine=True).to(dtype=self.forward_dtype)
+                                                elementwise_affine=self.config.hypernet_rmsaffine).to(dtype=self.forward_dtype)
             if self.attn_type == "mlp_t":
                 self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hypernet_hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
                 self.mlp_t = SwiGLU(
@@ -120,7 +121,7 @@ class RHN_ACTV1Block(nn.Module):
         if self.rmsnorm:
             self.post_mlp_norm = nn.RMSNorm(attn_params["input_size"],
                                             eps=self.config.rms_norm_eps,
-                                            elementwise_affine=True).to(dtype=self.forward_dtype)
+                                            elementwise_affine=self.config.hypernet_rmsaffine).to(dtype=self.forward_dtype)
 
         self.mlp = SwiGLU(
             hidden_size=attn_params["input_size"],
@@ -177,7 +178,7 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
         if self.attn:
             self.post_attn_norm = nn.RMSNorm(self.config.hidden_size,
                                                     eps=self.config.rms_norm_eps,
-                                                    elementwise_affine=True).to(dtype=self.forward_dtype)
+                                                    elementwise_affine=self.config.hypernet_rmsaffine).to(dtype=self.forward_dtype)
             if self.attn_type == "mlp_t":
                 self.puzzle_emb_len = -(
                             self.config.puzzle_emb_ndim // -self.config.hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
@@ -196,7 +197,7 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
 
         self.post_mlp_norm = nn.RMSNorm(self.config.hidden_size,
                                                 eps=self.config.rms_norm_eps,
-                                                elementwise_affine=True).to(dtype=self.forward_dtype)
+                                                elementwise_affine=self.config.hypernet_rmsaffine).to(dtype=self.forward_dtype)
 
         self.mlp = DynamicSwiGLU(
             hidden_size=config.hidden_size,

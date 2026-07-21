@@ -36,3 +36,4 @@ perceiver_heads: 8
 hypernet_attn: True
 hypernet_attn_type: perceiver
 hypernet_rmsnorm: True
+hypernet_rmsaffine: True
