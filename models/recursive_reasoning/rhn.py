@@ -672,7 +672,7 @@ class RHN_ACTV1_Inner(nn.Module):
 
         # Dynamic weight output
         h_dyn = initial_state
-        dynamic_weights, step_l2 = self.hypernet(h_dyn.detach(), **seq_info)
+        dynamic_weights, step_l2 = self.hypernet(h_dyn, **seq_info)
 
         step_metrics = {}
         with torch.no_grad():
