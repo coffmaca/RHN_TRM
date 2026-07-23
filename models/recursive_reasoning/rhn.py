@@ -68,8 +68,7 @@ class RHN_ACTV1Config(BaseModel):
     hypernet_rank: int
     layer_emb_dim: int
     hypernet_relative_scale: float
-    kron_dims: int
-    kron_dims_mult: bool
+    perceiver_rank: int
     perceiver_heads: int
     hypernet_l2_lambda: float = 1e-4
 
@@ -158,6 +157,8 @@ class RHN_ACTV1Block(nn.Module):
                 )
 
             hidden_states = self.post_attn_norm(hidden_states + attn_out)
+
+            return hidden_states
 
         out = self.mlp(hidden_states)
         if self.rmsnorm:
@@ -262,34 +263,39 @@ class RHN_Hypernetwork(nn.Module):
         self.input_size = self.config.hidden_size * self.config.L_layers
         self.num_layers = len(self.layer_specs)
 
-        if self.config.kron_dims_mult:
-            self.num_queries = self.num_layers * self.config.kron_dims
-        else:
-            self.num_queries = self.config.kron_dims
+        # if self.config.kron_dims_mult:
+        #     self.num_queries = self.num_layers * self.config.kron_dims
+        # else:
+        #     self.num_queries = self.config.kron_dims
 
         self.perceiver_attn = nn.MultiheadAttention(
-            embed_dim=self.config.hypernet_hidden_size,
+            embed_dim=self.input_size,
             num_heads=self.config.perceiver_heads,
             batch_first=True,
             kdim=self.input_size,
             vdim=self.input_size,
         ).to(dtype=self.forward_dtype)
 
-        self.input_queries = nn.Parameter(
+        self.perceiver_queries = nn.Parameter(
             trunc_normal_init_(
-                torch.empty((1, self.num_queries, self.config.hypernet_hidden_size), dtype=self.forward_dtype),
+                torch.empty((1, self.config.perceiver_rank, self.input_size), dtype=self.forward_dtype),
                 std=1.0 / math.sqrt(self.config.hypernet_hidden_size),
             )
         )
 
         self.hypernet_base = nn.ModuleList()
+        # self.hypernet_base.append(
+        #     RHN_ACTV1Block(self.config, attn=True, attn_type="perceiver", attn_params={
+        #         "input_size": self.input_size,
+        #         "kv_size": self.input_size,
+        #         "heads": self.config.perceiver_heads,
+        #     })
+        # )
         self.hypernet_base.append(
-            RHN_ACTV1Block(self.config, attn=True, attn_type="perceiver", attn_params={
-                "input_size": self.config.hypernet_hidden_size,
-                "kv_size": self.input_size,
-                "heads": self.config.perceiver_heads,
-            })
-        )
+            CastedLinear(self.input_size,
+                          self.config.hypernet_hidden_size,
+                          bias=False))
+        self.hypernet_base.append(nn.SiLU())
         for _i in range(self.config.H_layers):
             self.hypernet_base.append(RHN_ACTV1Block(self.config,
                                                      rmsnorm=self.config.hypernet_rmsnorm,
@@ -306,51 +312,53 @@ class RHN_Hypernetwork(nn.Module):
                                          self._output_dim(layer_specs),
                                          bias=False)
 
-        self.lora_norms = nn.ModuleDict()
+        # self.lora_norms = nn.ModuleDict()
+        #
+        # for name, shape in self.layer_specs:
+        #     safe_name = name.replace(".", "_")
+        #
+        #     if self._is_vector_like(shape):
+        #         size = shape[0] * self.config.hypernet_rank
+        #         self.lora_norms[f"{safe_name}"] = nn.RMSNorm(size, eps=self.config.rms_norm_eps,
+        #                                                      elementwise_affine=True).to(dtype=self.forward_dtype)
+        #     else:
+        #         size_a = shape[0] * self.config.hypernet_rank
+        #         size_b = shape[1] * self.config.hypernet_rank
+        #
+        #         self.lora_norms[f"{safe_name}_A"] = nn.RMSNorm(size_a, eps=self.config.rms_norm_eps,
+        #                                                        elementwise_affine=True).to(dtype=self.forward_dtype)
+        #         self.lora_norms[f"{safe_name}_B"] = nn.RMSNorm(size_b, eps=self.config.rms_norm_eps,
+        #                                                        elementwise_affine=True).to(dtype=self.forward_dtype)
 
-        for name, shape in self.layer_specs:
-            safe_name = name.replace(".", "_")
-
-            if self._is_vector_like(shape):
-                size = shape[0] * self.config.hypernet_rank
-                self.lora_norms[f"{safe_name}"] = nn.RMSNorm(size, eps=self.config.rms_norm_eps,
-                                                             elementwise_affine=True).to(dtype=self.forward_dtype)
-            else:
-                size_a = shape[0] * self.config.hypernet_rank
-                size_b = shape[1] * self.config.hypernet_rank
-
-                self.lora_norms[f"{safe_name}_A"] = nn.RMSNorm(size_a, eps=self.config.rms_norm_eps,
-                                                               elementwise_affine=True).to(dtype=self.forward_dtype)
-                self.lora_norms[f"{safe_name}_B"] = nn.RMSNorm(size_b, eps=self.config.rms_norm_eps,
-                                                               elementwise_affine=True).to(dtype=self.forward_dtype)
-
-        with torch.no_grad():
-            target_variance = 1.0 / self.config.hidden_size
-            symmetric_std = (target_variance / self.config.hypernet_rank) ** 0.25
-            for key, norm_module in self.lora_norms.items():
-        #         trunc_normal_init_(norm_module.weight, std=0.02)
-                # norm_module.weight.add_(1.0)
-
-                # trunc_normal_init_(norm_module.weight, std=symmetric_std)
-                # norm_module.weight *= 10
-
-                if key.endswith("_B"):
-                    # Initialize B matrices to 0.0 so dynamic output starts safely at zero
-                    # nn.init.zeros_(norm_module.weight)
-                    trunc_normal_init_(norm_module.weight, std=symmetric_std)
-                else:
-                    # Initialize A matrices (and vectors) to 1.0 unit variance
-                    nn.init.ones_(norm_module.weight)
+        # with torch.no_grad():
+        #     target_variance = 1.0 / self.config.hidden_size
+        #     symmetric_std = (target_variance / self.config.hypernet_rank) ** 0.25
+        #     for key, norm_module in self.lora_norms.items():
+        # #         trunc_normal_init_(norm_module.weight, std=0.02)
+        #         # norm_module.weight.add_(1.0)
+        #
+        #         # trunc_normal_init_(norm_module.weight, std=symmetric_std)
+        #         # norm_module.weight *= 10
+        #
+        #         if key.endswith("_B"):
+        #             # Initialize B matrices to 0.0 so dynamic output starts safely at zero
+        #             # nn.init.zeros_(norm_module.weight)
+        #             trunc_normal_init_(norm_module.weight, std=symmetric_std)
+        #         else:
+        #             # Initialize A matrices (and vectors) to 1.0 unit variance
+        #             nn.init.ones_(norm_module.weight)
 
     def forward(self, activations: torch.Tensor, **seq_info) -> Tuple[dict, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
 
-        # hidden_states = self._attention(activations)
-        hidden_states = activations
+        hidden_states = self._attention(activations)
+        # hidden_states = activations
 
         for i, layer in enumerate(self.hypernet_base):
-            if i == 0:
-                hidden_states = layer(hidden_states=self.input_queries, kv=activations, **seq_info)
+            # if i == 0:
+            #     hidden_states = layer(hidden_states=self.input_queries, kv=activations, **seq_info)
+            if i < 2:
+                hidden_states = layer(hidden_states)
             else:
                 hidden_states = layer(hidden_states=hidden_states, kv=activations, **seq_info)
 
@@ -422,9 +430,26 @@ class RHN_Hypernetwork(nn.Module):
         self.kron_dim = int(
             -(-base_param_total_low_rank ** (1 / 4) // 1))  # Square root twice (i.e., 1/4th root) and round up
 
-        vals_to_generate = math.ceil((self.kron_dim ** 2 * 2) / self.num_queries)
+        vals_to_generate = math.ceil((self.kron_dim ** 2 * 2) / self.config.perceiver_rank)
 
         return vals_to_generate
+
+    def _attention(self, inputs) -> torch.Tensor:
+        B, S, D = inputs.shape
+        H = self.config.perceiver_heads
+        Q = self.config.perceiver_rank
+        head_dim = D // H
+
+        q = self.perceiver_queries.view(1, Q, H, head_dim).transpose(1, 2)
+        k = inputs.view(B, S, H, head_dim).transpose(1, 2)
+        v = inputs.view(B, S, H, head_dim).transpose(1, 2)
+
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
+        attn_weights = F.softmax(attn_logits, dim=-1)
+        pooled_inputs = torch.matmul(attn_weights, v)
+        pooled_inputs = pooled_inputs.transpose(1, 2).contiguous().view(B, Q, D)
+
+        return pooled_inputs
 
     def _expand_output(self, outputs) -> torch.Tensor:
         batch_size = outputs.shape[0]

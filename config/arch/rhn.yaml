@@ -29,8 +29,7 @@ hypernet_hidden_size: 512
 hypernet_rank: 32
 layer_emb_dim: 32
 hypernet_relative_scale: 2
-kron_dims: 4
-kron_dims_mult: False
+perceiver_rank: 4
 perceiver_heads: 8
 
 hypernet_attn: True
