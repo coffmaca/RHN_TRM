@@ -355,7 +355,7 @@ class RHN_Hypernetwork(nn.Module):
                 hidden_states = layer(hidden_states=hidden_states, kv=activations, **seq_info)
 
         outputs = self.output_head(hidden_states)
-        outputs = rms_norm(outputs, variance_epsilon=self.config.rms_norm_eps)
+        # outputs = rms_norm(outputs, variance_epsilon=self.config.rms_norm_eps)
         outputs = self._expand_output(outputs)
 
         step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
@@ -431,8 +431,10 @@ class RHN_Hypernetwork(nn.Module):
         outputs = outputs.reshape(batch_size, -1)  # Collapse perceiver rank dimension
         used_outputs_a = outputs[..., :self.kron_dim ** 2]
         used_outputs_a = used_outputs_a.unsqueeze(-1).view(-1, self.kron_dim, self.kron_dim)
+        used_outputs_a = rms_norm(used_outputs_a, variance_epsilon=self.config.rms_norm_eps)
         used_outputs_b = outputs[..., self.kron_dim ** 2: self.kron_dim ** 2 * 2]
         used_outputs_b = used_outputs_b.unsqueeze(-1).view(-1, self.kron_dim, self.kron_dim)
+        used_outputs_b = rms_norm(used_outputs_b, variance_epsilon=self.config.rms_norm_eps)
         expanded_outputs = torch.einsum('bij,bkl->bikjl', used_outputs_a, used_outputs_b)
         outputs = expanded_outputs.flatten(start_dim=1, end_dim=-1)
 
