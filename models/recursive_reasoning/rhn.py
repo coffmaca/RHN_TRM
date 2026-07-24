@@ -90,16 +90,22 @@ class RHN_ACTV1Block(nn.Module):
         self.rmsnorm = rmsnorm
 
         if self.attn:
-            self.post_attn_norm = nn.RMSNorm(attn_params["input_size"],
-                                                eps=self.config.rms_norm_eps,
-                                                elementwise_affine=self.config.hypernet_rmsaffine).to(dtype=self.forward_dtype)
             if self.attn_type == "mlp_t":
                 self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hypernet_hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
                 self.mlp_t = SwiGLU(
                     hidden_size= self.config.perceiver_rank, # self.config.seq_len + self.puzzle_emb_len,
                     expansion=config.expansion,
                 )
+                self.post_attn_norm = nn.RMSNorm(self.config.perceiver_rank,
+                                                 eps=self.config.rms_norm_eps,
+                                                 elementwise_affine=self.config.hypernet_rmsaffine).to(
+                    dtype=self.forward_dtype)
             elif self.attn_type == "self":
+                self.post_attn_norm = nn.RMSNorm(attn_params["input_size"],
+                                                 eps=self.config.rms_norm_eps,
+                                                 elementwise_affine=self.config.hypernet_rmsaffine).to(
+                    dtype=self.forward_dtype)
+
                 self.self_attn = Attention(
                     hidden_size=attn_params["input_size"],
                     kdim=attn_params["kv_size"] if attn_params["kv_size"] != attn_params["input_size"] else None,
@@ -110,6 +116,11 @@ class RHN_ACTV1Block(nn.Module):
                     causal=False,
                 )
             elif self.attn_type == "perceiver":
+                self.post_attn_norm = nn.RMSNorm(attn_params["input_size"],
+                                                 eps=self.config.rms_norm_eps,
+                                                 elementwise_affine=self.config.hypernet_rmsaffine).to(
+                    dtype=self.forward_dtype)
+
                 self.perceiver_attn = nn.MultiheadAttention(
                     embed_dim=attn_params["input_size"],
                     kdim=attn_params["kv_size"],
@@ -135,13 +146,16 @@ class RHN_ACTV1Block(nn.Module):
         # Pre-Norm
         if self.attn:
             if self.attn_type == "mlp_t":
-                attn_in = hidden_states.transpose(1,2)
-                attn_out = self.mlp_t(attn_in).transpose(1,2)
+                hidden_states = hidden_states.transpose(1,2)
+                attn_out = self.mlp_t(hidden_states)
+                hidden_states = self.post_attn_norm(hidden_states + attn_out)
+                hidden_states = hidden_states.transpose(1,2)
             elif self.attn_type == "self":
                 attn_out = self.self_attn(cos_sin=cos_sin,
                                           query=hidden_states,
                                           key=hidden_states,
                                           value=hidden_states)
+                hidden_states = self.post_attn_norm(hidden_states + attn_out)
             elif self.attn_type == "perceiver":
                 queries = hidden_states
 
@@ -156,15 +170,14 @@ class RHN_ACTV1Block(nn.Module):
                     key=kv,
                     value=kv
                 )
-
-            hidden_states = self.post_attn_norm(hidden_states + attn_out)
+                hidden_states = self.post_attn_norm(hidden_states + attn_out)
 
         out = self.mlp(hidden_states)
         if self.rmsnorm:
-            hidden_states = self.post_mlp_norm(hidden_states + out)
+            out = self.post_mlp_norm(hidden_states + out)
         else:
-            hidden_states = out
-        return hidden_states
+            out = hidden_states + out
+        return out
 
 
 class RHN_ACTV1Block_Dynamic(nn.Module):
@@ -176,16 +189,20 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
         self.attn = attn
         self.attn_type = attn_type
         if self.attn:
-            self.post_attn_norm = nn.RMSNorm(self.config.hidden_size,
-                                                    eps=self.config.rms_norm_eps,
-                                                    elementwise_affine=self.config.hypernet_rmsaffine).to(dtype=self.forward_dtype)
+
             if self.attn_type == "mlp_t":
                 self.puzzle_emb_len = -(
                             self.config.puzzle_emb_ndim // -self.config.hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
+                seq_len_dim = self.config.seq_len + self.puzzle_emb_len
+
                 self.mlp_t = DynamicSwiGLU(
                     hidden_size=self.config.seq_len + self.puzzle_emb_len,
                     expansion=config.expansion,
                 )
+                self.post_attn_norm = nn.RMSNorm(seq_len_dim,
+                                                 eps=self.config.rms_norm_eps,
+                                                 elementwise_affine=self.config.hypernet_rmsaffine).to(
+                    dtype=self.forward_dtype)
             else:
                 self.self_attn = DynamicAttention(
                     hidden_size=config.hidden_size,
@@ -194,6 +211,10 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
                     num_key_value_heads=config.num_heads,
                     causal=False
                 )
+                self.post_attn_norm = nn.RMSNorm(self.config.hidden_size,
+                                                 eps=self.config.rms_norm_eps,
+                                                 elementwise_affine=self.config.hypernet_rmsaffine).to(
+                    dtype=self.forward_dtype)
 
         self.post_mlp_norm = nn.RMSNorm(self.config.hidden_size,
                                                 eps=self.config.rms_norm_eps,
@@ -235,14 +256,16 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.attn:
             if self.attn_type == "mlp_t":
-                attn_in = hidden_states.transpose(1, 2)
-                attn_out = self.mlp_t(attn_in).transpose(1, 2)
+                hidden_states = hidden_states.transpose(1, 2)
+                attn_out = self.mlp_t(hidden_states)
+                hidden_states = self.post_attn_norm(hidden_states + attn_out)
+                hidden_states = hidden_states.transpose(1, 2)
             else:
                 attn_out = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
-            hidden_states = self.post_attn_norm(hidden_states + attn_out)
+                hidden_states = self.post_attn_norm(hidden_states + attn_out)
         out = self.mlp(hidden_states)
-        hidden_states = self.post_mlp_norm(hidden_states + out)
-        return hidden_states
+        out = self.post_mlp_norm(hidden_states + out)
+        return out
 
 
 class RHN_Hypernetwork(nn.Module):
