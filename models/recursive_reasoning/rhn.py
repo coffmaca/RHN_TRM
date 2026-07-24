@@ -313,7 +313,7 @@ class RHN_Hypernetwork(nn.Module):
                 "heads": self.config.perceiver_heads,
             })
         )
-        for _i in range(self.config.H_layers):
+        for _i in range(self.config.H_layers - 1):
             self.hypernet_base.append(RHN_ACTV1Block(self.config,
                                                      rmsnorm=self.config.hypernet_rmsnorm,
                                                      attn=self.config.hypernet_attn,
