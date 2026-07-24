@@ -174,9 +174,10 @@ class RHN_ACTV1Block(nn.Module):
 
         out = self.mlp(hidden_states)
         if self.rmsnorm:
-            out = self.post_mlp_norm(hidden_states + out)
-        else:
-            out = hidden_states + out
+            # out = self.post_mlp_norm(hidden_states + out)
+            out = self.post_mlp_norm(out)
+        # else:
+        #     out = hidden_states + out
         return out
 
 
