@@ -260,10 +260,13 @@ class RHN_Hypernetwork(nn.Module):
 
             if self.config_per_layer[layer]["type"] == "vector":
                 # outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
+                outputs_a = torch.tanh(outputs_a) * self.post_output_head_scalar_a
                 outputs_by_layer[layer] = outputs_a
             else:
                 # outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
                 # outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
+                outputs_a = torch.tanh(outputs_a) * self.post_output_head_scalar_a
+                outputs_b = torch.tanh(outputs_b) * self.post_output_head_scalar_b
                 outputs_by_layer[layer] = (outputs_a, outputs_b)
 
         return outputs_by_layer, step_l2
@@ -322,10 +325,8 @@ class RHN_Hypernetwork(nn.Module):
         outputs = outputs.reshape(batch_size, -1)  # Collapse perceiver rank dimension
         used_outputs_a = outputs[..., :self.kron_dim ** 2]
         used_outputs_a = used_outputs_a.unsqueeze(-1).view(-1, self.kron_dim, self.kron_dim)
-        used_outputs_a = torch.tanh(used_outputs_a) * self.post_output_head_scalar_a
         used_outputs_b = outputs[..., self.kron_dim ** 2: self.kron_dim ** 2 * 2]
         used_outputs_b = used_outputs_b.unsqueeze(-1).view(-1, self.kron_dim, self.kron_dim)
-        used_outputs_b = torch.tanh(used_outputs_b) * self.post_output_head_scalar_b
         expanded_outputs = torch.einsum('bij,bkl->bikjl', used_outputs_a, used_outputs_b)
         outputs = expanded_outputs.flatten(start_dim=1, end_dim=-1)
 
