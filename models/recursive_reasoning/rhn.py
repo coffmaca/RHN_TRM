@@ -226,7 +226,7 @@ class RHN_Hypernetwork(nn.Module):
                                          self._output_dim(layer_specs),
                                          bias=False)
 
-        self.post_output_head_scalar = nn.Parameter(torch.ones(1)).to(self.forward_dtype)
+        self.post_output_head_scalar = nn.Parameter(torch.full((1,), 1, dtype=self.forward_dtype))
 
     def forward(self, activations: torch.Tensor) -> Tuple[dict, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
