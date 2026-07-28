@@ -226,7 +226,9 @@ class RHN_Hypernetwork(nn.Module):
                                          self._output_dim(layer_specs),
                                          bias=False)
 
-        self.post_output_head_scalar = nn.Parameter(torch.full((1,), 1, dtype=self.forward_dtype))
+        self.post_output_head_scalar_a = nn.Parameter(torch.full((1,), 1, dtype=self.forward_dtype))
+
+        self.post_output_head_scalar_b = nn.Parameter(torch.full((1,), 1, dtype=self.forward_dtype))
 
     def forward(self, activations: torch.Tensor) -> Tuple[dict, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
@@ -238,7 +240,6 @@ class RHN_Hypernetwork(nn.Module):
         outputs = self.hypernet_base(inputs)
         outputs = self.output_head(outputs)
         # outputs = rms_norm(outputs, variance_epsilon=self.config.rms_norm_eps)
-        outputs = torch.tanh(outputs) * self.post_output_head_scalar
         outputs = self._expand_output(outputs)
 
         step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
@@ -321,8 +322,10 @@ class RHN_Hypernetwork(nn.Module):
         outputs = outputs.reshape(batch_size, -1)  # Collapse perceiver rank dimension
         used_outputs_a = outputs[..., :self.kron_dim ** 2]
         used_outputs_a = used_outputs_a.unsqueeze(-1).view(-1, self.kron_dim, self.kron_dim)
+        used_outputs_a = torch.tanh(used_outputs_a) * self.post_output_head_scalar_a
         used_outputs_b = outputs[..., self.kron_dim ** 2: self.kron_dim ** 2 * 2]
         used_outputs_b = used_outputs_b.unsqueeze(-1).view(-1, self.kron_dim, self.kron_dim)
+        used_outputs_b = torch.tanh(used_outputs_b) * self.post_output_head_scalar_b
         expanded_outputs = torch.einsum('bij,bkl->bikjl', used_outputs_a, used_outputs_b)
         outputs = expanded_outputs.flatten(start_dim=1, end_dim=-1)
 
