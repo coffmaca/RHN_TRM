@@ -226,9 +226,9 @@ class RHN_Hypernetwork(nn.Module):
                                          self._output_dim(layer_specs),
                                          bias=False)
 
-        self.post_output_head_scalar_a = nn.Parameter(torch.full((1,), 1, dtype=self.forward_dtype))
-
-        self.post_output_head_scalar_b = nn.Parameter(torch.full((1,), 1, dtype=self.forward_dtype))
+        # self.post_output_head_scalar_a = nn.Parameter(torch.full((1,), 1, dtype=self.forward_dtype))
+        #
+        # self.post_output_head_scalar_b = nn.Parameter(torch.full((1,), 1, dtype=self.forward_dtype))
 
     def forward(self, activations: torch.Tensor) -> Tuple[dict, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
@@ -260,13 +260,13 @@ class RHN_Hypernetwork(nn.Module):
 
             if self.config_per_layer[layer]["type"] == "vector":
                 # outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
-                outputs_a = torch.tanh(outputs_a) * self.post_output_head_scalar_a
+                outputs_a = torch.tanh(outputs_a) # * self.post_output_head_scalar_a
                 outputs_by_layer[layer] = outputs_a
             else:
                 # outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
                 # outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
-                outputs_a = torch.tanh(outputs_a) * self.post_output_head_scalar_a
-                outputs_b = torch.tanh(outputs_b) * self.post_output_head_scalar_b
+                outputs_a = torch.tanh(outputs_a) # * self.post_output_head_scalar_a
+                outputs_b = torch.tanh(outputs_b) # * self.post_output_head_scalar_b
                 outputs_by_layer[layer] = (outputs_a, outputs_b)
 
         return outputs_by_layer, step_l2
