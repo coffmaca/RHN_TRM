@@ -229,7 +229,7 @@ class RHN_Hypernetwork(nn.Module):
 
         self.tanh_scalar_in = nn.Parameter(torch.full((1, self.output_dim), .001, dtype=self.forward_dtype))
 
-        self.tanh_scalar_out = nn.Parameter(torch.full((1, self.output_dim), 1.0, dtype=self.forward_dtype))
+        self.tanh_scalar_out = nn.Parameter(torch.full((1, self.output_dim), 100.0, dtype=self.forward_dtype))
 
     def forward(self, activations: torch.Tensor) -> Tuple[dict, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
