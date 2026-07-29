@@ -229,7 +229,7 @@ class RHN_Hypernetwork(nn.Module):
 
         self.post_output_head_norm = nn.RMSNorm([self.config.perceiver_rank, self.output_dim],
                                                 eps=self.config.rms_norm_eps,
-                                                elementwise_affine=False)
+                                                elementwise_affine=True)
 
     def forward(self, activations: torch.Tensor) -> Tuple[dict, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
