@@ -222,13 +222,14 @@ class RHN_Hypernetwork(nn.Module):
 
         self.hypernet_base = nn.Sequential(*module_list)
 
+        self.output_dim = self._output_dim(layer_specs)
         self.output_head = CastedLinear(self.config.hypernet_hidden_size,
-                                         self._output_dim(layer_specs),
+                                         self.output_dim,
                                          bias=False)
 
-        self.tanh_scalar_in = nn.Parameter(torch.full((1,), 1, dtype=self.forward_dtype))
+        self.tanh_scalar_in = nn.Parameter(torch.full((1, self.output_dim), .1, dtype=self.forward_dtype))
 
-        self.tanh_scalar_out = nn.Parameter(torch.full((1,), 1, dtype=self.forward_dtype))
+        self.tanh_scalar_out = nn.Parameter(torch.full((1, self.output_dim), 1, dtype=self.forward_dtype))
 
     def forward(self, activations: torch.Tensor) -> Tuple[dict, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
