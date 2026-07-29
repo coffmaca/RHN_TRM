@@ -240,35 +240,35 @@ class RHN_Hypernetwork(nn.Module):
                 size = shape[0] * self.config.hypernet_rank
                 self.lora_norms[f"{safe_name}"] = nn.RMSNorm(size, # self.config.hypernet_rank, #
                                                              eps=self.config.rms_norm_eps,
-                                                             elementwise_affine=False).to(dtype=self.forward_dtype)
+                                                             elementwise_affine=True).to(dtype=self.forward_dtype)
             else:
                 size_a = shape[0] * self.config.hypernet_rank
                 size_b = shape[1] * self.config.hypernet_rank
 
                 self.lora_norms[f"{safe_name}_A"] = nn.RMSNorm(size_a, # self.config.hypernet_rank, #
                                                                eps=self.config.rms_norm_eps,
-                                                               elementwise_affine=False).to(dtype=self.forward_dtype)
+                                                               elementwise_affine=True).to(dtype=self.forward_dtype)
                 self.lora_norms[f"{safe_name}_B"] = nn.RMSNorm(size_b, # shape[1], #
                                                                eps=self.config.rms_norm_eps,
-                                                               elementwise_affine=False).to(dtype=self.forward_dtype)
+                                                               elementwise_affine=True).to(dtype=self.forward_dtype)
 
-        # with torch.no_grad():
-        #     target_variance = 1.0 / self.config.hidden_size
-        #     symmetric_std = (target_variance / self.config.hypernet_rank) ** 0.25
-        #     for key, norm_module in self.lora_norms.items():
-        #         #         trunc_normal_init_(norm_module.weight, std=0.02)
-        #         # norm_module.weight.add_(1.0)
-        #
-        #         # trunc_normal_init_(norm_module.weight, std=symmetric_std)
-        #         # norm_module.weight *= 10
-        #
-        #         if key.endswith("_B"):
-        #             # Initialize B matrices to 0.0 so dynamic output starts safely at zero
-        #             # nn.init.zeros_(norm_module.weight)
-        #             trunc_normal_init_(norm_module.weight, std=symmetric_std)
-        #         else:
-        #             # Initialize A matrices (and vectors) to 1.0 unit variance
-        #             nn.init.ones_(norm_module.weight)
+        with torch.no_grad():
+            target_variance = 1.0 / self.config.hidden_size
+            symmetric_std = (target_variance / self.config.hypernet_rank) ** 0.25
+            for key, norm_module in self.lora_norms.items():
+                #         trunc_normal_init_(norm_module.weight, std=0.02)
+                # norm_module.weight.add_(1.0)
+
+                # trunc_normal_init_(norm_module.weight, std=symmetric_std)
+                # norm_module.weight *= 10
+
+                if key.endswith("_B"):
+                    # Initialize B matrices to 0.0 so dynamic output starts safely at zero
+                    # nn.init.zeros_(norm_module.weight)
+                    trunc_normal_init_(norm_module.weight, std=symmetric_std)
+                else:
+                    # Initialize A matrices (and vectors) to 1.0 unit variance
+                    nn.init.ones_(norm_module.weight)
 
     def forward(self, activations: torch.Tensor) -> Tuple[dict, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
