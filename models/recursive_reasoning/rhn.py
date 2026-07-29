@@ -238,17 +238,17 @@ class RHN_Hypernetwork(nn.Module):
 
             if self._is_vector_like(shape):
                 size = shape[0] * self.config.hypernet_rank
-                self.lora_norms[f"{safe_name}"] = nn.RMSNorm(self.config.hypernet_rank, # size,
+                self.lora_norms[f"{safe_name}"] = nn.RMSNorm(size, # self.config.hypernet_rank, #
                                                              eps=self.config.rms_norm_eps,
                                                              elementwise_affine=False).to(dtype=self.forward_dtype)
             else:
                 size_a = shape[0] * self.config.hypernet_rank
                 size_b = shape[1] * self.config.hypernet_rank
 
-                self.lora_norms[f"{safe_name}_A"] = nn.RMSNorm(self.config.hypernet_rank, # size_a,
+                self.lora_norms[f"{safe_name}_A"] = nn.RMSNorm(size_a, # self.config.hypernet_rank, #
                                                                eps=self.config.rms_norm_eps,
                                                                elementwise_affine=False).to(dtype=self.forward_dtype)
-                self.lora_norms[f"{safe_name}_B"] = nn.RMSNorm(shape[1], # size_b,
+                self.lora_norms[f"{safe_name}_B"] = nn.RMSNorm(size_b, # shape[1], #
                                                                eps=self.config.rms_norm_eps,
                                                                elementwise_affine=False).to(dtype=self.forward_dtype)
 
@@ -294,25 +294,25 @@ class RHN_Hypernetwork(nn.Module):
 
             outputs_a = outputs[:, output_index : output_index + (shape[0] * self.config.hypernet_rank)]
 
-            # if layer_info["type"] == "matrix":
-            #     outputs_a = self.lora_norms[f"{safe_name}_A"](outputs_a)
-            # else:
-            #     outputs_a = self.lora_norms[f"{safe_name}"](outputs_a)
-
-            outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
-
             if layer_info["type"] == "matrix":
                 outputs_a = self.lora_norms[f"{safe_name}_A"](outputs_a)
             else:
                 outputs_a = self.lora_norms[f"{safe_name}"](outputs_a)
 
+            outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
+
+            # if layer_info["type"] == "matrix":
+            #     outputs_a = self.lora_norms[f"{safe_name}_A"](outputs_a)
+            # else:
+            #     outputs_a = self.lora_norms[f"{safe_name}"](outputs_a)
+
             output_index += shape[0] * self.config.hypernet_rank
 
             if self.config_per_layer[layer]["type"] == "matrix":
                 outputs_b = outputs[:, output_index : output_index + (shape[1] * self.config.hypernet_rank)]
-                # outputs_b = self.lora_norms[f"{safe_name}_B"](outputs_b)
-                outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
                 outputs_b = self.lora_norms[f"{safe_name}_B"](outputs_b)
+                outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
+                # outputs_b = self.lora_norms[f"{safe_name}_B"](outputs_b)
                 output_index += shape[1] * self.config.hypernet_rank
 
             if self.config_per_layer[layer]["type"] == "vector":
