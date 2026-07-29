@@ -222,9 +222,14 @@ class RHN_Hypernetwork(nn.Module):
 
         self.hypernet_base = nn.Sequential(*module_list)
 
+        self.output_dim = self._output_dim(layer_specs)
         self.output_head = CastedLinear(self.config.hypernet_hidden_size,
-                                         self._output_dim(layer_specs),
+                                         self.output_dim,
                                          bias=False)
+
+        self.post_output_head_norm = nn.RMSNorm([self.config.perceiver_rank, self.output_dim],
+                                                eps=self.config.rms_norm_eps,
+                                                elementwise_affine=False)
 
     def forward(self, activations: torch.Tensor) -> Tuple[dict, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
@@ -235,7 +240,7 @@ class RHN_Hypernetwork(nn.Module):
 
         outputs = self.hypernet_base(inputs)
         outputs = self.output_head(outputs)
-        # outputs = rms_norm(outputs, variance_epsilon=self.config.rms_norm_eps)
+        outputs = self.post_output_head_norm(outputs)
         outputs = self._expand_output(outputs)
 
         step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
@@ -255,11 +260,11 @@ class RHN_Hypernetwork(nn.Module):
                 output_index += shape[1] * self.config.hypernet_rank
 
             if self.config_per_layer[layer]["type"] == "vector":
-                outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
+                # outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
                 outputs_by_layer[layer] = outputs_a
             else:
-                outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
-                outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
+                # outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
+                # outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
                 outputs_by_layer[layer] = (outputs_a, outputs_b)
 
         return outputs_by_layer, step_l2
