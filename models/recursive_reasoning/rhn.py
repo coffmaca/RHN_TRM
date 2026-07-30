@@ -231,7 +231,7 @@ class RHN_Hypernetwork(nn.Module):
                                                 eps=self.config.rms_norm_eps,
                                                 elementwise_affine=False)
 
-    def forward(self, activations: torch.Tensor) -> Tuple[dict, torch.Tensor]:
+    def forward(self, activations: torch.Tensor) -> Tuple[dict, torch.Tensor, dict]:
         batch_size, seq_len, _ = activations.shape
 
         inputs = self._attention(activations)
@@ -240,13 +240,17 @@ class RHN_Hypernetwork(nn.Module):
 
         outputs = self.hypernet_base(inputs)
         outputs = self.output_head(outputs)
+        output_head_l2 = outputs.flatten(1).norm(dim=1).mean()
         outputs = self.post_output_head_norm(outputs)
+        output_head_norm_l2 = outputs.flatten(1).norm(dim=1).mean()
         outputs = self._expand_output(outputs)
+        expansion_l2 = outputs.flatten(1).norm(dim=1).mean()
 
         step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
 
         outputs_by_layer = {}
         output_index = 0
+
         for layer in self.config_per_layer:
             shape = self.config_per_layer[layer]["shape"]
 
@@ -267,7 +271,13 @@ class RHN_Hypernetwork(nn.Module):
                 # outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
                 outputs_by_layer[layer] = (outputs_a, outputs_b)
 
-        return outputs_by_layer, step_l2
+        hyper_metrics = {
+            "output_head_l2": output_head_l2.detach(),
+            "output_head_norm_l2": output_head_norm_l2.detach(),
+            "expansion_l2": expansion_l2.detach(),
+        }
+
+        return outputs_by_layer, step_l2, hyper_metrics
 
     def _is_vector_like(self, shape:list) -> bool:
         if len(shape) < 2:
@@ -449,7 +459,11 @@ class RHN_ACTV1_Inner(nn.Module):
             "telemetry/act_sparsity": torch.tensor(0.0, device=z_H.device),
             "telemetry/act_saturation": torch.tensor(0.0, device=z_H.device),
             "telemetry/gen_l2_norm": torch.tensor(0.0, device=z_H.device),
-            "telemetry/state_drift": torch.tensor(0.0, device=z_H.device)
+            "telemetry/state_drift": torch.tensor(0.0, device=z_H.device),
+            "telemetry/output_head_l2": torch.tensor(0.0, device=z_H.device),
+            "telemetry/output_head_norm_l2": torch.tensor(0.0, device=z_H.device),
+            "telemetry/expansion_l2": torch.tensor(0.0, device=z_H.device),
+            # "telemetry/expansion_norm_l2": torch.tensor(0.0, device=z_H.device)
         }
 
         if log_deep_metrics:
@@ -464,6 +478,10 @@ class RHN_ACTV1_Inner(nn.Module):
             total_metrics["telemetry/act_saturation"] += step_metrics["saturation"]
             total_metrics["telemetry/gen_l2_norm"] += step_metrics["gen_norm"]
             total_metrics["telemetry/state_drift"] += F.cosine_similarity(prev_state, new_state, dim=-1).mean()
+            total_metrics["telemetry/output_head_l2"] += step_metrics["output_head_l2"]
+            total_metrics["telemetry/output_head_norm_l2"] += step_metrics["output_head_norm_l2"]
+            total_metrics["telemetry/expansion_l2"] += step_metrics["expansion_l2"]
+            # total_metrics["telemetry/expansion_norm_l2"] += step_metrics["expansion_norm_l2"]
 
             # Low-Frequency (Every 100 Steps)
             if log_deep_metrics:
@@ -541,12 +559,15 @@ class RHN_ACTV1_Inner(nn.Module):
 
         # Dynamic weight output
         h_dyn = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
-        dynamic_weights, step_l2 = self.hypernet(activations)
+
+        dynamic_weights, step_l2, hyper_metrics = self.hypernet(activations)
 
         step_metrics = {}
         with torch.no_grad():
             step_metrics["sparsity"] = (h_base.abs() < 1e-3).float().mean()
             step_metrics["saturation"] = (h_base.abs() > 5.0).float().mean()
+
+            step_metrics.update(hyper_metrics)
 
             gen_norm = 0.0
             svd_ratio = 0.0
