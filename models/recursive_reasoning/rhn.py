@@ -231,6 +231,14 @@ class RHN_Hypernetwork(nn.Module):
                                                 eps=self.config.rms_norm_eps,
                                                 elementwise_affine=False)
 
+        self.pre_expansion_norm_a = nn.RMSNorm([self.kron_dim, self.kron_dim],
+                                                eps=self.config.rms_norm_eps,
+                                                elementwise_affine=False)
+
+        self.pre_expansion_norm_b = nn.RMSNorm([self.kron_dim, self.kron_dim],
+                                                eps=self.config.rms_norm_eps,
+                                                elementwise_affine=False)
+
         self.lora_norms = nn.ModuleDict()
 
         for name, shape in self.layer_specs:
@@ -283,14 +291,14 @@ class RHN_Hypernetwork(nn.Module):
         outputs = self.post_output_head_norm(outputs)
         output_head_norm_l2 = outputs.flatten(1).norm(dim=1).mean()
         outputs = self._expand_output(outputs)
-        expansion_l2 = outputs.flatten(1).norm(dim=1).mean()
+        expansion_norm_l2 = outputs.flatten(1).norm(dim=1).mean()
 
         step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
 
         outputs_by_layer = {}
         output_index = 0
 
-        expansion_norm_sq = torch.zeros(batch_size, device=outputs.device)
+        gen_norm_sq = torch.zeros(batch_size, device=outputs.device)
 
         for layer in self.config_per_layer:
             layer_name = layer
@@ -305,7 +313,7 @@ class RHN_Hypernetwork(nn.Module):
             else:
                 outputs_a = self.lora_norms[f"{safe_name}"](outputs_a)
 
-            expansion_norm_sq += outputs_a.pow(2).sum(dim=1)
+            gen_norm_sq += outputs_a.pow(2).sum(dim=1)
 
             outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
 
@@ -320,7 +328,7 @@ class RHN_Hypernetwork(nn.Module):
                 outputs_b = outputs[:, output_index : output_index + (shape[1] * self.config.hypernet_rank)]
                 outputs_b = self.lora_norms[f"{safe_name}_B"](outputs_b)
 
-                expansion_norm_sq += outputs_b.pow(2).sum(dim=1)
+                gen_norm_sq += outputs_b.pow(2).sum(dim=1)
 
                 outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
                 # outputs_b = self.lora_norms[f"{safe_name}_B"](outputs_b)
@@ -334,13 +342,13 @@ class RHN_Hypernetwork(nn.Module):
                 # outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
                 outputs_by_layer[layer] = (outputs_a, outputs_b)
 
-        expansion_norm_l2 = expansion_norm_sq.sqrt().mean()
+        gen_norm_l2 = gen_norm_sq.sqrt().mean()
 
         hyper_metrics = {
             "output_head_l2": output_head_l2.detach(),
             "output_head_norm_l2": output_head_norm_l2.detach(),
-            "expansion_l2": expansion_l2.detach(),
-            "expansion_norm_l2": expansion_norm_l2.detach()
+            "expansion_norm_l2": expansion_norm_l2.detach(),
+            "gen_norm_l2": expansion_norm_l2.detach()
         }
 
         return outputs_by_layer, step_l2, hyper_metrics
@@ -399,8 +407,10 @@ class RHN_Hypernetwork(nn.Module):
         outputs = outputs.reshape(batch_size, -1)  # Collapse perceiver rank dimension
         used_outputs_a = outputs[..., :self.kron_dim ** 2]
         used_outputs_a = used_outputs_a.unsqueeze(-1).view(-1, self.kron_dim, self.kron_dim)
+        used_outputs_a = self.pre_expansion_norm_a(used_outputs_a)
         used_outputs_b = outputs[..., self.kron_dim ** 2: self.kron_dim ** 2 * 2]
         used_outputs_b = used_outputs_b.unsqueeze(-1).view(-1, self.kron_dim, self.kron_dim)
+        used_outputs_b = self.pre_expansion_norm_b(used_outputs_b)
         expanded_outputs = torch.einsum('bij,bkl->bikjl', used_outputs_a, used_outputs_b)
         outputs = expanded_outputs.flatten(start_dim=1, end_dim=-1)
 
@@ -528,8 +538,8 @@ class RHN_ACTV1_Inner(nn.Module):
             "telemetry/state_drift": torch.tensor(0.0, device=z_H.device),
             "telemetry/output_head_l2": torch.tensor(0.0, device=z_H.device),
             "telemetry/output_head_norm_l2": torch.tensor(0.0, device=z_H.device),
-            "telemetry/expansion_l2": torch.tensor(0.0, device=z_H.device),
-            "telemetry/expansion_norm_l2": torch.tensor(0.0, device=z_H.device)
+            "telemetry/expansion_norm_l2": torch.tensor(0.0, device=z_H.device),
+            "telemetry/gen_norm_l2": torch.tensor(0.0, device=z_H.device)
         }
 
         if log_deep_metrics:
@@ -546,8 +556,8 @@ class RHN_ACTV1_Inner(nn.Module):
             total_metrics["telemetry/state_drift"] += F.cosine_similarity(prev_state, new_state, dim=-1).mean()
             total_metrics["telemetry/output_head_l2"] += step_metrics["output_head_l2"]
             total_metrics["telemetry/output_head_norm_l2"] += step_metrics["output_head_norm_l2"]
-            total_metrics["telemetry/expansion_l2"] += step_metrics["expansion_l2"]
             total_metrics["telemetry/expansion_norm_l2"] += step_metrics["expansion_norm_l2"]
+            total_metrics["telemetry/gen_norm_l2"] += step_metrics["gen_norm_l2"]
 
             # Low-Frequency (Every 100 Steps)
             if log_deep_metrics:
