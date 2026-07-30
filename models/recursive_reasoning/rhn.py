@@ -414,6 +414,8 @@ class RHN_Hypernetwork(nn.Module):
         expanded_outputs = torch.einsum('bij,bkl->bikjl', used_outputs_a, used_outputs_b)
         outputs = expanded_outputs.flatten(start_dim=1, end_dim=-1)
 
+        outputs = outputs / self.kron_dim
+
         return outputs
 
 
