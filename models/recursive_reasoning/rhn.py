@@ -290,7 +290,7 @@ class RHN_Hypernetwork(nn.Module):
         outputs_by_layer = {}
         output_index = 0
 
-        expansion_norm_sq = torch.zeros(batch_size, device=outputs.device)
+        gen_norm_sq = torch.zeros(batch_size, device=outputs.device)
 
         for layer in self.config_per_layer:
             layer_name = layer
@@ -305,7 +305,7 @@ class RHN_Hypernetwork(nn.Module):
             else:
                 outputs_a = self.lora_norms[f"{safe_name}"](outputs_a)
 
-            expansion_norm_sq += outputs_a.pow(2).sum(dim=1)
+            gen_norm_sq += outputs_a.pow(2).sum(dim=1)
 
             outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
 
@@ -320,7 +320,7 @@ class RHN_Hypernetwork(nn.Module):
                 outputs_b = outputs[:, output_index : output_index + (shape[1] * self.config.hypernet_rank)]
                 outputs_b = self.lora_norms[f"{safe_name}_B"](outputs_b)
 
-                expansion_norm_sq += outputs_b.pow(2).sum(dim=1)
+                gen_norm_sq += outputs_b.pow(2).sum(dim=1)
 
                 outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
                 # outputs_b = self.lora_norms[f"{safe_name}_B"](outputs_b)
@@ -334,13 +334,13 @@ class RHN_Hypernetwork(nn.Module):
                 # outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
                 outputs_by_layer[layer] = (outputs_a, outputs_b)
 
-        expansion_norm_l2 = expansion_norm_sq.sqrt().mean()
+        gen_norm_l2 = gen_norm_sq.sqrt().mean()
 
         hyper_metrics = {
             "output_head_l2": output_head_l2.detach(),
             "output_head_norm_l2": output_head_norm_l2.detach(),
             "expansion_l2": expansion_l2.detach(),
-            "expansion_norm_l2": expansion_norm_l2.detach()
+            "gen_norm_l2": gen_norm_l2.detach()
         }
 
         return outputs_by_layer, step_l2, hyper_metrics
@@ -529,7 +529,7 @@ class RHN_ACTV1_Inner(nn.Module):
             "telemetry/output_head_l2": torch.tensor(0.0, device=z_H.device),
             "telemetry/output_head_norm_l2": torch.tensor(0.0, device=z_H.device),
             "telemetry/expansion_l2": torch.tensor(0.0, device=z_H.device),
-            "telemetry/expansion_norm_l2": torch.tensor(0.0, device=z_H.device)
+            "telemetry/gen_norm_l2": torch.tensor(0.0, device=z_H.device)
         }
 
         if log_deep_metrics:
@@ -547,7 +547,7 @@ class RHN_ACTV1_Inner(nn.Module):
             total_metrics["telemetry/output_head_l2"] += step_metrics["output_head_l2"]
             total_metrics["telemetry/output_head_norm_l2"] += step_metrics["output_head_norm_l2"]
             total_metrics["telemetry/expansion_l2"] += step_metrics["expansion_l2"]
-            total_metrics["telemetry/expansion_norm_l2"] += step_metrics["expansion_norm_l2"]
+            total_metrics["telemetry/gen_norm_l2"] += step_metrics["gen_norm_l2"]
 
             # Low-Frequency (Every 100 Steps)
             if log_deep_metrics:
