@@ -241,7 +241,7 @@ class RHN_Hypernetwork(nn.Module):
         outputs = self.hypernet_base(inputs)
         outputs = self.output_head(outputs)
         # outputs = rms_norm(outputs, variance_epsilon=self.config.rms_norm_eps)
-        outputs = torch.tanh(outputs * self.tanh_scalar_in) * 100
+        outputs = torch.tanh(outputs * self.tanh_scalar_in) * 10
         outputs = self._expand_output(outputs)
 
         step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
