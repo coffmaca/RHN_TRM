@@ -227,7 +227,7 @@ class RHN_Hypernetwork(nn.Module):
                                          self.output_dim,
                                          bias=False)
 
-        self.tanh_scalar_in = nn.Parameter(torch.full((1, self.output_dim), .01, dtype=self.forward_dtype))
+        self.tanh_scalar_in = nn.Parameter(torch.full((1, self.output_dim), .001, dtype=self.forward_dtype))
 
         # self.tanh_scalar_out = nn.Parameter(torch.full((1, self.output_dim), 1, dtype=self.forward_dtype))
 
@@ -241,7 +241,7 @@ class RHN_Hypernetwork(nn.Module):
         outputs = self.hypernet_base(inputs)
         outputs = self.output_head(outputs)
         # outputs = rms_norm(outputs, variance_epsilon=self.config.rms_norm_eps)
-        outputs = torch.tanh(outputs * self.tanh_scalar_in) * 100
+        outputs = torch.tanh(outputs * self.tanh_scalar_in) * 1000
         outputs = self._expand_output(outputs)
 
         step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
