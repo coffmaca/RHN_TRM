@@ -291,7 +291,7 @@ class RHN_Hypernetwork(nn.Module):
         outputs = self.post_output_head_norm(outputs)
         output_head_norm_l2 = outputs.flatten(1).norm(dim=1).mean()
         outputs = self._expand_output(outputs)
-        expansion_norm_l2 = outputs.flatten(1).norm(dim=1).mean()
+        expansion_l2 = outputs.flatten(1).norm(dim=1).mean()
 
         step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
 
@@ -347,8 +347,8 @@ class RHN_Hypernetwork(nn.Module):
         hyper_metrics = {
             "output_head_l2": output_head_l2.detach(),
             "output_head_norm_l2": output_head_norm_l2.detach(),
-            "expansion_norm_l2": expansion_norm_l2.detach(),
-            "gen_norm_l2": expansion_norm_l2.detach()
+            "expansion_l2": expansion_l2.detach(),
+            "gen_norm_l2": gen_norm_l2.detach()
         }
 
         return outputs_by_layer, step_l2, hyper_metrics
@@ -538,7 +538,7 @@ class RHN_ACTV1_Inner(nn.Module):
             "telemetry/state_drift": torch.tensor(0.0, device=z_H.device),
             "telemetry/output_head_l2": torch.tensor(0.0, device=z_H.device),
             "telemetry/output_head_norm_l2": torch.tensor(0.0, device=z_H.device),
-            "telemetry/expansion_norm_l2": torch.tensor(0.0, device=z_H.device),
+            "telemetry/expansion_l2": torch.tensor(0.0, device=z_H.device),
             "telemetry/gen_norm_l2": torch.tensor(0.0, device=z_H.device)
         }
 
@@ -556,7 +556,7 @@ class RHN_ACTV1_Inner(nn.Module):
             total_metrics["telemetry/state_drift"] += F.cosine_similarity(prev_state, new_state, dim=-1).mean()
             total_metrics["telemetry/output_head_l2"] += step_metrics["output_head_l2"]
             total_metrics["telemetry/output_head_norm_l2"] += step_metrics["output_head_norm_l2"]
-            total_metrics["telemetry/expansion_norm_l2"] += step_metrics["expansion_norm_l2"]
+            total_metrics["telemetry/expansion_l2"] += step_metrics["expansion_l2"]
             total_metrics["telemetry/gen_norm_l2"] += step_metrics["gen_norm_l2"]
 
             # Low-Frequency (Every 100 Steps)
