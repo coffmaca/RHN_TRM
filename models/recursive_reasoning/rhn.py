@@ -227,69 +227,30 @@ class RHN_Hypernetwork(nn.Module):
                                          self.output_dim,
                                          bias=False)
 
-        self.post_output_head_norm = nn.RMSNorm([self.config.perceiver_rank, self.output_dim],
-                                                eps=self.config.rms_norm_eps,
-                                                elementwise_affine=False)
-
-        self.pre_expansion_norm_a = nn.RMSNorm([self.kron_dim, self.kron_dim],
-                                                eps=self.config.rms_norm_eps,
-                                                elementwise_affine=False)
-
-        self.pre_expansion_norm_b = nn.RMSNorm([self.kron_dim, self.kron_dim],
-                                                eps=self.config.rms_norm_eps,
-                                                elementwise_affine=False)
-
-        self.lora_norms = nn.ModuleDict()
-
-        for name, shape in self.layer_specs:
-            safe_name = name.replace(".", "_")
-
-            if self._is_vector_like(shape):
-                size = shape[0] * self.config.hypernet_rank
-                self.lora_norms[f"{safe_name}"] = nn.RMSNorm(size, # self.config.hypernet_rank, #
-                                                             eps=self.config.rms_norm_eps,
-                                                             elementwise_affine=False).to(dtype=self.forward_dtype)
-            else:
-                size_a = shape[0] * self.config.hypernet_rank
-                size_b = shape[1] * self.config.hypernet_rank
-
-                self.lora_norms[f"{safe_name}_A"] = nn.RMSNorm(size_a, # self.config.hypernet_rank, #
-                                                               eps=self.config.rms_norm_eps,
-                                                               elementwise_affine=False).to(dtype=self.forward_dtype)
-                self.lora_norms[f"{safe_name}_B"] = nn.RMSNorm(size_b, # shape[1], #
-                                                               eps=self.config.rms_norm_eps,
-                                                               elementwise_affine=False).to(dtype=self.forward_dtype)
-
-        # with torch.no_grad():
-        #     target_variance = 1.0 / self.config.hidden_size
-        #     symmetric_std = (target_variance / self.config.hypernet_rank) ** 0.25
-        #     for key, norm_module in self.lora_norms.items():
-        #         #         trunc_normal_init_(norm_module.weight, std=0.02)
-        #         # norm_module.weight.add_(1.0)
-        #
-        #         # trunc_normal_init_(norm_module.weight, std=symmetric_std)
-        #         # norm_module.weight *= 10
-        #
-        #         if key.endswith("_B"):
-        #             # Initialize B matrices to 0.0 so dynamic output starts safely at zero
-        #             # nn.init.zeros_(norm_module.weight)
-        #             trunc_normal_init_(norm_module.weight, std=symmetric_std)
-        #         else:
-        #             # Initialize A matrices (and vectors) to 1.0 unit variance
-        #             nn.init.ones_(norm_module.weight)
+        # DoRA-Style Learned Magnitude Vector
+        # Initialized as a pure leaf tensor to preserve deepcopy compatibility
+        self.adapter_magnitude = nn.Parameter(
+            torch.full(
+                (1, self.output_dim),
+                10.0,
+                dtype=self.forward_dtype
+            )
+        )
 
     def forward(self, activations: torch.Tensor) -> Tuple[dict, torch.Tensor, dict]:
         batch_size, seq_len, _ = activations.shape
 
         inputs = self._attention(activations)
-
         inputs = rms_norm(inputs, variance_epsilon=self.config.rms_norm_eps)
 
         outputs = self.hypernet_base(inputs)
         outputs = self.output_head(outputs)
         output_head_l2 = outputs.flatten(1).norm(dim=1).mean()
-        outputs = self.post_output_head_norm(outputs)
+
+        outputs = F.normalize(outputs, p=2.0, dim=-1, eps=1e-8)
+        outputs = outputs * self.adapter_magnitude
         output_head_norm_l2 = outputs.flatten(1).norm(dim=1).mean()
+
         outputs = self._expand_output(outputs)
         expansion_l2 = outputs.flatten(1).norm(dim=1).mean()
 
@@ -301,46 +262,22 @@ class RHN_Hypernetwork(nn.Module):
         gen_norm_sq = torch.zeros(batch_size, device=outputs.device)
 
         for layer in self.config_per_layer:
-            layer_name = layer
-            layer_info = self.config_per_layer[layer]
             shape = self.config_per_layer[layer]["shape"]
-            safe_name = layer_name.replace(".", "_")
 
             outputs_a = outputs[:, output_index : output_index + (shape[0] * self.config.hypernet_rank)]
-
-            if layer_info["type"] == "matrix":
-                outputs_a = self.lora_norms[f"{safe_name}_A"](outputs_a)
-            else:
-                outputs_a = self.lora_norms[f"{safe_name}"](outputs_a)
-
             gen_norm_sq += outputs_a.pow(2).sum(dim=1)
-
             outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
-
-            # if layer_info["type"] == "matrix":
-            #     outputs_a = self.lora_norms[f"{safe_name}_A"](outputs_a)
-            # else:
-            #     outputs_a = self.lora_norms[f"{safe_name}"](outputs_a)
-
             output_index += shape[0] * self.config.hypernet_rank
 
             if self.config_per_layer[layer]["type"] == "matrix":
                 outputs_b = outputs[:, output_index : output_index + (shape[1] * self.config.hypernet_rank)]
-                outputs_b = self.lora_norms[f"{safe_name}_B"](outputs_b)
-
                 gen_norm_sq += outputs_b.pow(2).sum(dim=1)
-
                 outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
-                # outputs_b = self.lora_norms[f"{safe_name}_B"](outputs_b)
                 output_index += shape[1] * self.config.hypernet_rank
 
-            if self.config_per_layer[layer]["type"] == "vector":
-                # outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
-                outputs_by_layer[layer] = outputs_a
-            else:
-                # outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
-                # outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
                 outputs_by_layer[layer] = (outputs_a, outputs_b)
+            else:
+                outputs_by_layer[layer] = outputs_a
 
         gen_norm_l2 = gen_norm_sq.sqrt().mean()
 
@@ -407,14 +344,10 @@ class RHN_Hypernetwork(nn.Module):
         outputs = outputs.reshape(batch_size, -1)  # Collapse perceiver rank dimension
         used_outputs_a = outputs[..., :self.kron_dim ** 2]
         used_outputs_a = used_outputs_a.unsqueeze(-1).view(-1, self.kron_dim, self.kron_dim)
-        used_outputs_a = self.pre_expansion_norm_a(used_outputs_a)
         used_outputs_b = outputs[..., self.kron_dim ** 2: self.kron_dim ** 2 * 2]
         used_outputs_b = used_outputs_b.unsqueeze(-1).view(-1, self.kron_dim, self.kron_dim)
-        used_outputs_b = self.pre_expansion_norm_b(used_outputs_b)
         expanded_outputs = torch.einsum('bij,bkl->bikjl', used_outputs_a, used_outputs_b)
         outputs = expanded_outputs.flatten(start_dim=1, end_dim=-1)
-
-        outputs = outputs / self.kron_dim
 
         return outputs
 
