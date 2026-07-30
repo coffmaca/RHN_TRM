@@ -261,14 +261,14 @@ class RHN_Hypernetwork(nn.Module):
                 output_index += shape[1] * self.config.hypernet_rank
 
             if self.config_per_layer[layer]["type"] == "vector":
-                # outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
-                # expansion_norm_sq += outputs_a.pow(2).sum(dim=1)
+                outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
+                expansion_norm_sq += outputs_a.pow(2).sum(dim=1)
                 outputs_by_layer[layer] = outputs_a
             else:
-                # outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
-                # expansion_norm_sq += outputs_a.pow(2).sum(dim=1)
-                # outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
-                # expansion_norm_sq += outputs_b.pow(2).sum(dim=1)
+                outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
+                expansion_norm_sq += outputs_a.pow(2).sum(dim=1)
+                outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
+                expansion_norm_sq += outputs_b.pow(2).sum(dim=1)
                 outputs_by_layer[layer] = (outputs_a, outputs_b)
 
         expansion_norm_l2 = expansion_norm_sq.sqrt().mean()
@@ -277,7 +277,7 @@ class RHN_Hypernetwork(nn.Module):
             "output_head_l2": output_head_l2.detach(),
             "output_head_norm_l2": output_head_norm_l2.detach(),
             "expansion_l2": expansion_l2.detach(),
-            # "expansion_norm_l2": expansion_norm_l2.detach()
+            "expansion_norm_l2": expansion_norm_l2.detach()
         }
 
         return outputs_by_layer, step_l2, hyper_metrics
@@ -466,7 +466,7 @@ class RHN_ACTV1_Inner(nn.Module):
             "telemetry/output_head_l2": torch.tensor(0.0, device=z_H.device),
             "telemetry/output_head_norm_l2": torch.tensor(0.0, device=z_H.device),
             "telemetry/expansion_l2": torch.tensor(0.0, device=z_H.device),
-            # "telemetry/expansion_norm_l2": torch.tensor(0.0, device=z_H.device)
+            "telemetry/expansion_norm_l2": torch.tensor(0.0, device=z_H.device)
         }
 
         if log_deep_metrics:
@@ -484,7 +484,7 @@ class RHN_ACTV1_Inner(nn.Module):
             total_metrics["telemetry/output_head_l2"] += step_metrics["output_head_l2"]
             total_metrics["telemetry/output_head_norm_l2"] += step_metrics["output_head_norm_l2"]
             total_metrics["telemetry/expansion_l2"] += step_metrics["expansion_l2"]
-            # total_metrics["telemetry/expansion_norm_l2"] += step_metrics["expansion_norm_l2"]
+            total_metrics["telemetry/expansion_norm_l2"] += step_metrics["expansion_norm_l2"]
 
             # Low-Frequency (Every 100 Steps)
             if log_deep_metrics:
