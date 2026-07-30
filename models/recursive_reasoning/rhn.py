@@ -227,7 +227,7 @@ class RHN_Hypernetwork(nn.Module):
                                          self.output_dim,
                                          bias=False)
 
-        self.tanh_scalar_in = nn.Parameter(torch.full((1, self.output_dim), .001, dtype=self.forward_dtype))
+        self.tanh_scalar_in = nn.Parameter(torch.full((1, self.output_dim), .0001, dtype=self.forward_dtype))
 
         # self.tanh_scalar_out = nn.Parameter(torch.full((1, self.output_dim), 1, dtype=self.forward_dtype))
 
