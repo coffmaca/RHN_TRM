@@ -284,7 +284,7 @@ class RHN_Hypernetwork(nn.Module):
         outputs = self.hypernet_base(inputs)
         features = self.output_head_features(outputs)
         features = torch.tanh(features * self.tanh_scalar_in)
-        scale = self.output_head_scale(outputs) * 1000
+        scale = self.output_head_scale(outputs) * 100
         outputs = features * scale
         outputs = self._expand_output(outputs)
 
