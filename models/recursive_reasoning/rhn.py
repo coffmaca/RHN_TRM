@@ -648,10 +648,10 @@ class RHN_ACTV1(nn.Module):
                 # Halt signal
                 # NOTE: During evaluation, always use max steps, this is to guarantee the same halting steps inside a batch for batching purposes
                 
-                if self.config.no_ACT_continue:
-                    halted = halted | (q_halt_logits > 0)
-                else:
-                    halted = halted | (q_halt_logits > q_continue_logits)
+                # if self.config.no_ACT_continue:
+                #     halted = halted | (q_halt_logits > 0)
+                # else:
+                #     halted = halted | (q_halt_logits > q_continue_logits)
 
                 # Exploration
                 min_halt_steps = (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
