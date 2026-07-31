@@ -229,9 +229,10 @@ class RHN_Hypernetwork(nn.Module):
     def forward(self, activations: torch.Tensor) -> Tuple[dict, torch.Tensor, dict]:
         batch_size, seq_len, _ = activations.shape
 
+        activations = rms_norm(activations, variance_epsilon=self.config.rms_norm_eps)
         inputs = self._attention(activations)
 
-        inputs = rms_norm(inputs, variance_epsilon=self.config.rms_norm_eps)
+        # inputs = rms_norm(inputs, variance_epsilon=self.config.rms_norm_eps)
 
         outputs = self.hypernet_base(inputs)
         outputs = self.output_head(outputs)
