@@ -232,7 +232,7 @@ class RHN_Hypernetwork(nn.Module):
         self.adapter_magnitude = nn.Parameter(
             torch.full(
                 (1, self.output_dim),
-                50.0,
+                20.0,
                 dtype=self.forward_dtype
             )
         )
