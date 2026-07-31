@@ -226,7 +226,7 @@ class RHN_Hypernetwork(nn.Module):
                                          self._output_dim(layer_specs),
                                          bias=False)
 
-    def forward(self, activations: torch.Tensor) -> Tuple[dict, torch.Tensor]:
+    def forward(self, activations: torch.Tensor) -> Tuple[dict, torch.Tensor, dict]:
         batch_size, seq_len, _ = activations.shape
 
         inputs = self._attention(activations)
@@ -235,13 +235,19 @@ class RHN_Hypernetwork(nn.Module):
 
         outputs = self.hypernet_base(inputs)
         outputs = self.output_head(outputs)
+        output_head_l2 = outputs.flatten(1).norm(dim=1).mean()
         outputs = rms_norm(outputs, variance_epsilon=self.config.rms_norm_eps)
+        output_head_norm_l2 = outputs.flatten(1).norm(dim=1).mean()
         outputs = self._expand_output(outputs)
+        expansion_l2 = outputs.flatten(1).norm(dim=1).mean()
 
         step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
 
         outputs_by_layer = {}
         output_index = 0
+
+        gen_norm_sq = torch.zeros(batch_size, device=outputs.device)
+
         for layer in self.config_per_layer:
             shape = self.config_per_layer[layer]["shape"]
 
@@ -256,13 +262,25 @@ class RHN_Hypernetwork(nn.Module):
 
             if self.config_per_layer[layer]["type"] == "vector":
                 outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
+                gen_norm_sq += outputs_a.pow(2).flatten(1).sum(dim=1)
                 outputs_by_layer[layer] = outputs_a
             else:
                 outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
+                gen_norm_sq += outputs_a.pow(2).flatten(1).sum(dim=1)
                 outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
+                gen_norm_sq += outputs_b.pow(2).flatten(1).sum(dim=1)
                 outputs_by_layer[layer] = (outputs_a, outputs_b)
 
-        return outputs_by_layer, step_l2
+        gen_norm_l2 = gen_norm_sq.sqrt().mean()
+
+        hyper_metrics = {
+            "output_head_l2": output_head_l2.detach(),
+            "output_head_norm_l2": output_head_norm_l2.detach(),
+            "expansion_l2": expansion_l2.detach(),
+            "gen_norm_l2": gen_norm_l2.detach()
+        }
+
+        return outputs_by_layer, step_l2, hyper_metrics
 
     def _is_vector_like(self, shape:list) -> bool:
         if len(shape) < 2:
@@ -444,12 +462,20 @@ class RHN_ACTV1_Inner(nn.Module):
             "telemetry/act_sparsity": torch.tensor(0.0, device=z_H.device),
             "telemetry/act_saturation": torch.tensor(0.0, device=z_H.device),
             "telemetry/gen_l2_norm": torch.tensor(0.0, device=z_H.device),
-            "telemetry/state_drift": torch.tensor(0.0, device=z_H.device)
+            "telemetry/state_drift": torch.tensor(0.0, device=z_H.device),
+            "telemetry/output_head_l2": torch.tensor(0.0, device=z_H.device),
+            "telemetry/output_head_norm_l2": torch.tensor(0.0, device=z_H.device),
+            "telemetry/expansion_l2": torch.tensor(0.0, device=z_H.device),
+            "telemetry/gen_norm_l2": torch.tensor(0.0, device=z_H.device)
         }
 
         if log_deep_metrics:
             total_metrics["telemetry/gen_svd_ratio"] = torch.tensor(0.0, device=z_H.device)
             total_metrics["telemetry/gen_base_l2_ratio"] = torch.tensor(0.0, device=z_H.device)
+            total_metrics["telemetry/act_norm_input"] = torch.tensor(0.0, device=z_H.device)
+            for i in range(self.config.L_layers):
+                total_metrics[f"telemetry/act_norm_base_layer_{i}"] = torch.tensor(0.0, device=z_H.device)
+                total_metrics[f"telemetry/act_norm_dyn_layer_{i}"] = torch.tensor(0.0, device=z_H.device)
 
         metric_calls = 0
 
@@ -459,11 +485,19 @@ class RHN_ACTV1_Inner(nn.Module):
             total_metrics["telemetry/act_saturation"] += step_metrics["saturation"]
             total_metrics["telemetry/gen_l2_norm"] += step_metrics["gen_norm"]
             total_metrics["telemetry/state_drift"] += F.cosine_similarity(prev_state, new_state, dim=-1).mean()
+            total_metrics["telemetry/output_head_l2"] += step_metrics["output_head_l2"]
+            total_metrics["telemetry/output_head_norm_l2"] += step_metrics["output_head_norm_l2"]
+            total_metrics["telemetry/expansion_l2"] += step_metrics["expansion_l2"]
+            total_metrics["telemetry/gen_norm_l2"] += step_metrics["gen_norm_l2"]
 
             # Low-Frequency (Every 100 Steps)
             if log_deep_metrics:
                 total_metrics["telemetry/gen_svd_ratio"] += step_metrics["svd_ratio"]
                 total_metrics["telemetry/gen_base_l2_ratio"] += step_metrics["gen_base_l2_ratio"]
+                total_metrics["telemetry/act_norm_input"] += step_metrics["act_norm_input"]
+                for i in range(self.config.L_layers):
+                    total_metrics[f"telemetry/act_norm_base_layer_{i}"] += step_metrics[f"act_norm_base_layer_{i}"]
+                    total_metrics[f"telemetry/act_norm_dyn_layer_{i}"] += step_metrics[f"act_norm_dyn_layer_{i}"]
             metric_calls += 1
 
         total_l2 = torch.zeros(z_L.shape[0], device=z_L.device, dtype=z_L.dtype)
@@ -525,23 +559,35 @@ class RHN_ACTV1_Inner(nn.Module):
     def _dynamic_forward(self, z_L, z_H, input_embeddings=None, log_deep_metrics=False, **seq_info) -> Tuple[
         torch.Tensor, torch.Tensor, dict
     ]:
-        h_base = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
-        activations = torch.tensor([], dtype=h_base.dtype, device=h_base.device)
-        # Base model output
-        for layer in self.L_level:
-            layer.clear_dynamic_adapter()
-            h_base = layer(hidden_states=h_base, **seq_info)
-            activations = torch.cat((activations, h_base.detach()),
-                                    dim=2)  # TODO - Determine whether detaching is preferable here.
-
-        # Dynamic weight output
-        h_dyn = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
-        dynamic_weights, step_l2 = self.hypernet(activations)
+        raw_state = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
 
         step_metrics = {}
+
+        if log_deep_metrics:
+            with torch.no_grad():
+                step_metrics["act_norm_input"] = raw_state.float().norm(dim=-1).mean()
+
+        h_base = raw_state
+        activations = torch.tensor([], dtype=h_base.dtype, device=h_base.device)
+        # Base model output
+        for i, layer in enumerate(self.L_level):
+            layer.clear_dynamic_adapter()
+            h_base = layer(hidden_states=h_base, **seq_info)
+            activations = torch.cat((activations, h_base.detach()), dim=2)
+
+            if log_deep_metrics:
+                with torch.no_grad():
+                    step_metrics[f"act_norm_base_layer_{i}"] = h_base.float().norm(dim=-1).mean()
+
+        # Dynamic weight output
+        h_dyn = raw_state
+        dynamic_weights, step_l2, hyper_metrics = self.hypernet(activations)
+
         with torch.no_grad():
             step_metrics["sparsity"] = (h_base.abs() < 1e-3).float().mean()
             step_metrics["saturation"] = (h_base.abs() > 5.0).float().mean()
+
+            step_metrics.update(hyper_metrics)
 
             gen_norm = 0.0
             svd_ratio = 0.0
@@ -585,6 +631,10 @@ class RHN_ACTV1_Inner(nn.Module):
                              f"L_level.{i}" in layer_name]
             layer.set_dynamic_adapter(*layer_weights)
             h_dyn = layer(hidden_states=h_dyn, **seq_info)
+
+            if log_deep_metrics:
+                with torch.no_grad():
+                    step_metrics[f"act_norm_dyn_layer_{i}"] = h_dyn.float().norm(dim=-1).mean()
 
         return h_base + h_dyn, step_l2, step_metrics #, step_kl
 
