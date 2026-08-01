@@ -37,3 +37,4 @@ hypernet_attn: True
 hypernet_attn_type: perceiver
 hypernet_rmsnorm: True
 hypernet_rmsaffine: True
+hypernet_rmsaffine_factor: 1

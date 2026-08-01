@@ -77,6 +77,7 @@ class RHN_ACTV1Config(BaseModel):
     hypernet_attn_type: str
     hypernet_rmsnorm: bool
     hypernet_rmsaffine: bool
+    hypernet_rmsaffine_factor: int
 
 class RHN_ACTV1Block(nn.Module):
     def __init__(self, config: RHN_ACTV1Config, attn: bool = True, attn_type: str = "self",
@@ -361,6 +362,7 @@ class RHN_Hypernetwork(nn.Module):
                     # Initialize B matrices to 0.0 so dynamic output starts safely at zero
                     # nn.init.zeros_(norm_module.weight)
                     trunc_normal_init_(norm_module.weight, std=symmetric_std)
+                    norm_module.weight *= self.config.hypernet_rmsaffine_factor
                 else:
                     # Initialize A matrices (and vectors) to 1.0 unit variance
                     nn.init.ones_(norm_module.weight)
