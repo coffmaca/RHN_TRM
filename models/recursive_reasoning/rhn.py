@@ -71,7 +71,7 @@ class RHN_ACTV1Config(BaseModel):
     kron_dims: int
     kron_dims_mult: bool
     perceiver_heads: int
-    hypernet_l2_lambda: float = 1e-4
+    hypernet_l2_lambda: float
 
     hypernet_attn: bool
     hypernet_attn_type: str

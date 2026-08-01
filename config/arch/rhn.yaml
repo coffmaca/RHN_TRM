@@ -33,6 +33,7 @@ kron_dims: 4
 kron_dims_mult: False
 perceiver_heads: 8
 
+hypernet_l2_lambda: 1e-4
 hypernet_attn: True
 hypernet_attn_type: perceiver
 hypernet_rmsnorm: True
