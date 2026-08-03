@@ -326,6 +326,9 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         hypernet_grad_sq = 0.0
         base_grad_sq = 0.0
 
+        hypernet_pre_weight_sq = 0.0
+        base_pre_weight_sq = 0.0
+
         pre_step_weights = {}
 
         with torch.no_grad():
@@ -335,15 +338,27 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 
                 if param.grad is not None:
                     grad_norm = param.grad.norm().item()
+                    param_norm = param.norm().item()
+
                     captured_metrics[f"telemetry/grad_norm/{name}"] = grad_norm
+
+                    grad_param_ratio = grad_norm / (param_norm + 1e-8)
+                    captured_metrics[f"telemetry/grad_param_norm_ratio/{name}"] = grad_param_ratio
 
                     if "hypernet" in name:
                         hypernet_grad_sq += grad_norm ** 2
+                        hypernet_pre_weight_sq += param_norm ** 2
                     elif "L_level" in name:
                         base_grad_sq += grad_norm ** 2
+                        base_pre_weight_sq += param_norm ** 2
 
             captured_metrics["telemetry/total_grad_norm/hypernetwork"] = math.sqrt(hypernet_grad_sq)
             captured_metrics["telemetry/total_grad_norm/base_model"] = math.sqrt(base_grad_sq)
+
+            captured_metrics["telemetry/total_grad_param_norm_ratio/hypernetwork"] = math.sqrt(hypernet_grad_sq) / (
+                        math.sqrt(hypernet_pre_weight_sq) + 1e-8)
+            captured_metrics["telemetry/total_grad_param_norm_ratio/base_model"] = math.sqrt(base_grad_sq) / (
+                        math.sqrt(base_pre_weight_sq) + 1e-8)
 
     # Apply optimizer
     lr_this_step = None    
@@ -417,10 +432,10 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 
                     for name, param in train_state.model.named_parameters():
                         if param.requires_grad:
-                            reduced_metrics[f"telemetry/static_mean/{name}"] = param.mean().item()
+                            reduced_metrics[f"telemetry/static_abs_mean/{name}"] = param.abs().mean().item()
                             reduced_metrics[f"telemetry/static_std/{name}"] = param.std().item()
 
-                            p_sum = param.sum().item()
+                            p_sum = param.abs().sum().item()
                             p_sq_sum = (param ** 2).sum().item()
                             p_count = param.numel()
 
@@ -436,7 +451,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
                     if hypernet_count > 0:
                         h_mean = hypernet_sum / hypernet_count
                         h_var = (hypernet_sq_sum / hypernet_count) - (h_mean ** 2)
-                        reduced_metrics["telemetry/total_static_mean/hypernetwork"] = h_mean
+                        reduced_metrics["telemetry/total_static_abs_mean/hypernetwork"] = h_mean
                         reduced_metrics["telemetry/total_static_std/hypernetwork"] = math.sqrt(max(h_var, 0.0))
 
                     if base_count > 0:
