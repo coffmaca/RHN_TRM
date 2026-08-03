@@ -87,6 +87,8 @@ class PretrainConfig(pydantic.BaseModel):
     ema_rate: float = 0.999 # EMA-rate
     freeze_weights: bool = False # If True, freeze weights and only learn the embeddings
 
+    grad_clip_factor: float = 0.02
+
 @dataclass
 class TrainState:
     model: nn.Module
@@ -290,6 +292,21 @@ def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetada
 
     return evaluators
 
+
+def adaptive_gradient_clipping(model: nn.Module, clip_ratio: float = 0.01, eps: float = 1e-3):
+    with torch.no_grad():
+        for param in model.parameters():
+            if param.grad is None:
+                continue
+
+            p_norm = param.norm().clamp(min=eps)
+            g_norm = param.grad.norm()
+
+            max_norm = p_norm * clip_ratio
+
+            if g_norm > max_norm:
+                param.grad.mul_(max_norm / g_norm)
+
 def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
     train_state.step += 1
     if train_state.step > train_state.total_steps:  # At most train_total_steps
@@ -320,6 +337,8 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         for param in train_state.model.parameters():
             if param.grad is not None:
                 dist.all_reduce(param.grad)
+
+    adaptive_gradient_clipping(train_state.model, clip_ratio=config.grad_clip_factor)
 
     captured_metrics = {}
     if rank == 0 and log_deep_metrics:
