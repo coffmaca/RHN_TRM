@@ -87,6 +87,47 @@ class PretrainConfig(pydantic.BaseModel):
     ema_rate: float = 0.999 # EMA-rate
     freeze_weights: bool = False # If True, freeze weights and only learn the embeddings
 
+    gradient_clip_ema_tolerance: float = 4.0
+
+
+class GradientClipperEMA:
+    def __init__(self, ema_decay: float = 0.99, spike_tolerance: float = 3.0, min_ratio: float = 0.02):
+        self.ema_decay = ema_decay
+        self.spike_tolerance = spike_tolerance
+        self.min_ratio = min_ratio
+        self.ema_ratios = {}
+
+    def __call__(self, model: nn.Module):
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if param.grad is None:
+                    continue
+
+                p_norm = param.norm().item()
+                g_norm = param.grad.norm().item()
+
+                if p_norm < 1e-8:
+                    continue
+
+                current_ratio = g_norm / p_norm
+
+                if name not in self.ema_ratios:
+                    self.ema_ratios[name] = current_ratio
+                    continue
+
+                ema = self.ema_ratios[name]
+
+                threshold = max(self.min_ratio, ema) * self.spike_tolerance
+
+                if current_ratio > threshold:
+                    clip_factor = threshold / current_ratio
+                    param.grad.mul_(clip_factor)
+
+                    current_ratio = threshold
+
+                # Update the EMA tracking
+                self.ema_ratios[name] = self.ema_decay * ema + (1 - self.ema_decay) * current_ratio
+
 @dataclass
 class TrainState:
     model: nn.Module
@@ -96,6 +137,8 @@ class TrainState:
 
     step: int
     total_steps: int
+
+    grad_clipper_ema: Any = None
 
 
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
@@ -232,7 +275,11 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
         model=model,
         optimizers=optimizers,
         optimizer_lrs=optimizer_lrs,
-        carry=None
+        carry=None,
+
+        grad_clipper_ema = GradientClipperEMA(ema_decay=0.99,
+                                              spike_tolerance=config.gradient_clip_ema_tolerance,
+                                              min_ratio=0.02)
     )
 
 
