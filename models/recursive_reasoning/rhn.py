@@ -69,7 +69,8 @@ class RHN_ACTV1Config(BaseModel):
     hypernet_rank: int
     layer_emb_dim: int
     hypernet_relative_scale: float
-    perceiver_rank: int
+    kron_dims: int
+    kron_dims_mult: bool
     perceiver_heads: int
     hypernet_relative_scale: int
     hypernet_l2_lambda: float = 1e-4
@@ -199,11 +200,17 @@ class RHN_Hypernetwork(nn.Module):
         embed_init_std = 1.0 / self.embed_scale
 
         self.input_size = self.config.hidden_size * self.config.L_layers
+        self.num_layers = len(self.layer_specs)
 
-        self.perceiver_queries = nn.Parameter(
+        if self.config.kron_dims_mult:
+            self.num_queries = self.num_layers * self.config.kron_dims
+        else:
+            self.num_queries = self.config.kron_dims
+
+        self.input_queries = nn.Parameter(
             trunc_normal_init_(
-                torch.empty((1, self.config.perceiver_rank, self.input_size), dtype=self.forward_dtype),
-                std=embed_init_std
+                torch.empty((1, self.num_queries, self.input_size), dtype=self.forward_dtype),
+                std=1.0 / math.sqrt(self.config.hypernet_hidden_size),
             )
         )
 
@@ -227,7 +234,7 @@ class RHN_Hypernetwork(nn.Module):
                                          self.output_dim,
                                          bias=False)
 
-        self.post_output_head_norm = nn.RMSNorm([self.config.perceiver_rank, self.output_dim],
+        self.post_output_head_norm = nn.RMSNorm([self.num_queries, self.output_dim],
                                                 eps=self.config.rms_norm_eps,
                                                 elementwise_affine=False)
 
@@ -288,17 +295,18 @@ class RHN_Hypernetwork(nn.Module):
         step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
 
         outputs_by_layer = {}
-        output_index = 0
 
         gen_norm_sq = torch.zeros(batch_size, device=outputs.device)
 
-        for layer in self.config_per_layer:
-            layer_name = layer
-            layer_info = self.config_per_layer[layer]
-            shape = self.config_per_layer[layer]["shape"]
+        for i, (layer_name, layer_info) in enumerate(self.config_per_layer.items()):
+            shape = layer_info["shape"]
             safe_name = layer_name.replace(".", "_")
+            layer_params = outputs[:, i, :]  # Shape: (B, kron_dim^4)
 
-            outputs_a = outputs[:, output_index : output_index + (shape[0] * self.config.hypernet_rank)]
+            output_index = 0
+
+            size_a = shape[0] * self.config.hypernet_rank
+            outputs_a = layer_params[:, output_index: output_index + size_a]
 
             if layer_info["type"] == "matrix":
                 outputs_a = self.lora_norms[f"{safe_name}_A"](outputs_a)
@@ -308,31 +316,22 @@ class RHN_Hypernetwork(nn.Module):
             gen_norm_sq += outputs_a.pow(2).sum(dim=1)
 
             outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
+            output_index += size_a
 
-            # if layer_info["type"] == "matrix":
-            #     outputs_a = self.lora_norms[f"{safe_name}_A"](outputs_a)
-            # else:
-            #     outputs_a = self.lora_norms[f"{safe_name}"](outputs_a)
-
-            output_index += shape[0] * self.config.hypernet_rank
-
-            if self.config_per_layer[layer]["type"] == "matrix":
-                outputs_b = outputs[:, output_index : output_index + (shape[1] * self.config.hypernet_rank)]
+            if layer_info["type"] == "matrix":
+                size_b = shape[1] * self.config.hypernet_rank
+                outputs_b = layer_params[:, output_index: output_index + size_b]
                 outputs_b = self.lora_norms[f"{safe_name}_B"](outputs_b)
 
                 gen_norm_sq += outputs_b.pow(2).sum(dim=1)
 
                 outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
-                # outputs_b = self.lora_norms[f"{safe_name}_B"](outputs_b)
-                output_index += shape[1] * self.config.hypernet_rank
 
-            if self.config_per_layer[layer]["type"] == "vector":
-                # outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
-                outputs_by_layer[layer] = outputs_a
+                output_index += size_b
+
+                outputs_by_layer[layer_name] = (outputs_a, outputs_b)
             else:
-                # outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
-                # outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
-                outputs_by_layer[layer] = (outputs_a, outputs_b)
+                outputs_by_layer[layer_name] = outputs_a
 
         gen_norm_l2 = gen_norm_sq.sqrt().mean()
 
@@ -359,31 +358,35 @@ class RHN_Hypernetwork(nn.Module):
         else:
             return True
 
-    # TODO - Make this dynamic / tunable for larger base models, to ensure appropriate hypernetwork scaling.
-    def _output_dim(self, layer_specs:dict) -> int:
-        base_param_dim_sum = 0
-        base_param_total = 0
-        for layer in layer_specs:
-            rows, cols = layer[1]
-            base_param_dim_sum += rows + cols
-            base_param_total += rows * cols
+    def _output_dim(self, layer_specs: dict) -> int:
+        max_params = 0
 
-        base_param_total_low_rank = base_param_dim_sum * self.config.hypernet_rank
+        # Identify the largest layer param count (handling both matrix and vector cases)
+        for name, shape in layer_specs:
+            if self._is_vector_like(shape):
+                params = shape[0] * self.config.hypernet_rank
+            else:
+                params = (shape[0] + shape[1]) * self.config.hypernet_rank
 
-        self.kron_dim = int(
-            -(-base_param_total_low_rank ** (1 / 4) // 1))  # Square root twice (i.e., 1/4th root) and round up
+            if params > max_params:
+                max_params = params
 
-        vals_to_generate = math.ceil((self.kron_dim ** 2 * 2) / self.config.perceiver_rank)
+        self.kron_dim = int(math.ceil(max_params ** 0.25))
 
-        return vals_to_generate
+        elements_per_matrix = self.kron_dim ** 2
+        total_elements_needed = self.num_layers * 2 * elements_per_matrix
+
+        output_dim = int(math.ceil(total_elements_needed / self.num_queries))
+
+        return output_dim
 
     def _attention(self, inputs) -> torch.Tensor:
         B, S, D = inputs.shape
         H = self.config.perceiver_heads
-        Q = self.config.perceiver_rank
+        Q = self.num_queries
         head_dim = D // H
 
-        q = self.perceiver_queries.view(1, Q, H, head_dim).transpose(1, 2)
+        q = self.input_queries.view(1, Q, H, head_dim).transpose(1, 2)
         k = inputs.view(B, S, H, head_dim).transpose(1, 2)
         v = inputs.view(B, S, H, head_dim).transpose(1, 2)
 
@@ -394,15 +397,40 @@ class RHN_Hypernetwork(nn.Module):
 
         return pooled_inputs
 
-    def _expand_output(self, outputs) -> torch.Tensor:
+    def _expand_output(self, outputs: torch.Tensor) -> torch.Tensor:
         batch_size = outputs.shape[0]
-        outputs = outputs.reshape(batch_size, -1)  # Collapse perceiver rank dimension
-        used_outputs_a = outputs[..., :self.kron_dim ** 2]
-        used_outputs_a = used_outputs_a.unsqueeze(-1).view(-1, self.kron_dim, self.kron_dim)
-        used_outputs_b = outputs[..., self.kron_dim ** 2: self.kron_dim ** 2 * 2]
-        used_outputs_b = used_outputs_b.unsqueeze(-1).view(-1, self.kron_dim, self.kron_dim)
-        expanded_outputs = torch.einsum('bij,bkl->bikjl', used_outputs_a, used_outputs_b)
-        outputs = expanded_outputs.flatten(start_dim=1, end_dim=-1)
+        output_dim = outputs.shape[-1]
+
+        # 1) Flatten outputs to a single 1D vector per batch (batch_size, num_queries * output_dim)
+        outputs = outputs.flatten(start_dim=1)
+
+        # 2) Calculate exact total elements needed
+        needed_elements_per_matrix = self.kron_dim ** 2
+        needed_elements_per_layer = 2 * needed_elements_per_matrix
+        total_needed = self.num_layers * needed_elements_per_layer
+
+        # 3) Slice away any trailing padded elements from the math.ceil operation
+        outputs = outputs[:, :total_needed]
+
+        # 4) Reshape seamlessly into (batch, num_layers, 2 (for A and B matrices), needed_elements)
+        outputs = outputs.reshape(batch_size, self.num_layers, 2, needed_elements_per_matrix)
+
+        outputs_a = outputs[:, :, 0, :]
+        outputs_b = outputs[:, :, 1, :]
+
+        # Normalize each factor individually
+        outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
+        outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
+
+        # 4) Reshape such that the final two dimensions are equal (kron_dim, kron_dim)
+        outputs_a = outputs_a.reshape(batch_size, self.num_layers, self.kron_dim, self.kron_dim)
+        outputs_b = outputs_b.reshape(batch_size, self.num_layers, self.kron_dim, self.kron_dim)
+
+        # 5) Multiply via Kronecker product dynamically per layer (b=batch, l=layer)
+        expanded_outputs = torch.einsum('blij,blkm->blikjm', outputs_a, outputs_b)
+
+        # Flatten spatial dims to produce the final populated LoRA values: (batch, num_layers, kron_dim^4)
+        outputs = expanded_outputs.flatten(start_dim=2, end_dim=-1)
 
         return outputs
 
