@@ -368,6 +368,9 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             if param.grad is not None:
                 dist.all_reduce(param.grad)
 
+    if train_state.grad_clipper_ema is not None:
+        train_state.grad_clipper_ema(train_state.model)
+
     captured_metrics = {}
     if rank == 0 and log_deep_metrics:
         hypernet_grad_sq = 0.0
