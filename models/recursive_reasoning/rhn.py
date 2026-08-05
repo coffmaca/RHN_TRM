@@ -278,7 +278,34 @@ class RHN_Hypernetwork(nn.Module):
         else:
             return True
 
-    # TODO - Make this dynamic / tunable for larger base models, to ensure appropriate hypernetwork scaling.
+    def get_low_rank_factors(self, base_param_total_low_rank: int) -> list:
+        if base_param_total_low_rank < 4:
+            raise ValueError("Input must be a positive integer >= 4.")
+
+        def get_factors_if_valid(d):
+            factors = []
+            n = d
+            while n % 2 == 0:
+                factors.append(2)
+                n //= 2
+            while n % 3 == 0:
+                factors.append(3)
+                n //= 3
+            if n > 1:
+                if 3 < n < 10:
+                    factors.append(n)
+                else:
+                    return None
+            return factors
+
+        target_dim = math.ceil(math.sqrt(base_param_total_low_rank))
+
+        while True:
+            factors = get_factors_if_valid(target_dim)
+            if factors is not None:
+                return factors
+            target_dim += 1
+
     def _output_dim(self, layer_specs:dict) -> int:
         base_param_dim_sum = 0
         base_param_total = 0
@@ -289,10 +316,11 @@ class RHN_Hypernetwork(nn.Module):
 
         base_param_total_low_rank = base_param_dim_sum * self.config.hypernet_rank
 
-        self.kron_dim = int(
-            -(-base_param_total_low_rank ** (1 / 4) // 1))  # Square root twice (i.e., 1/4th root) and round up
+        self.kron_factors = self.get_low_rank_factors(base_param_total_low_rank)
 
-        vals_to_generate = math.ceil((self.kron_dim ** 2 * 2) / self.config.perceiver_rank)
+        # The total amount of elements the hypernet needs to generate is the sum of the square of each factor
+        total_factor_elements = sum(f ** 2 for f in self.kron_factors)
+        vals_to_generate = math.ceil(total_factor_elements / self.config.perceiver_rank)
 
         return vals_to_generate
 
@@ -316,12 +344,29 @@ class RHN_Hypernetwork(nn.Module):
     def _expand_output(self, outputs) -> torch.Tensor:
         batch_size = outputs.shape[0]
         outputs = outputs.reshape(batch_size, -1)  # Collapse perceiver rank dimension
-        used_outputs_a = outputs[..., :self.kron_dim ** 2]
-        used_outputs_a = used_outputs_a.unsqueeze(-1).view(-1, self.kron_dim, self.kron_dim)
-        used_outputs_b = outputs[..., self.kron_dim ** 2: self.kron_dim ** 2 * 2]
-        used_outputs_b = used_outputs_b.unsqueeze(-1).view(-1, self.kron_dim, self.kron_dim)
-        expanded_outputs = torch.einsum('bij,bkl->bikjl', used_outputs_a, used_outputs_b)
-        outputs = expanded_outputs.flatten(start_dim=1, end_dim=-1)
+
+        idx = 0
+        expanded = None
+
+        for f in self.kron_factors:
+            elements = f ** 2
+
+            # Slice out the values needed for this factor in the sequence
+            factor_tensor = outputs[..., idx : idx + elements].view(batch_size, f, f)
+            idx += elements
+
+            if expanded is None:
+                expanded = factor_tensor
+            else:
+                # Multiply the accumulated tensor with the current factor
+                expanded = torch.einsum('bij,bkl->bikjl', expanded, factor_tensor)
+
+                # Reshape back into a single 2D block matrix (plus batch dimension)
+                H1, H2 = expanded.shape[1], expanded.shape[2]
+                W1, W2 = expanded.shape[3], expanded.shape[4]
+                expanded = expanded.reshape(batch_size, H1 * H2, W1 * W2)
+
+        outputs = expanded.flatten(start_dim=1, end_dim=-1)
 
         return outputs
 
