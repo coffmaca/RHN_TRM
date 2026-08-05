@@ -307,6 +307,8 @@ class RHN_Hypernetwork(nn.Module):
 
             expansion_norm_sq += outputs_a.pow(2).sum(dim=1)
 
+            outputs_a = torch.tanh(outputs_a * 0.5)
+
             outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
 
             # if layer_info["type"] == "matrix":
@@ -321,6 +323,8 @@ class RHN_Hypernetwork(nn.Module):
                 outputs_b = self.lora_norms[f"{safe_name}_B"](outputs_b)
 
                 expansion_norm_sq += outputs_b.pow(2).sum(dim=1)
+
+                outputs_b = torch.tanh(outputs_b * 0.5)
 
                 outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
                 # outputs_b = self.lora_norms[f"{safe_name}_B"](outputs_b)
