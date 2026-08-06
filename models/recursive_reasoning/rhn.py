@@ -232,6 +232,7 @@ class RHN_Hypernetwork(nn.Module):
         #                                         elementwise_affine=False)
 
         self.lora_norms = nn.ModuleDict()
+        self.lora_scalars = nn.ParameterDict()
 
         for name, shape in self.layer_specs:
             safe_name = name.replace(".", "_")
@@ -241,6 +242,9 @@ class RHN_Hypernetwork(nn.Module):
                 self.lora_norms[f"{safe_name}"] = nn.RMSNorm(size, # self.config.hypernet_rank, #
                                                              eps=self.config.rms_norm_eps,
                                                              elementwise_affine=False).to(dtype=self.forward_dtype)
+                self.lora_scalars[f"{safe_name}"] = nn.Parameter(
+                    torch.ones((1, size_a), dtype=self.forward_dtype)
+                )
             else:
                 size_a = shape[0] * self.config.hypernet_rank
                 size_b = shape[1] * self.config.hypernet_rank
@@ -251,6 +255,12 @@ class RHN_Hypernetwork(nn.Module):
                 self.lora_norms[f"{safe_name}_B"] = nn.RMSNorm(size_b, # shape[1], #
                                                                eps=self.config.rms_norm_eps,
                                                                elementwise_affine=False).to(dtype=self.forward_dtype)
+                self.lora_scalars[f"{safe_name}_A"] = nn.Parameter(
+                    torch.ones((1, size_a), dtype=self.forward_dtype)
+                )
+                self.lora_scalars[f"{safe_name}_B"] = nn.Parameter(
+                    torch.ones((1, size_b), dtype=self.forward_dtype)
+                )
 
         # with torch.no_grad():
         #     target_variance = 1.0 / self.config.hidden_size
@@ -309,6 +319,11 @@ class RHN_Hypernetwork(nn.Module):
 
             outputs_a = torch.tanh(outputs_a * 0.5)
 
+            if layer_info["type"] == "matrix":
+                outputs_a = self.lora_scalars[f"{safe_name}_A"] * outputs_a
+            else:
+                outputs_a = self.lora_scalars[f"{safe_name}"] * outputs_a
+
             outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
 
             # if layer_info["type"] == "matrix":
@@ -325,6 +340,8 @@ class RHN_Hypernetwork(nn.Module):
                 expansion_norm_sq += outputs_b.pow(2).sum(dim=1)
 
                 outputs_b = torch.tanh(outputs_b * 0.5)
+
+                outputs_b = self.lora_scalars[f"{safe_name}_B"] * outputs_b
 
                 outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
                 # outputs_b = self.lora_norms[f"{safe_name}_B"](outputs_b)
