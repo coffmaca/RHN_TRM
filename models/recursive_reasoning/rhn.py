@@ -243,7 +243,7 @@ class RHN_Hypernetwork(nn.Module):
                                                              eps=self.config.rms_norm_eps,
                                                              elementwise_affine=False).to(dtype=self.forward_dtype)
                 self.lora_scalars[f"{safe_name}"] = nn.Parameter(
-                    torch.zeros((1, size), dtype=self.forward_dtype)
+                    torch.full((1, size), 2.0, dtype=self.forward_dtype)
                 )
             else:
                 size_a = shape[0] * self.config.hypernet_rank
@@ -256,10 +256,10 @@ class RHN_Hypernetwork(nn.Module):
                                                                eps=self.config.rms_norm_eps,
                                                                elementwise_affine=False).to(dtype=self.forward_dtype)
                 self.lora_scalars[f"{safe_name}_A"] = nn.Parameter(
-                    torch.zeros((1, size_a), dtype=self.forward_dtype)
+                    torch.full((1, size_a), 2.0, dtype=self.forward_dtype)
                 )
                 self.lora_scalars[f"{safe_name}_B"] = nn.Parameter(
-                    torch.zeros((1, size_b), dtype=self.forward_dtype)
+                    torch.full((1, size_b), 2.0, dtype=self.forward_dtype)
                 )
 
         # with torch.no_grad():
@@ -320,9 +320,9 @@ class RHN_Hypernetwork(nn.Module):
             outputs_a = torch.tanh(outputs_a * 0.5)
 
             if layer_info["type"] == "matrix":
-                outputs_a = (F.softplus(self.lora_scalars[f"{safe_name}_A"]) + 1.0) * outputs_a
+                outputs_a = F.softplus(self.lora_scalars[f"{safe_name}_A"]) * outputs_a
             else:
-                outputs_a = (F.softplus(self.lora_scalars[f"{safe_name}"]) + 1.0) * outputs_a
+                outputs_a = F.softplus(self.lora_scalars[f"{safe_name}"]) * outputs_a
 
             outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
 
@@ -341,7 +341,7 @@ class RHN_Hypernetwork(nn.Module):
 
                 outputs_b = torch.tanh(outputs_b * 0.5)
 
-                outputs_b = self.lora_scalars[f"{safe_name}_B"] * outputs_b
+                outputs_b = F.softplus(self.lora_scalars[f"{safe_name}_B"]) * outputs_b
 
                 outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
                 # outputs_b = self.lora_norms[f"{safe_name}_B"](outputs_b)
