@@ -341,7 +341,7 @@ class RHN_Hypernetwork(nn.Module):
 
                 outputs_b = torch.tanh(outputs_b * 0.5)
 
-                outputs_b = self.lora_scalars[f"{safe_name}_B"] * outputs_b
+                outputs_b = (F.softplus(self.lora_scalars[f"{safe_name}_B"]) + 1.0)  * outputs_b
 
                 outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
                 # outputs_b = self.lora_norms[f"{safe_name}_B"](outputs_b)
