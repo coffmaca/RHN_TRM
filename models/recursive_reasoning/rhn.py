@@ -243,7 +243,7 @@ class RHN_Hypernetwork(nn.Module):
                                                              eps=self.config.rms_norm_eps,
                                                              elementwise_affine=False).to(dtype=self.forward_dtype)
                 self.lora_scalars[f"{safe_name}"] = nn.Parameter(
-                    torch.ones((1, size_a), dtype=self.forward_dtype)
+                    torch.ones((1, size), dtype=self.forward_dtype)
                 )
             else:
                 size_a = shape[0] * self.config.hypernet_rank
