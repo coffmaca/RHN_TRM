@@ -460,17 +460,19 @@ class RHN_ACTV1_Inner(nn.Module):
 
         self.hypernet = RHN_Hypernetwork(self.config, self.layer_specs)
 
-        # Parallel Stream Temporal Iteration Mixer (mHC-lite)
-        self.mhc_mixer = MHCLiteMixer(num_streams=self.config.mhc_window_size)
-
         # Unified Initial State (Now dynamically tracked as K streams)
         self.Z_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.mhc_window_size, self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
 
-        self.mhc_pre = nn.Parameter(torch.zeros(self.config.mhc_window_size, dtype=self.forward_dtype))
-        self.mhc_pre.data[0] = 1.0  # Initialize to extract stream 0
+        self.mhc_mixer_iter = MHCLiteMixer(num_streams=self.config.mhc_window_size)
+        self.mhc_pre_iter = nn.Parameter(torch.zeros(self.config.mhc_window_size, dtype=self.forward_dtype))
+        self.mhc_pre_iter.data[0] = 1.0  # Extract stream 0 for the Hypernetwork context
 
-        self.mhc_post = nn.Parameter(torch.zeros(self.config.mhc_window_size, dtype=self.forward_dtype))
-        self.mhc_post.data[0] = 1.0  # Initialize to inject back to stream 0
+        # --- 2. Layer-Level mHC (Spatial Routing) ---
+        self.mhc_mixer_layer = MHCLiteMixer(num_streams=self.config.mhc_window_size)
+        self.mhc_pre_layer = nn.Parameter(torch.zeros(self.config.mhc_window_size, dtype=self.forward_dtype))
+        self.mhc_pre_layer.data[0] = 1.0  # Extract stream 0 for the base layers
+        self.mhc_post_layer = nn.Parameter(torch.zeros(self.config.mhc_window_size, dtype=self.forward_dtype))
+        self.mhc_post_layer.data[0] = 1.0  # Inject layer delta back to stream 0
 
         with torch.no_grad():
             self.q_head.weight.zero_()
@@ -620,9 +622,18 @@ class RHN_ACTV1_Inner(nn.Module):
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), avg_l2, total_metrics
 
     def _dynamic_forward(self, z_local: torch.Tensor, log_deep_metrics: bool = False, **seq_info) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-        z_local_mixed = self.mhc_mixer(z_local)
-        z_in = torch.einsum('k, bksd -> bsd', self.mhc_pre.to(self.forward_dtype), z_local_mixed)
+        # ------------------------------------------------------------------
+        # 1. Iteration-Level mHC (Temporal Routing)
+        # ------------------------------------------------------------------
+        # Mix the temporal manifold at the start of the iteration
+        z_iter_mixed = self.mhc_mixer_iter(z_local)
 
+        # Extract the global context vector for the Hypernetwork
+        z_in = torch.einsum('k, bksd -> bsd', self.mhc_pre_iter.to(self.forward_dtype), z_iter_mixed)
+
+        # ------------------------------------------------------------------
+        # 2. Hypernetwork Pass
+        # ------------------------------------------------------------------
         dynamic_weights, step_l2, hyper_metrics = self.hypernet(z_in, **seq_info)
 
         step_metrics = {}
@@ -665,22 +676,37 @@ class RHN_ACTV1_Inner(nn.Module):
                 step_metrics["svd_ratio"] = (svd_ratio / count) if count > 0 else torch.tensor(0.0, device=z_local.device)
                 step_metrics["gen_base_l2_ratio"] = (gen_base_l2_ratio / count) if count > 0 else torch.tensor(0.0, device=z_local.device)
 
-        prev_layer_z = z_in
-        new_layer_z = z_in
+        # ------------------------------------------------------------------
+        # 3. Base Model Spatial Passes (Layer-Level mHC)
+        # ------------------------------------------------------------------
+        z_layer_manifold = z_iter_mixed
+        new_layer_z = z_in # Safe fallback if L_layers == 0
 
-        for i, layer in enumerate(self.L_level):
-            layer.set_dynamic_adapter(dynamic_weights, layer_idx=i)
-            new_layer_z = layer(hidden_states=prev_layer_z, **seq_info)
+        if len(self.L_level) > 0:
+            # Initial Spatial Mix (Pipelined optimization)
+            z_layer_mixed = self.mhc_mixer_layer(z_layer_manifold)
 
-            y_t = new_layer_z - prev_layer_z
+            for i, layer in enumerate(self.L_level):
+                layer.set_dynamic_adapter(dynamic_weights, layer_idx=i)
 
-            z_local = z_local_mixed + torch.einsum('k, bsd -> bksd', self.mhc_post.to(self.forward_dtype), y_t)
+                # Spatial Pre-Mapping
+                prev_layer_z = torch.einsum('k, bksd -> bsd', self.mhc_pre_layer.to(self.forward_dtype), z_layer_mixed)
 
-            if i < len(self.L_level) - 1:
-                z_local_mixed = self.mhc_mixer(z_local)
-                prev_layer_z = torch.einsum('k, bksd -> bsd', self.mhc_pre.to(self.forward_dtype), z_local_mixed)
+                # Active Transformation
+                new_layer_z = layer(hidden_states=prev_layer_z, **seq_info)
 
-        return z_local, z_in, new_layer_z, step_l2, step_metrics
+                # Delta Update
+                y_t = new_layer_z - prev_layer_z
+
+                # Spatial Post-Mapping: Broadcast the delta back to the manifold
+                z_layer_manifold = z_layer_mixed + torch.einsum('k, bsd -> bksd', self.mhc_post_layer.to(self.forward_dtype), y_t)
+
+                # Prepare the next mixed state ONLY if there is another layer coming
+                if i < len(self.L_level) - 1:
+                    z_layer_mixed = self.mhc_mixer_layer(z_layer_manifold)
+
+        # The globally updated manifold automatically becomes the base state for the next temporal iteration
+        return z_layer_manifold, z_in, new_layer_z, step_l2, step_metrics
 
 
 class RHN_ACTV1(nn.Module):
