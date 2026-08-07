@@ -37,3 +37,5 @@ hypernet_attn: True
 hypernet_attn_type: self
 hypernet_rmsnorm: True
 hypernet_rmsaffine: True
+
+mhc_window_size: 4
