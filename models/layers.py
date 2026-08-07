@@ -14,20 +14,16 @@ from torch.nn.functional import scaled_dot_product_attention
 
 from models.common import trunc_normal_init_
 
-
 CosSin = Tuple[torch.Tensor, torch.Tensor]
-
 
 def _find_multiple(a, b):
     return (-(a // -b)) * b
-
 
 def rotate_half(x: torch.Tensor):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
-
 
 def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
     # q, k: [bs, seq_len, num_heads, head_dim]
@@ -41,6 +37,12 @@ def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, si
 
     return q_embed.to(orig_dtype), k_embed.to(orig_dtype)
 
+def rms_norm(hidden_states: torch.Tensor, variance_epsilon: float) -> torch.Tensor:
+    input_dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(torch.float32)
+    variance = hidden_states.square().mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + variance_epsilon)
+    return hidden_states.to(input_dtype)
 
 class DynamicCastedLinear(nn.Module):
     def __init__(self,
@@ -50,11 +52,10 @@ class DynamicCastedLinear(nn.Module):
         super().__init__()
         # Truncated LeCun normal init
         self.weight = nn.Parameter(trunc_normal_init_(torch.empty((out_features, in_features)), std=1.0 / (in_features ** 0.5)))
-        self.bias = None
-        if bias:
-            # Zero init bias
-            self.bias = nn.Parameter(torch.zeros((out_features, )))
+        self.bias = nn.Parameter(torch.zeros((out_features, ))) if bias else None
 
+        # DoRA Magnitude Parameter
+        self.m = nn.Parameter(torch.ones(out_features))
         self.dynamic_adapter = None
 
     def set_dynamic_adapter(self, A, B):
@@ -64,29 +65,26 @@ class DynamicCastedLinear(nn.Module):
         self.dynamic_adapter = None
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if self.dynamic_adapter is None: # Base Out
-            return F.linear(input, self.weight.to(input.dtype), bias=self.bias.to(input.dtype) if self.bias is not None else None)
-        else: # Dynamic Out (using low-rank matrices)
-            A, B = self.dynamic_adapter
+        # Base Path
+        base_out = F.linear(input, self.weight.to(input.dtype), bias=self.bias.to(input.dtype) if self.bias is not None else None)
 
-            if input.dim() == 2:
-                input_reshaped = input.unsqueeze(1)  # [Batch, 1, In]
-            else:
-                input_reshaped = input
+        if self.dynamic_adapter is None:
+            return base_out
 
-            out = torch.einsum('abc,adc->abd', input, B.to(input.dtype)) # torch.matmul(input, B)
-            out = torch.einsum('abd,aed->abe', out, A.to(input.dtype)) # torch.matmul(out, A)
+        A, B = self.dynamic_adapter
 
-            in_features = input_reshaped.shape[-1]
-            rank = B.shape[1]
-            var_scale = math.sqrt(in_features * rank)
+        # Dynamic Path using Einsum
+        out = torch.einsum('abc,adc->abd', input, B.to(input.dtype))
+        out = torch.einsum('abd,aed->abe', out, A.to(input.dtype))
 
-            out = out / var_scale
+        # DoRA Directional Normalization
+        out = rms_norm(out, variance_epsilon=1e-5)
 
-            if input.dim() == 2:
-                out = out.squeeze(1)
+        # DoRA Magnitude Scaling
+        out = out * self.m.to(input.dtype).view(1, 1, -1)
 
-            return out
+        # Unified Residual Addition
+        return base_out + out
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -103,18 +101,11 @@ class CastedLinear(nn.Module):
                  out_features: int,
                  bias: bool):
         super().__init__()
-        # Truncated LeCun normal init
-        self.weight = nn.Parameter(
-            trunc_normal_init_(torch.empty((out_features, in_features)), std=1.0 / (in_features ** 0.5))
-        )
-        self.bias = None
-        if bias:
-            # Zero init bias
-            self.bias = nn.Parameter(torch.zeros((out_features, )))
+        self.weight = nn.Parameter(trunc_normal_init_(torch.empty((out_features, in_features)), std=1.0 / (in_features ** 0.5)))
+        self.bias = nn.Parameter(torch.zeros((out_features, ))) if bias else None
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return F.linear(input, self.weight.to(input.dtype), bias=self.bias.to(input.dtype) if self.bias is not None else None)
-
 
 class CastedParameter(nn.Module):
     def __init__(self,
@@ -131,7 +122,6 @@ class CastedParameter(nn.Module):
 
     def forward(self) -> torch.Tensor:
         return self.parameter_weight.to(self.cast_to)
-
 
 class CastedEmbedding(nn.Module):
     def __init__(self,
@@ -353,11 +343,3 @@ class SwiGLU(nn.Module):
     def forward(self, x):
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
         return self.down_proj(F.silu(gate) * up)
-
-def rms_norm(hidden_states: torch.Tensor, variance_epsilon: float) -> torch.Tensor:
-    input_dtype = hidden_states.dtype
-    hidden_states = hidden_states.to(torch.float32)
-
-    variance = hidden_states.square().mean(-1, keepdim=True)
-    hidden_states = hidden_states * torch.rsqrt(variance + variance_epsilon)
-    return hidden_states.to(input_dtype)

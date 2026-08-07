@@ -1,5 +1,6 @@
 from typing import Tuple, List, Dict, Optional
 from dataclasses import dataclass
+import itertools
 import math
 import torch
 import copy
@@ -18,19 +19,15 @@ IGNORE_LABEL_ID = -100
 
 @dataclass
 class RHN_ACTV1InnerCarry:
-    z_H: torch.Tensor
-    z_L: torch.Tensor
-
+    z: torch.Tensor
+    inner_steps: torch.Tensor
 
 @dataclass
 class RHN_ACTV1Carry:
     inner_carry: RHN_ACTV1InnerCarry
-    
     steps: torch.Tensor
     halted: torch.Tensor
-    
     current_data: Dict[str, torch.Tensor]
-
 
 class RHN_ACTV1Config(BaseModel):
     batch_size: int
@@ -78,6 +75,52 @@ class RHN_ACTV1Config(BaseModel):
     hypernet_rmsnorm: bool
     hypernet_rmsaffine: bool
 
+    # Size of the parallel residual streams for mHC-lite
+    mhc_window_size: int = 4
+
+
+class MHCLiteMixer(nn.Module):
+    """Generates a Doubly Stochastic Matrix to safely mix parallel residual streams."""
+    def __init__(self, num_streams: int):
+        super().__init__()
+        self.num_streams = num_streams
+
+        # Generate all permutations for the given number of streams
+        perms = list(itertools.permutations(range(num_streams)))
+        self.num_perms = len(perms)
+
+        # Create the permutation matrices
+        # Shape: (num_perms, num_streams, num_streams)
+        perm_matrices = torch.zeros(self.num_perms, num_streams, num_streams)
+        for i, p in enumerate(perms):
+            for j, val in enumerate(p):
+                perm_matrices[i, j, val] = 1.0
+
+        # Register as a buffer so it automatically moves to the correct device
+        self.register_buffer("perm_matrices", perm_matrices)
+
+        # Learnable logits for the convex combination
+        self.logits = nn.Parameter(torch.zeros(self.num_perms))
+
+    def forward(self, streams: torch.Tensor) -> torch.Tensor:
+        # streams shape: [Batch, Streams, Seq, Dim]
+
+        # 1. Softmax to get valid Birkhoff-von Neumann convex coefficients
+        weights = F.softmax(self.logits, dim=0)
+
+        # 2. Combine permutation matrices: W_mix = sum(w_i * P_i)
+        # w_mix shape: [Streams, Streams]
+        w_mix = torch.tensordot(weights, self.perm_matrices.to(weights.dtype), dims=([0], [0]))
+
+        # 3. Mix the streams
+        # 'ij' is the mixing matrix [Out_Stream, In_Stream]
+        # 'bjkl' is the batch data [Batch, In_Stream, Seq, Dim]
+        # Result 'bikl' is the newly mixed streams [Batch, Out_Stream, Seq, Dim]
+        mixed_streams = torch.einsum('ij, bjkl -> bikl', w_mix.to(streams.dtype), streams)
+
+        return mixed_streams
+
+
 class RHN_ACTV1Block(nn.Module):
     def __init__(self, config: RHN_ACTV1Config, attn: bool = True, attn_type: str = "self",
                  attn_params: dict = None, rmsnorm: bool = True) -> None:
@@ -90,37 +133,24 @@ class RHN_ACTV1Block(nn.Module):
         self.rmsnorm = rmsnorm
 
         if self.attn:
-            if self.attn_type == "mlp_t":
-                self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hypernet_hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
-                self.mlp_t = SwiGLU(
-                    hidden_size= self.config.perceiver_rank, # self.config.seq_len + self.puzzle_emb_len,
-                    expansion=config.expansion,
-                )
-                self.post_attn_norm = nn.RMSNorm(self.config.perceiver_rank,
-                                                 eps=self.config.rms_norm_eps,
-                                                 elementwise_affine=self.config.hypernet_rmsaffine).to(
-                    dtype=self.forward_dtype)
-            elif self.attn_type == "self":
-                self.post_attn_norm = nn.RMSNorm(attn_params["input_size"],
-                                                 eps=self.config.rms_norm_eps,
-                                                 elementwise_affine=self.config.hypernet_rmsaffine).to(
-                    dtype=self.forward_dtype)
+            self.pre_attn_norm = nn.RMSNorm(attn_params["input_size"], eps=self.config.rms_norm_eps, elementwise_affine=self.config.hypernet_rmsaffine).to(dtype=self.forward_dtype)
 
+            if self.attn_type == "mlp_t":
+                self.mlp_t = SwiGLU(hidden_size=attn_params["seq_len"], expansion=config.expansion)
+            elif self.attn_type == "self":
                 self.self_attn = Attention(
                     hidden_size=attn_params["input_size"],
-                    kdim=attn_params["kv_size"] if attn_params["kv_size"] != attn_params["input_size"] else None,
-                    vdim=attn_params["kv_size"] if attn_params["kv_size"] != attn_params["input_size"] else None,
+                    kdim=attn_params["input_size"],
+                    vdim=attn_params["input_size"],
                     head_dim=attn_params["input_size"] // attn_params["heads"],
                     num_heads=attn_params["heads"],
                     num_key_value_heads=attn_params["heads"],
                     causal=False,
                 )
             elif self.attn_type == "perceiver":
-                self.post_attn_norm = nn.RMSNorm(attn_params["input_size"],
-                                                 eps=self.config.rms_norm_eps,
-                                                 elementwise_affine=self.config.hypernet_rmsaffine).to(
-                    dtype=self.forward_dtype)
-
+                self.kv_norm = nn.RMSNorm(attn_params["kv_size"],
+                                          eps=self.config.rms_norm_eps,
+                                          elementwise_affine=self.config.hypernet_rmsaffine).to(dtype=self.forward_dtype)
                 self.perceiver_attn = nn.MultiheadAttention(
                     embed_dim=attn_params["input_size"],
                     kdim=attn_params["kv_size"],
@@ -130,55 +160,38 @@ class RHN_ACTV1Block(nn.Module):
                 ).to(dtype=self.forward_dtype)
 
         if self.rmsnorm:
-            self.post_mlp_norm = nn.RMSNorm(attn_params["input_size"],
-                                            eps=self.config.rms_norm_eps,
-                                            elementwise_affine=self.config.hypernet_rmsaffine).to(dtype=self.forward_dtype)
+            self.pre_mlp_norm = nn.RMSNorm(attn_params["input_size"], eps=self.config.rms_norm_eps, elementwise_affine=self.config.hypernet_rmsaffine).to(dtype=self.forward_dtype)
 
-        self.mlp = SwiGLU(
-            hidden_size=attn_params["input_size"],
-            expansion=config.expansion,
-        )
+        self.mlp = SwiGLU(hidden_size=attn_params["input_size"], expansion=config.expansion)
 
-        self.norm_eps = config.rms_norm_eps
-
-    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor, kv: torch.Tensor = None) -> torch.Tensor:
-        # B, L, D = hidden_states.shape
-        # Pre-Norm
+    def forward(self, hidden_states: torch.Tensor, kv: torch.Tensor = None, **kwargs) -> torch.Tensor:
         if self.attn:
+            normed = self.pre_attn_norm(hidden_states)
             if self.attn_type == "mlp_t":
-                hidden_states = hidden_states.transpose(1,2)
-                attn_out = self.mlp_t(hidden_states)
-                hidden_states = self.post_attn_norm(hidden_states + attn_out)
-                hidden_states = hidden_states.transpose(1,2)
+                normed = normed.transpose(1, 2)
+                attn_out = self.mlp_t(normed).transpose(1, 2)
             elif self.attn_type == "self":
-                attn_out = self.self_attn(cos_sin=cos_sin,
-                                          query=hidden_states,
-                                          key=hidden_states,
-                                          value=hidden_states)
-                hidden_states = self.post_attn_norm(hidden_states + attn_out)
+                attn_out = self.self_attn(cos_sin=None, query=normed, key=normed, value=normed)
             elif self.attn_type == "perceiver":
-                queries = hidden_states
-
-                if queries.dim() == 2:
-                    queries = queries.unsqueeze(0)
-                if queries.dim() == 3 and queries.size(0) == 1:
+                if normed.dim() == 2:
+                    normed = normed.unsqueeze(0)
+                if normed.dim() == 3 and normed.size(0) == 1 and kv is not None:
                     batch_size = kv.shape[0]
-                    queries = queries.expand(batch_size, -1, -1)
+                    normed = normed.expand(batch_size, -1, -1)
+                normed_kv = self.kv_norm(kv) if kv is not None else None
+                attn_out, _ = self.perceiver_attn(query=normed, key=normed_kv, value=normed_kv, need_weights=False)
 
-                attn_out, _ = self.perceiver_attn(
-                    query=queries,
-                    key=kv,
-                    value=kv
-                )
-                hidden_states = self.post_attn_norm(hidden_states + attn_out)
+            hidden_states = hidden_states + attn_out
 
-        out = self.mlp(hidden_states)
         if self.rmsnorm:
-            # out = self.post_mlp_norm(hidden_states + out)
-            out = self.post_mlp_norm(out)
-        # else:
-        #     out = hidden_states + out
-        return out
+            normed = self.pre_mlp_norm(hidden_states)
+            out = self.mlp(normed)
+            hidden_states = hidden_states + out
+        else:
+            out = self.mlp(hidden_states)
+            hidden_states = hidden_states + out
+
+        return hidden_states
 
 
 class RHN_ACTV1Block_Dynamic(nn.Module):
@@ -186,64 +199,34 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
         super().__init__()
 
         self.config = config
-        self.forward_dtype = getattr(torch, self.config.forward_dtype)
         self.attn = attn
-        self.attn_type = attn_type
+        self.forward_dtype = getattr(torch, self.config.forward_dtype)
+
+        self.pre_attn_norm = nn.RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps, elementwise_affine=True).to(dtype=self.forward_dtype)
+        self.pre_mlp_norm = nn.RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps, elementwise_affine=True).to(dtype=self.forward_dtype)
+
         if self.attn:
-
-            if self.attn_type == "mlp_t":
-                self.puzzle_emb_len = -(
-                            self.config.puzzle_emb_ndim // -self.config.hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
-                seq_len_dim = self.config.seq_len + self.puzzle_emb_len
-
-                self.mlp_t = DynamicSwiGLU(
-                    hidden_size=self.config.seq_len + self.puzzle_emb_len,
-                    expansion=config.expansion,
-                )
-                self.post_attn_norm = nn.RMSNorm(seq_len_dim,
-                                                 eps=self.config.rms_norm_eps,
-                                                 elementwise_affine=self.config.hypernet_rmsaffine).to(
-                    dtype=self.forward_dtype)
+            if self.config.mlp_t:
+                self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
+                self.mlp_t = DynamicSwiGLU(hidden_size=self.config.seq_len + self.puzzle_emb_len, expansion=config.expansion)
             else:
-                self.self_attn = DynamicAttention(
-                    hidden_size=config.hidden_size,
-                    head_dim=config.hidden_size // config.num_heads,
-                    num_heads=config.num_heads,
-                    num_key_value_heads=config.num_heads,
-                    causal=False
-                )
-                self.post_attn_norm = nn.RMSNorm(self.config.hidden_size,
-                                                 eps=self.config.rms_norm_eps,
-                                                 elementwise_affine=self.config.hypernet_rmsaffine).to(
-                    dtype=self.forward_dtype)
+                self.self_attn = DynamicAttention(hidden_size=config.hidden_size, head_dim=config.hidden_size // config.num_heads, num_heads=config.num_heads, num_key_value_heads=config.num_heads, causal=False)
 
-        self.post_mlp_norm = nn.RMSNorm(self.config.hidden_size,
-                                                eps=self.config.rms_norm_eps,
-                                                elementwise_affine=self.config.hypernet_rmsaffine).to(dtype=self.forward_dtype)
-
-        self.mlp = DynamicSwiGLU(
-            hidden_size=config.hidden_size,
-            expansion=config.expansion,
-        )
-
-        self.norm_eps = config.rms_norm_eps
+        self.mlp = DynamicSwiGLU(hidden_size=config.hidden_size, expansion=config.expansion)
 
     def set_dynamic_adapter(self, dynamic_weights: Dict[str, torch.Tensor], layer_idx: int):
         if self.attn:
             if self.config.mlp_t:
                 gate_up = dynamic_weights[f"L_level.{layer_idx}.mlp_t.gate_up_proj.weight"]
                 down = dynamic_weights[f"L_level.{layer_idx}.mlp_t.down_proj.weight"]
-
                 self.mlp_t.set_dynamic_adapter(gate_up[0], gate_up[1], down[0], down[1])
             else:
                 qkv = dynamic_weights[f"L_level.{layer_idx}.self_attn.qkv_proj.weight"]
                 o = dynamic_weights[f"L_level.{layer_idx}.self_attn.o_proj.weight"]
-
                 self.self_attn.set_dynamic_adapter(qkv[0], qkv[1], o[0], o[1])
 
         mlp_gate_up = dynamic_weights[f"L_level.{layer_idx}.mlp.gate_up_proj.weight"]
         mlp_down = dynamic_weights[f"L_level.{layer_idx}.mlp.down_proj.weight"]
-
         self.mlp.set_dynamic_adapter(mlp_gate_up[0], mlp_gate_up[1], mlp_down[0], mlp_down[1])
 
     def clear_dynamic_adapter(self):
@@ -256,17 +239,22 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.attn:
-            if self.attn_type == "mlp_t":
-                hidden_states = hidden_states.transpose(1, 2)
-                attn_out = self.mlp_t(hidden_states)
-                hidden_states = self.post_attn_norm(hidden_states + attn_out)
-                hidden_states = hidden_states.transpose(1, 2)
+            residual = hidden_states
+            normed = self.pre_attn_norm(hidden_states)
+            if self.config.mlp_t:
+                normed = normed.transpose(1, 2)
+                attn_out = self.mlp_t(normed).transpose(1, 2)
             else:
-                attn_out = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
-                hidden_states = self.post_attn_norm(hidden_states + attn_out)
-        out = self.mlp(hidden_states)
-        out = self.post_mlp_norm(hidden_states + out)
-        return out
+                attn_out = self.self_attn(cos_sin=cos_sin, hidden_states=normed)
+
+            hidden_states = residual + attn_out
+
+        residual = hidden_states
+        normed = self.pre_mlp_norm(hidden_states)
+        mlp_out = self.mlp(normed)
+        hidden_states = residual + mlp_out
+
+        return hidden_states
 
 
 class RHN_Hypernetwork(nn.Module):
@@ -283,6 +271,9 @@ class RHN_Hypernetwork(nn.Module):
                 "type": "vector" if self._is_vector_like(shape) else "matrix",
             }
 
+        self.embed_scale = math.sqrt(self.config.hypernet_hidden_size)
+        embed_init_std = 1.0 / self.embed_scale
+
         self.input_size = self.config.hidden_size * self.config.L_layers
         self.num_layers = len(self.layer_specs)
 
@@ -290,14 +281,6 @@ class RHN_Hypernetwork(nn.Module):
             self.num_queries = self.num_layers * self.config.kron_dims
         else:
             self.num_queries = self.config.kron_dims
-
-        self.perceiver_attn = nn.MultiheadAttention(
-            embed_dim=self.config.hypernet_hidden_size,
-            num_heads=self.config.perceiver_heads,
-            batch_first=True,
-            kdim=self.input_size,
-            vdim=self.input_size,
-        ).to(dtype=self.forward_dtype)
 
         self.input_queries = nn.Parameter(
             trunc_normal_init_(
@@ -310,169 +293,129 @@ class RHN_Hypernetwork(nn.Module):
         self.hypernet_base.append(
             RHN_ACTV1Block(self.config, attn=True, attn_type="perceiver", attn_params={
                 "input_size": self.config.hypernet_hidden_size,
-                "kv_size": self.input_size,
+                "kv_size": self.config.hidden_size,
                 "heads": self.config.perceiver_heads,
+                "seq_len": self.num_queries
             })
         )
         for _i in range(self.config.H_layers):
-            self.hypernet_base.append(RHN_ACTV1Block(self.config,
-                                                     rmsnorm=self.config.hypernet_rmsnorm,
-                                                     attn=self.config.hypernet_attn,
-                                                     attn_type=self.config.hypernet_attn_type,
-                                                     attn_params={
-                "input_size": self.config.hypernet_hidden_size,
-                "kv_size": self.input_size,
-                "heads": self.config.perceiver_heads,
-            })
-        )
+            self.hypernet_base.append(
+                RHN_ACTV1Block(self.config,
+                               rmsnorm=self.config.hypernet_rmsnorm,
+                               attn=self.config.hypernet_attn,
+                               attn_type="self",
+                               attn_params={
+                                   "input_size": self.config.hypernet_hidden_size,
+                                   "kv_size": self.config.hypernet_hidden_size,
+                                   "heads": self.config.perceiver_heads,
+                                   "seq_len": self.num_queries
+                               })
+            )
 
-        self.output_head = CastedLinear(self.config.hypernet_hidden_size,
-                                         self._output_dim(layer_specs),
-                                         bias=False)
+        self.output_dim = self._output_dim(layer_specs)
+        self.output_head = CastedLinear(self.config.hypernet_hidden_size, self.output_dim, bias=False)
 
-        self.lora_norms = nn.ModuleDict()
+    def forward(self, activations: torch.Tensor, **seq_info) -> Tuple[dict, torch.Tensor, dict]:
+        batch_size = activations.shape[0]
 
-        for name, shape in self.layer_specs:
-            safe_name = name.replace(".", "_")
-
-            if self._is_vector_like(shape):
-                size = shape[0] * self.config.hypernet_rank
-                self.lora_norms[f"{safe_name}"] = nn.RMSNorm(size, eps=self.config.rms_norm_eps,
-                                                             elementwise_affine=True).to(dtype=self.forward_dtype)
-            else:
-                size_a = shape[0] * self.config.hypernet_rank
-                size_b = shape[1] * self.config.hypernet_rank
-
-                self.lora_norms[f"{safe_name}_A"] = nn.RMSNorm(size_a, eps=self.config.rms_norm_eps,
-                                                               elementwise_affine=True).to(dtype=self.forward_dtype)
-                self.lora_norms[f"{safe_name}_B"] = nn.RMSNorm(size_b, eps=self.config.rms_norm_eps,
-                                                               elementwise_affine=True).to(dtype=self.forward_dtype)
-
-        with torch.no_grad():
-            target_variance = 1.0 / self.config.hidden_size
-            symmetric_std = (target_variance / self.config.hypernet_rank) ** 0.25
-            for key, norm_module in self.lora_norms.items():
-        #         trunc_normal_init_(norm_module.weight, std=0.02)
-                # norm_module.weight.add_(1.0)
-
-                # trunc_normal_init_(norm_module.weight, std=symmetric_std)
-                # norm_module.weight *= 10
-
-                if key.endswith("_B"):
-                    # Initialize B matrices to 0.0 so dynamic output starts safely at zero
-                    # nn.init.zeros_(norm_module.weight)
-                    trunc_normal_init_(norm_module.weight, std=symmetric_std)
-                else:
-                    # Initialize A matrices (and vectors) to 1.0 unit variance
-                    nn.init.ones_(norm_module.weight)
-
-    def forward(self, activations: torch.Tensor, **seq_info) -> Tuple[dict, torch.Tensor]:
-        batch_size, seq_len, _ = activations.shape
-
-        # hidden_states = self._attention(activations)
-        hidden_states = activations
-
+        hidden_states = None
         for i, layer in enumerate(self.hypernet_base):
             if i == 0:
                 hidden_states = layer(hidden_states=self.input_queries, kv=activations, **seq_info)
             else:
-                hidden_states = layer(hidden_states=hidden_states, kv=activations, **seq_info)
+                hidden_states = layer(hidden_states=hidden_states, kv=None, **seq_info)
 
         outputs = self.output_head(hidden_states)
-        outputs = rms_norm(outputs, variance_epsilon=self.config.rms_norm_eps)
+        output_head_l2 = outputs.flatten(1).norm(dim=1).mean()
+
         outputs = self._expand_output(outputs)
+        expansion_l2 = outputs.flatten(1).norm(dim=1).mean()
 
         step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
 
         outputs_by_layer = {}
-        output_index = 0
-        for layer in self.config_per_layer:
-            layer_name = layer
-            layer_info = self.config_per_layer[layer]
-            shape = self.config_per_layer[layer]["shape"]
-            safe_name = layer_name.replace(".", "_")
+        gen_norm_sq = torch.zeros(batch_size, device=outputs.device)
 
-            outputs_a = outputs[:, output_index : output_index + (shape[0] * self.config.hypernet_rank)]
+        for i, (layer_name, layer_info) in enumerate(self.config_per_layer.items()):
+            shape = layer_info["shape"]
+            layer_params = outputs[:, i, :]
 
-            # if layer_info["type"] == "matrix":
-            #     outputs_a = self.lora_norms[f"{safe_name}_A"](outputs_a)
-            # else:
-            #     outputs_a = self.lora_norms[f"{safe_name}"](outputs_a)
-
+            output_index = 0
+            size_a = shape[0] * self.config.hypernet_rank
+            outputs_a = layer_params[:, output_index: output_index + size_a]
+            gen_norm_sq += outputs_a.pow(2).sum(dim=1)
             outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
-            output_index += shape[0] * self.config.hypernet_rank
+            output_index += size_a
 
-            if self.config_per_layer[layer]["type"] == "matrix":
-                outputs_b = outputs[:, output_index : output_index + (shape[1] * self.config.hypernet_rank)]
-                # outputs_b = self.lora_norms[f"{safe_name}_B"](outputs_b)
+            if layer_info["type"] == "matrix":
+                size_b = shape[1] * self.config.hypernet_rank
+                outputs_b = layer_params[:, output_index: output_index + size_b]
+                gen_norm_sq += outputs_b.pow(2).sum(dim=1)
                 outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
-                output_index += shape[1] * self.config.hypernet_rank
-
-            if self.config_per_layer[layer]["type"] == "vector":
-                outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
-                outputs_by_layer[layer] = outputs_a
+                outputs_by_layer[layer_name] = (outputs_a, outputs_b)
             else:
-                outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
-                outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
-                outputs_by_layer[layer] = (outputs_a, outputs_b)
+                outputs_by_layer[layer_name] = outputs_a
 
-        return outputs_by_layer, step_l2
+        gen_norm_l2 = gen_norm_sq.sqrt().mean()
+
+        hyper_metrics = {
+            "output_head_l2": output_head_l2.detach(),
+            "expansion_l2": expansion_l2.detach(),
+            "gen_norm_l2": gen_norm_l2.detach()
+        }
+
+        return outputs_by_layer, step_l2, hyper_metrics
 
     def _is_vector_like(self, shape: list) -> bool:
-        if len(shape) < 2:
-            return True
-
+        if len(shape) < 2: return True
         num_large_dims = 0
         for dim in shape:
-            if dim >= 1:
-                num_large_dims += 1
+            if dim >= 1: num_large_dims += 1
+        return num_large_dims < 2
 
-        if num_large_dims >= 2:
-            return False
-        else:
-            return True
+    def _output_dim(self, layer_specs: dict) -> int:
+        max_params = 0
+        for name, shape in layer_specs:
+            if self._is_vector_like(shape):
+                params = shape[0] * self.config.hypernet_rank
+            else:
+                params = (shape[0] + shape[1]) * self.config.hypernet_rank
+            if params > max_params:
+                max_params = params
 
-    # TODO - Make this dynamic / tunable for larger base models, to ensure appropriate hypernetwork scaling.
-    def _output_dim(self, layer_specs:dict) -> int:
-        base_param_dim_sum = 0
-        base_param_total = 0
-        for layer in layer_specs:
-            rows, cols = layer[1]
-            base_param_dim_sum += rows + cols
-            base_param_total += rows * cols
+        self.kron_dim = int(math.ceil(max_params ** 0.25))
+        elements_per_matrix = self.kron_dim ** 2
+        total_elements_needed = self.num_layers * 2 * elements_per_matrix
+        output_dim = int(math.ceil(total_elements_needed / self.num_queries))
+        return output_dim
 
-        base_param_total_low_rank = base_param_dim_sum * self.config.hypernet_rank
-
-        self.kron_dim = int(
-            -(-base_param_total_low_rank ** (1 / 4) // 1))  # Square root twice (i.e., 1/4th root) and round up
-
-        vals_to_generate = math.ceil((self.kron_dim ** 2 * 2) / self.num_queries)
-
-        return vals_to_generate
-
-    def _expand_output(self, outputs) -> torch.Tensor:
+    def _expand_output(self, outputs: torch.Tensor) -> torch.Tensor:
         batch_size = outputs.shape[0]
-        outputs = outputs.reshape(batch_size, -1)  # Collapse perceiver rank dimension
-        used_outputs_a = outputs[..., :self.kron_dim ** 2]
-        used_outputs_a = used_outputs_a.unsqueeze(-1).view(-1, self.kron_dim, self.kron_dim)
-        used_outputs_b = outputs[..., self.kron_dim ** 2: self.kron_dim ** 2 * 2]
-        used_outputs_b = used_outputs_b.unsqueeze(-1).view(-1, self.kron_dim, self.kron_dim)
-        expanded_outputs = torch.einsum('bij,bkl->bikjl', used_outputs_a, used_outputs_b)
-        outputs = expanded_outputs.flatten(start_dim=1, end_dim=-1)
+        outputs = outputs.flatten(start_dim=1)
+
+        needed_elements_per_matrix = self.kron_dim ** 2
+        needed_elements_per_layer = 2 * needed_elements_per_matrix
+        total_needed = self.num_layers * needed_elements_per_layer
+
+        outputs = outputs[:, :total_needed]
+
+        # Reshape to isolate each factor matrix
+        outputs = outputs.reshape(batch_size, self.num_layers, 2, needed_elements_per_matrix)
+
+        outputs_a = outputs[:, :, 0, :]
+        outputs_b = outputs[:, :, 1, :]
+
+        # Normalize the ENTIRE factor matrix globally to preserve 2D internal geometry
+        outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
+        outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
+
+        outputs_a = outputs_a.reshape(batch_size, self.num_layers, self.kron_dim, self.kron_dim)
+        outputs_b = outputs_b.reshape(batch_size, self.num_layers, self.kron_dim, self.kron_dim)
+
+        expanded_outputs = torch.einsum('blij,blkm->blikjm', outputs_a, outputs_b)
+        outputs = expanded_outputs.flatten(start_dim=2, end_dim=-1)
 
         return outputs
-
-
-# class RHN_ACTV1ReasoningModule(nn.Module):
-#     def __init__(self, layers: List[RHN_ACTV1Block_Dynamic]):
-#         super().__init__()
-#         self.layers = torch.nn.ModuleList(layers)
-#
-#     def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs) -> torch.Tensor:
-#         hidden_states = hidden_states + input_injection
-#         for layer in self.layers:
-#             hidden_states = layer(hidden_states=hidden_states, **kwargs)
-#         return hidden_states
 
 
 class RHN_ACTV1_Inner(nn.Module):
@@ -480,8 +423,6 @@ class RHN_ACTV1_Inner(nn.Module):
         super().__init__()
         self.config = config
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
-
-        # I/O
 
         self.embed_scale = math.sqrt(self.config.hidden_size)
         embed_init_std = 1.0 / self.embed_scale
@@ -506,20 +447,12 @@ class RHN_ACTV1_Inner(nn.Module):
         else:
             pass
 
-        # Base Model
-        attn_type = "mlp_t" if self.config.mlp_t else "self"
-        self.L_level = torch.nn.ModuleList(
-            [RHN_ACTV1Block_Dynamic(self.config, attn=True, attn_type=attn_type) for _i in range(self.config.L_layers)]
-        )
+        self.L_level = torch.nn.ModuleList([RHN_ACTV1Block_Dynamic(self.config, attn=True) for _i in range(self.config.L_layers)])
 
-        # Turn off Base Model training
-        # for name, param in self.L_level.named_parameters():
-        #     param.requires_grad = False
-
-        # Hypernetwork
         self.layer_specs = []
         for name, param in self.named_parameters():
-            if not name.startswith("L_level."):
+            name_tag = name.split(".")[0]
+            if name_tag != "L_level":
                 continue
             if "norm" in name.lower() or "scale" in name.lower():
                 continue
@@ -527,19 +460,25 @@ class RHN_ACTV1_Inner(nn.Module):
 
         self.hypernet = RHN_Hypernetwork(self.config, self.layer_specs)
 
-        # Initial states
-        self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
-        self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        # Parallel Stream Temporal Iteration Mixer (mHC-lite)
+        self.mhc_mixer = MHCLiteMixer(num_streams=self.config.mhc_window_size)
 
-        # Q head special init
-        # Init Q to (almost) zero for faster learning during bootstrapping
+        # Unified Initial State (Now dynamically tracked as K streams)
+        self.Z_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.mhc_window_size, self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+
+        self.mhc_pre = nn.Parameter(torch.zeros(self.config.mhc_window_size, dtype=self.forward_dtype))
+        self.mhc_pre.data[0] = 1.0  # Initialize to extract stream 0
+
+        self.mhc_post = nn.Parameter(torch.zeros(self.config.mhc_window_size, dtype=self.forward_dtype))
+        self.mhc_post.data[0] = 1.0  # Initialize to inject back to stream 0
+
         with torch.no_grad():
             self.q_head.weight.zero_()
-            self.q_head.bias.fill_(-5)  # type: ignore
+            self.q_head.bias.fill_(-5)
 
-        self.dynamic_out_norm = nn.RMSNorm(self.config.hidden_size,
-                                           eps=self.config.rms_norm_eps,
-                                           elementwise_affine=False).to(dtype=self.forward_dtype)
+        # Macro and Readout Normalization
+        self.macro_norm = nn.RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps, elementwise_affine=True).to(dtype=self.forward_dtype)
+        self.readout_norm = nn.RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps, elementwise_affine=True).to(dtype=self.forward_dtype)
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # Token embedding
@@ -565,40 +504,50 @@ class RHN_ACTV1_Inner(nn.Module):
 
     def empty_carry(self, batch_size: int):
         return RHN_ACTV1InnerCarry(
-            z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
-            z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z=torch.empty(batch_size, self.config.mhc_window_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            inner_steps=torch.zeros(batch_size, dtype=torch.int32, device="cuda" if torch.cuda.is_available() else "cpu"),
         )
         
     def reset_carry(self, reset_flag: torch.Tensor, carry: RHN_ACTV1InnerCarry):
+        reset_mask = reset_flag.view(-1, 1, 1, 1)
         return RHN_ACTV1InnerCarry(
-            z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
-            z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
+            z=torch.where(reset_mask, self.Z_init.view(1, self.config.mhc_window_size, 1, self.config.hidden_size), carry.z),
+            inner_steps=torch.where(reset_flag, 0, carry.inner_steps)
         )
 
-    def forward(self, carry: RHN_ACTV1InnerCarry, batch: Dict[str, torch.Tensor], log_deep_metrics: bool = False,
-                **kwargs) -> Tuple[RHN_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor, dict]:
-        seq_info = dict(
-            cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
-        )
+    def forward(self, carry: RHN_ACTV1InnerCarry, batch: Dict[str, torch.Tensor], log_deep_metrics: bool = False, **kwargs) -> Tuple[RHN_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor, dict]:
+        seq_info = dict(cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None)
+        inner_steps = carry.inner_steps
 
-        # Input encoding
-        input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+        if inner_steps[0] == 0:
+            input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+            # Push the kickstart embeddings symmetrically into all parallel streams
+            z_macro = carry.z + input_embeddings.unsqueeze(1)
+        else:
+            z_macro = carry.z
 
-        # Forward iterations
-        z_H, z_L = carry.z_H, carry.z_L
+        # ----------------------------------------------------
+        # 1. Macro Norm & Hypernetwork Path
+        # ----------------------------------------------------
+        # Standard RMSNorm naturally handles trailing dimensions regardless of [B, S, L, D] shapes
+        z_normed = self.macro_norm(z_macro)
 
         total_metrics = {
-            "telemetry/act_sparsity": torch.tensor(0.0, device=z_H.device),
-            "telemetry/act_saturation": torch.tensor(0.0, device=z_H.device),
-            "telemetry/gen_l2_norm": torch.tensor(0.0, device=z_H.device),
-            "telemetry/state_drift": torch.tensor(0.0, device=z_H.device)
+            "telemetry/act_sparsity": torch.tensor(0.0, device=z_macro.device),
+            "telemetry/act_saturation": torch.tensor(0.0, device=z_macro.device),
+            "telemetry/state_drift": torch.tensor(0.0, device=z_macro.device),
+            "telemetry/gen_l2_norm": torch.tensor(0.0, device=z_macro.device)
         }
 
         if log_deep_metrics:
-            total_metrics["telemetry/gen_svd_ratio"] = torch.tensor(0.0, device=z_H.device)
-            total_metrics["telemetry/gen_base_l2_ratio"] = torch.tensor(0.0, device=z_H.device)
+            total_metrics["telemetry/gen_svd_ratio"] = torch.tensor(0.0, device=z_macro.device)
+            total_metrics["telemetry/gen_base_l2_ratio"] = torch.tensor(0.0, device=z_macro.device)
+            total_metrics["telemetry/output_head_l2"] = torch.tensor(0.0, device=z_macro.device)
+            total_metrics["telemetry/expansion_l2"] = torch.tensor(0.0, device=z_macro.device)
+            total_metrics["telemetry/gen_norm_l2"] = torch.tensor(0.0, device=z_macro.device)
 
         metric_calls = 0
+        total_l2 = torch.zeros(z_macro.shape[0], device=z_macro.device, dtype=z_macro.dtype)
 
         def track_metrics(prev_state, new_state, step_metrics):
             nonlocal metric_calls
@@ -611,82 +560,78 @@ class RHN_ACTV1_Inner(nn.Module):
             if log_deep_metrics:
                 total_metrics["telemetry/gen_svd_ratio"] += step_metrics["svd_ratio"]
                 total_metrics["telemetry/gen_base_l2_ratio"] += step_metrics["gen_base_l2_ratio"]
+                total_metrics["telemetry/output_head_l2"] += step_metrics["output_head_l2"]
+                total_metrics["telemetry/expansion_l2"] += step_metrics["expansion_l2"]
+                total_metrics["telemetry/gen_norm_l2"] += step_metrics["gen_norm_l2"]
             metric_calls += 1
 
-        total_l2 = torch.zeros(z_L.shape[0], device=z_L.device, dtype=z_L.dtype)
+        # ----------------------------------------------------
+        # 2. Micro-Cycles (Temporal mHC-lite constraints)
+        # ----------------------------------------------------
+        z_local = z_normed
 
-        # H_cycles-1 without grad
+        # H_cycles-1 without grad (Truncated BPTT)
         with torch.no_grad():
-            for _H_step in range(self.config.H_cycles-1):
+            for _H_step in range(self.config.H_cycles - 1):
                 for _L_step in range(self.config.L_cycles):
-                    prev_z_L = z_L
-                    z_L, _, step_m = self._dynamic_forward(z_L=z_L,
-                                                        z_H=z_H,
-                                                        input_embeddings=input_embeddings,
-                                                        log_deep_metrics=log_deep_metrics,
-                                                        **seq_info)
-                    track_metrics(prev_z_L, z_L, step_m)
-                prev_z_H = z_H
-                z_H, _, step_m = self._dynamic_forward(z_L=z_L,
-                                                    z_H=z_H,
-                                                    input_embeddings=None,
-                                                    log_deep_metrics=log_deep_metrics,
-                                                    **seq_info)
-                track_metrics(prev_z_H, z_H, step_m)
+                    z_local, prev_z_0, new_z_0, step_l2, step_metrics = self._dynamic_forward(
+                        z_local=z_local,
+                        log_deep_metrics=log_deep_metrics,
+                        **seq_info
+                    )
 
+                    total_l2 += step_l2
+                    track_metrics(prev_z_0, new_z_0, step_metrics)
+                    inner_steps += 1
+
+        # Final gradient-tracked cycle
         for _L_step in range(self.config.L_cycles):
-            prev_z_L = z_L
-            z_L, step_l2, step_m = self._dynamic_forward(z_L=z_L,
-                                                z_H=z_H,
-                                                input_embeddings=input_embeddings,
-                                                log_deep_metrics=log_deep_metrics,
-                                                **seq_info)
-            track_metrics(prev_z_L, z_L, step_m)
+            z_local, prev_z_0, new_z_0, step_l2, step_metrics = self._dynamic_forward(
+                z_local=z_local,
+                log_deep_metrics=log_deep_metrics,
+                **seq_info
+            )
 
-        prev_z_H = z_H
-        z_H, step_l2, step_m = self._dynamic_forward(z_L=z_L,
-                                    z_H=z_H,
-                                    input_embeddings=None,
-                                    log_deep_metrics=log_deep_metrics,
-                                    **seq_info)
+            total_l2 += step_l2
+            track_metrics(prev_z_0, new_z_0, step_metrics)
+            inner_steps += 1
 
-        total_l2 += step_l2
-        avg_l2 = total_l2 / (self.config.L_cycles + 1)
-
-        track_metrics(prev_z_H, z_H, step_m)
+        # ----------------------------------------------------
+        # 3. The Hierarchical Ratchet (Additive Macro Step)
+        # ----------------------------------------------------
+        z_macro = z_macro + z_local
 
         if metric_calls > 0:
             for k in total_metrics:
                 total_metrics[k] /= metric_calls
 
-        # LM Outputs
-        new_carry = RHN_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
-        output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
-        q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
+        avg_l2 = total_l2 / metric_calls if metric_calls > 0 else total_l2
+
+        # ----------------------------------------------------
+        # 4. Readout
+        # ----------------------------------------------------
+        new_carry = RHN_ACTV1InnerCarry(z=z_macro.detach(), inner_steps=inner_steps)
+
+        # Linear readouts read purely from Stream 0 context memory
+        z_readout = self.readout_norm(z_macro[:, 0])
+        output = self.lm_head(z_readout)[:, self.puzzle_emb_len:]
+        q_logits = self.q_head(z_readout[:, 0]).to(torch.float32)
+
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), avg_l2, total_metrics
 
-    def _dynamic_forward(self, z_L, z_H, input_embeddings=None, log_deep_metrics=False, **seq_info) -> Tuple[
-        torch.Tensor, torch.Tensor, dict
-    ]:
-        initial_state = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
+    def _dynamic_forward(self, z_local: torch.Tensor, log_deep_metrics: bool = False, **seq_info) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+        z_local_mixed = self.mhc_mixer(z_local)
+        z_in = torch.einsum('k, bksd -> bsd', self.mhc_pre.to(self.forward_dtype), z_local_mixed)
 
-        h_base = initial_state
-        activations = torch.tensor([], dtype=h_base.dtype, device=h_base.device)
-        # Base model output
-        for layer in self.L_level:
-            layer.clear_dynamic_adapter()
-            h_base = layer(hidden_states=h_base, **seq_info)
-            activations = torch.cat((activations, h_base.detach()),
-                                    dim=2)  # TODO - Determine whether detaching is preferable here.
-
-        # Dynamic weight output
-        h_dyn = initial_state
-        dynamic_weights, step_l2 = self.hypernet(activations, **seq_info)
+        dynamic_weights, step_l2, hyper_metrics = self.hypernet(z_in, **seq_info)
 
         step_metrics = {}
         with torch.no_grad():
-            step_metrics["sparsity"] = (h_base.abs() < 1e-3).float().mean()
-            step_metrics["saturation"] = (h_base.abs() > 5.0).float().mean()
+            step_metrics["sparsity"] = (z_in.abs() < 1e-3).float().mean()
+            step_metrics["saturation"] = (z_in.abs() > 5.0).float().mean()
+
+            if log_deep_metrics:
+                step_metrics.update(hyper_metrics)
 
             gen_norm = 0.0
             svd_ratio = 0.0
@@ -697,16 +642,13 @@ class RHN_ACTV1_Inner(nn.Module):
                 base_param = self.get_parameter(k)
                 if isinstance(v, tuple) and len(v) == 2:
                     A, B = v
-
                     gen_norm += (A[0].norm() + B[0].norm())
 
                     if log_deep_metrics:
                         delta_W = torch.matmul(A[0], B[0]).float()
                         S = torch.linalg.svdvals(delta_W)
                         svd_ratio += (S[0] / (S.sum() + 1e-6))
-
                         gen_base_l2_ratio += delta_W.norm() / (base_param.norm() + 1e-8)
-
                     count += 1
                 else:
                     A = v
@@ -715,23 +657,30 @@ class RHN_ACTV1_Inner(nn.Module):
                     if log_deep_metrics:
                         delta_W = A[0].float()
                         gen_base_l2_ratio += delta_W.norm() / (base_param.norm() + 1e-8)
-
                     count += 1
 
-            step_metrics["gen_norm"] = (gen_norm / count) if count > 0 else torch.tensor(0.0, device=h_base.device)
+            step_metrics["gen_norm"] = (gen_norm / count) if count > 0 else torch.tensor(0.0, device=z_local.device)
+
             if log_deep_metrics:
-                step_metrics["svd_ratio"] = (svd_ratio / count) if count > 0 else torch.tensor(0.0,
-                                                                                               device=h_base.device)
-                step_metrics["gen_base_l2_ratio"] = (gen_base_l2_ratio / count) if count > 0 else torch.tensor(0.0,
-                                                                                                         device=h_base.device)
+                step_metrics["svd_ratio"] = (svd_ratio / count) if count > 0 else torch.tensor(0.0, device=z_local.device)
+                step_metrics["gen_base_l2_ratio"] = (gen_base_l2_ratio / count) if count > 0 else torch.tensor(0.0, device=z_local.device)
+
+        prev_layer_z = z_in
+        new_layer_z = z_in
 
         for i, layer in enumerate(self.L_level):
             layer.set_dynamic_adapter(dynamic_weights, layer_idx=i)
-            h_dyn = layer(hidden_states=h_dyn, **seq_info)
+            new_layer_z = layer(hidden_states=prev_layer_z, **seq_info)
 
-        h_combined_norm = self.dynamic_out_norm(h_base + h_dyn)
-        return h_combined_norm, step_l2, step_metrics
+            y_t = new_layer_z - prev_layer_z
 
+            z_local = z_local_mixed + torch.einsum('k, bsd -> bksd', self.mhc_post.to(self.forward_dtype), y_t)
+
+            if i < len(self.L_level) - 1:
+                z_local_mixed = self.mhc_mixer(z_local)
+                prev_layer_z = torch.einsum('k, bksd -> bsd', self.mhc_pre.to(self.forward_dtype), z_local_mixed)
+
+        return z_local, z_in, new_layer_z, step_l2, step_metrics
 
 
 class RHN_ACTV1(nn.Module):
@@ -750,25 +699,21 @@ class RHN_ACTV1(nn.Module):
         batch_size = batch["inputs"].shape[0]
 
         return RHN_ACTV1Carry(
-            inner_carry=self.inner.empty_carry(batch_size),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
-            
-            steps=torch.zeros((batch_size, ), dtype=torch.int32),
-            halted=torch.ones((batch_size, ), dtype=torch.bool),  # Default to halted
-            
+            inner_carry=self.inner.empty_carry(batch_size),
+            steps=torch.zeros((batch_size,), dtype=torch.int32),
+            halted=torch.ones((batch_size,), dtype=torch.bool),
             current_data={k: torch.empty_like(v) for k, v in batch.items()}
         )
-        
-    def forward(self, carry: RHN_ACTV1Carry, batch: Dict[str, torch.Tensor], log_deep_metrics: bool = False) -> Tuple[RHN_ACTV1Carry, Dict[str, torch.Tensor]]:
 
-        # Update data, carry (removing halted sequences)
+    def forward(self, carry: RHN_ACTV1Carry, batch: Dict[str, torch.Tensor], log_deep_metrics: bool = False) -> Tuple[
+        RHN_ACTV1Carry, Dict[str, torch.Tensor]]:
         new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
-        
         new_steps = torch.where(carry.halted, 0, carry.steps)
+        new_current_data = {k: torch.where(carry.halted.view((-1,) + (1,) * (batch[k].ndim - 1)), batch[k], v) for k, v
+                            in carry.current_data.items()}
 
-        new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
-
-        # Forward inner model
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits), hypernet_l2, deep_metrics = self.inner(new_inner_carry, new_current_data, log_deep_metrics)
+        new_inner_carry, logits, (q_halt_logits, q_continue_logits), hypernet_l2, deep_metrics = self.inner(
+            new_inner_carry, new_current_data, log_deep_metrics)
 
         outputs = {
             "logits": logits,
@@ -776,7 +721,6 @@ class RHN_ACTV1(nn.Module):
             "q_continue_logits": q_continue_logits,
             "hypernet_l2": hypernet_l2,
         }
-
         outputs.update(deep_metrics)
 
         with torch.no_grad():
