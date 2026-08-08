@@ -620,7 +620,10 @@ class RHN_ACTV1_Inner(nn.Module):
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), avg_l2, total_metrics
 
     def _dynamic_forward(self, z_local: torch.Tensor, log_deep_metrics: bool = False, **seq_info) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+        # 1. mHC Res-Mapping: Safely mix parallel streams for this iteration
         z_local_mixed = self.mhc_mixer(z_local)
+
+        # 2. mHC Pre-Mapping: Extract the active stream 0
         z_in = torch.einsum('k, bksd -> bsd', self.mhc_pre.to(self.forward_dtype), z_local_mixed)
 
         dynamic_weights, step_l2, hyper_metrics = self.hypernet(z_in, **seq_info)
@@ -665,22 +668,19 @@ class RHN_ACTV1_Inner(nn.Module):
                 step_metrics["svd_ratio"] = (svd_ratio / count) if count > 0 else torch.tensor(0.0, device=z_local.device)
                 step_metrics["gen_base_l2_ratio"] = (gen_base_l2_ratio / count) if count > 0 else torch.tensor(0.0, device=z_local.device)
 
-        prev_layer_z = z_in
-        new_layer_z = z_in
-
+        # 3. Standard Spatial Forward Pass (No mHC operations inside this loop)
+        h_dyn = z_in
         for i, layer in enumerate(self.L_level):
             layer.set_dynamic_adapter(dynamic_weights, layer_idx=i)
-            new_layer_z = layer(hidden_states=prev_layer_z, **seq_info)
+            h_dyn = layer(hidden_states=h_dyn, **seq_info)
 
-            y_t = new_layer_z - prev_layer_z
+        # Delta over the entire base model spatial depth for this iteration
+        y_t = h_dyn - z_in
 
-            z_local = z_local_mixed + torch.einsum('k, bsd -> bksd', self.mhc_post.to(self.forward_dtype), y_t)
+        # 4. mHC Post-Mapping: Inject the resulting delta back into the mixed manifold streams
+        z_local_out = z_local_mixed + torch.einsum('k, bsd -> bksd', self.mhc_post.to(self.forward_dtype), y_t)
 
-            if i < len(self.L_level) - 1:
-                z_local_mixed = self.mhc_mixer(z_local)
-                prev_layer_z = torch.einsum('k, bksd -> bsd', self.mhc_pre.to(self.forward_dtype), z_local_mixed)
-
-        return z_local, z_in, new_layer_z, step_l2, step_metrics
+        return z_local_out, z_in, h_dyn, step_l2, step_metrics
 
 
 class RHN_ACTV1(nn.Module):
