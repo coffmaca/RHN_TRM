@@ -615,7 +615,7 @@ class RHN_ACTV1_Inner(nn.Module):
         # Linear readouts read purely from Stream 0 context memory
         z_readout = self.readout_norm(z_macro[:, 0])
         output = self.lm_head(z_readout)[:, self.puzzle_emb_len:]
-        q_logits = self.q_head(z_readout[:, 0]).to(torch.float32)
+        q_logits = self.q_head(z_readout[:, 0].detach()).to(torch.float32)
 
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), avg_l2, total_metrics
 
