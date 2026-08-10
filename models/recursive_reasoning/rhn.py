@@ -230,6 +230,7 @@ class RHN_Hypernetwork(nn.Module):
         batch_size, seq_len, _ = activations.shape
 
         inputs = self._attention(activations)
+        inputs = inputs + activations
 
         inputs = rms_norm(inputs, variance_epsilon=self.config.rms_norm_eps)
 
