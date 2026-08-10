@@ -200,6 +200,14 @@ class RHN_Hypernetwork(nn.Module):
 
         self.input_size = self.config.hidden_size * self.config.L_layers
 
+        self.perceiver_attn = nn.MultiheadAttention(
+            embed_dim=self.input_size,
+            num_heads=self.config.perceiver_heads,
+            batch_first=True,
+            kdim=self.input_size,
+            vdim=self.input_size,
+        ).to(dtype=self.forward_dtype)
+
         self.perceiver_queries = nn.Parameter(
             trunc_normal_init_(
                 torch.empty((1, self.config.perceiver_rank, self.input_size), dtype=self.forward_dtype),
@@ -214,7 +222,7 @@ class RHN_Hypernetwork(nn.Module):
                           bias=False)] + \
             [nn.SiLU()]
         )
-        for _ in range(self.config.hypernet_hidden_depth):
+        for _ in range(self.config.hypernet_hidden_depth - 1):
             module_list.append(SwiGLU(self.config.hypernet_hidden_size, self.config.expansion))
             module_list.append(torch.nn.RMSNorm(self.config.hypernet_hidden_size,
                                                 eps=self.config.rms_norm_eps,
@@ -326,21 +334,15 @@ class RHN_Hypernetwork(nn.Module):
         return vals_to_generate
 
     def _attention(self, inputs) -> torch.Tensor:
-        B, S, D = inputs.shape
-        H = self.config.perceiver_heads
-        Q = self.config.perceiver_rank
-        head_dim = D // H
+        batch_size = inputs.shape[0]
+        queries = self.perceiver_queries.expand(batch_size, -1, -1)  # .to(dtype=inputs.dtype)
+        attn_output, _ = self.perceiver_attn(
+            query=queries,
+            key=inputs,
+            value=inputs
+        )
 
-        q = self.perceiver_queries.view(1, Q, H, head_dim).transpose(1, 2)
-        k = inputs.view(B, S, H, head_dim).transpose(1, 2)
-        v = inputs.view(B, S, H, head_dim).transpose(1, 2)
-
-        attn_logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
-        attn_weights = F.softmax(attn_logits, dim=-1)
-        pooled_inputs = torch.matmul(attn_weights, v)
-        pooled_inputs = pooled_inputs.transpose(1, 2).contiguous().view(B, Q, D)
-
-        return pooled_inputs
+        return attn_output
 
     def _expand_output(self, outputs) -> torch.Tensor:
         batch_size = outputs.shape[0]
