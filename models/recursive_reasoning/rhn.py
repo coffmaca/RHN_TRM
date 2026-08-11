@@ -246,20 +246,22 @@ class RHN_Hypernetwork(nn.Module):
             shape = self.config_per_layer[layer]["shape"]
 
             outputs_a = outputs[:, output_index : output_index + (shape[0] * self.config.hypernet_rank)]
+            outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
             outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
             output_index += shape[0] * self.config.hypernet_rank
 
             if self.config_per_layer[layer]["type"] == "matrix":
                 outputs_b = outputs[:, output_index : output_index + (shape[1] * self.config.hypernet_rank)]
+                outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
                 outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
                 output_index += shape[1] * self.config.hypernet_rank
 
             if self.config_per_layer[layer]["type"] == "vector":
-                outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
+                # outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
                 outputs_by_layer[layer] = outputs_a
             else:
-                outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
-                outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
+                # outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
+                # outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
                 outputs_by_layer[layer] = (outputs_a, outputs_b)
 
         return outputs_by_layer, step_l2
