@@ -69,7 +69,8 @@ class RHN_ACTV1Config(BaseModel):
     hypernet_rank: int
     layer_emb_dim: int
     hypernet_relative_scale: float
-    perceiver_rank: int
+    kron_dims: int
+    kron_dims_mult: bool
     perceiver_heads: int
     hypernet_relative_scale: int
     hypernet_l2_lambda: float = 1e-4
@@ -199,11 +200,17 @@ class RHN_Hypernetwork(nn.Module):
         embed_init_std = 1.0 / self.embed_scale
 
         self.input_size = self.config.hidden_size * self.config.L_layers
+        self.num_layers = len(self.layer_specs)
 
-        self.perceiver_queries = nn.Parameter(
+        if self.config.kron_dims_mult:
+            self.num_queries = self.num_layers * self.config.kron_dims
+        else:
+            self.num_queries = self.config.kron_dims
+
+        self.input_queries = nn.Parameter(
             trunc_normal_init_(
-                torch.empty((1, self.config.perceiver_rank, self.input_size), dtype=self.forward_dtype),
-                std=embed_init_std
+                torch.empty((1, self.num_queries, self.input_size), dtype=self.forward_dtype),
+                std=1.0 / math.sqrt(self.input_size),
             )
         )
 
@@ -222,8 +229,9 @@ class RHN_Hypernetwork(nn.Module):
 
         self.hypernet_base = nn.Sequential(*module_list)
 
+        self.output_dim = self._output_dim(layer_specs)
         self.output_head = CastedLinear(self.config.hypernet_hidden_size,
-                                         self._output_dim(layer_specs),
+                                         self.output_dim,
                                          bias=False)
 
     def forward(self, activations: torch.Tensor) -> Tuple[dict, torch.Tensor]:
@@ -236,31 +244,40 @@ class RHN_Hypernetwork(nn.Module):
         outputs = self.hypernet_base(inputs)
         outputs = self.output_head(outputs)
         outputs = rms_norm(outputs, variance_epsilon=self.config.rms_norm_eps)
-        outputs = self._expand_output(outputs)
+        outputs_list = self._expand_output(outputs)
 
-        step_l2 = outputs.view(batch_size, -1).pow(2).sum(dim=1)
+        flat_expanded = torch.cat(outputs_list, dim=1)
+        step_l2 = flat_expanded.pow(2).sum(dim=1)
 
         outputs_by_layer = {}
-        output_index = 0
-        for layer in self.config_per_layer:
-            shape = self.config_per_layer[layer]["shape"]
 
-            outputs_a = outputs[:, output_index : output_index + (shape[0] * self.config.hypernet_rank)]
+        gen_norm_sq = torch.zeros(batch_size, device=outputs.device)
+
+        for i, (layer_name, layer_info) in enumerate(self.config_per_layer.items()):
+            shape = layer_info["shape"]
+
+            # Retrieve the specific expanded tensor for this layer
+            layer_params = outputs_list[i]
+
+            output_index = 0
+
+            size_a = shape[0] * self.config.hypernet_rank
+            outputs_a = layer_params[:, output_index: output_index + size_a]
+            outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
             outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
-            output_index += shape[0] * self.config.hypernet_rank
+            output_index += size_a
 
-            if self.config_per_layer[layer]["type"] == "matrix":
-                outputs_b = outputs[:, output_index : output_index + (shape[1] * self.config.hypernet_rank)]
-                outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
-                output_index += shape[1] * self.config.hypernet_rank
-
-            if self.config_per_layer[layer]["type"] == "vector":
-                outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
-                outputs_by_layer[layer] = outputs_a
-            else:
-                outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
+            if layer_info["type"] == "matrix":
+                size_b = shape[1] * self.config.hypernet_rank
+                outputs_b = layer_params[:, output_index: output_index + size_b]
                 outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
-                outputs_by_layer[layer] = (outputs_a, outputs_b)
+                outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
+
+                output_index += size_b
+
+                outputs_by_layer[layer_name] = (outputs_a, outputs_b)
+            else:
+                outputs_by_layer[layer_name] = outputs_a
 
         return outputs_by_layer, step_l2
 
@@ -280,7 +297,7 @@ class RHN_Hypernetwork(nn.Module):
 
     def get_low_rank_factors(self, base_param_total_low_rank: int) -> list:
         if base_param_total_low_rank < 4:
-            raise ValueError("Input must be a positive integer >= 4.")
+            return [2, 2]
 
         def get_factors_if_valid(d):
             factors = []
@@ -306,31 +323,35 @@ class RHN_Hypernetwork(nn.Module):
                 return factors
             target_dim += 1
 
-    def _output_dim(self, layer_specs:dict) -> int:
-        base_param_dim_sum = 0
-        base_param_total = 0
-        for layer in layer_specs:
-            rows, cols = layer[1]
-            base_param_dim_sum += rows + cols
-            base_param_total += rows * cols
+    def _output_dim(self, layer_specs) -> int:
+        self.layer_kron_factors = {}
+        total_elements_needed = 0
 
-        base_param_total_low_rank = base_param_dim_sum * self.config.hypernet_rank
+        for name, shape in layer_specs:
+            if self._is_vector_like(shape):
+                params = shape[0] * self.config.hypernet_rank
+            else:
+                params = (shape[0] + shape[1]) * self.config.hypernet_rank
 
-        self.kron_factors = self.get_low_rank_factors(base_param_total_low_rank)
+            # Fetch and store factors tailored specifically to this layer
+            factors = self.get_low_rank_factors(params)
+            self.layer_kron_factors[name] = factors
 
-        # The total amount of elements the hypernet needs to generate is the sum of the square of each factor
-        total_factor_elements = sum(f ** 2 for f in self.kron_factors)
-        vals_to_generate = math.ceil(total_factor_elements / self.config.perceiver_rank)
+            # Accumulate the elements needed dynamically
+            layer_elements = sum(f ** 2 for f in factors)
+            total_elements_needed += layer_elements
 
-        return vals_to_generate
+        output_dim = int(math.ceil(total_elements_needed / self.num_queries))
+
+        return output_dim
 
     def _attention(self, inputs) -> torch.Tensor:
         B, S, D = inputs.shape
         H = self.config.perceiver_heads
-        Q = self.config.perceiver_rank
+        Q = self.num_queries
         head_dim = D // H
 
-        q = self.perceiver_queries.view(1, Q, H, head_dim).transpose(1, 2)
+        q = self.input_queries.view(1, Q, H, head_dim).transpose(1, 2)
         k = inputs.view(B, S, H, head_dim).transpose(1, 2)
         v = inputs.view(B, S, H, head_dim).transpose(1, 2)
 
@@ -341,34 +362,36 @@ class RHN_Hypernetwork(nn.Module):
 
         return pooled_inputs
 
-    def _expand_output(self, outputs) -> torch.Tensor:
+    def _expand_output(self, outputs: torch.Tensor) -> list:
         batch_size = outputs.shape[0]
-        outputs = outputs.reshape(batch_size, -1)  # Collapse perceiver rank dimension
+        outputs = outputs.flatten(start_dim=1)
 
-        idx = 0
-        expanded = None
+        expanded_per_layer = []
+        current_idx = 0
 
-        for f in self.kron_factors:
-            elements = f ** 2
+        for name, _ in self.layer_specs:
+            factors = self.layer_kron_factors[name]
+            expanded = None
 
-            # Slice out the values needed for this factor in the sequence
-            factor_tensor = outputs[..., idx : idx + elements].view(batch_size, f, f)
-            idx += elements
+            for f in factors:
+                elements = f ** 2
 
-            if expanded is None:
-                expanded = factor_tensor
-            else:
-                # Multiply the accumulated tensor with the current factor
-                expanded = torch.einsum('bij,bkl->bikjl', expanded, factor_tensor)
+                factor_tensor = outputs[:, current_idx : current_idx + elements]
+                factor_tensor = rms_norm(factor_tensor, variance_epsilon=self.config.rms_norm_eps)
+                factor_tensor = factor_tensor.view(batch_size, f, f)
+                current_idx += elements
 
-                # Reshape back into a single 2D block matrix (plus batch dimension)
-                H1, H2 = expanded.shape[1], expanded.shape[2]
-                W1, W2 = expanded.shape[3], expanded.shape[4]
-                expanded = expanded.reshape(batch_size, H1 * H2, W1 * W2)
+                if expanded is None:
+                    expanded = factor_tensor
+                else:
+                    expanded = torch.einsum('bij,bkl->bikjl', expanded, factor_tensor)
+                    H1, H2 = expanded.shape[1], expanded.shape[2]
+                    W1, W2 = expanded.shape[3], expanded.shape[4]
+                    expanded = expanded.reshape(batch_size, H1 * H2, W1 * W2)
 
-        outputs = expanded.flatten(start_dim=1, end_dim=-1)
+            expanded_per_layer.append(expanded.flatten(start_dim=1))
 
-        return outputs
+        return expanded_per_layer
 
 
 # class RHN_ACTV1ReasoningModule(nn.Module):
