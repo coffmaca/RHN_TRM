@@ -205,7 +205,7 @@ class RHN_Hypernetwork(nn.Module):
         self.input_size = self.config.hidden_size * self.config.L_layers
 
         self.perceiver_attn = nn.MultiheadAttention(
-            embed_dim=self.input_size,
+            embed_dim=self.config.hypernet_hidden_size,
             num_heads=self.config.perceiver_heads,
             batch_first=True,
             kdim=self.input_size,
@@ -214,18 +214,13 @@ class RHN_Hypernetwork(nn.Module):
 
         self.perceiver_queries = nn.Parameter(
             trunc_normal_init_(
-                torch.empty((1, self.config.perceiver_rank, self.input_size), dtype=self.forward_dtype),
+                torch.empty((1, self.config.perceiver_rank, self.config.hypernet_hidden_size), dtype=self.forward_dtype),
                 std=embed_init_std
             )
         )
 
         # TODO - Consider alternative initialization to 0's.  Classes below have built-in LeCun Normal initialization.
-        module_list = nn.ModuleList(
-            [CastedLinear(self.input_size,
-                          self.config.hypernet_hidden_size,
-                          bias=False)] + \
-            [nn.SiLU()]
-        )
+        module_list = nn.ModuleList()
         for _ in range(self.config.hypernet_hidden_depth):
             module_list.append(RHN_ACTV1Block(config=self.config, attn=False))
 
@@ -244,10 +239,7 @@ class RHN_Hypernetwork(nn.Module):
         hidden_states = rms_norm(inputs, variance_epsilon=self.config.rms_norm_eps)
 
         for i, layer in enumerate(self.hypernet_base):
-            if i < 2:
-                hidden_states = layer(hidden_states)
-            else:
-                hidden_states = layer(hidden_states=hidden_states, **seq_info)
+            hidden_states = layer(hidden_states=hidden_states, **seq_info)
         outputs = self.output_head(hidden_states)
         outputs = rms_norm(outputs, variance_epsilon=self.config.rms_norm_eps)
         outputs = self._expand_output(outputs)
