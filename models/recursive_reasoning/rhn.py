@@ -353,6 +353,8 @@ class RHN_Hypernetwork(nn.Module):
 
             # Slice out the values needed for this factor in the sequence
             factor_tensor = outputs[..., idx : idx + elements].view(batch_size, f, f)
+            factor_tensor = rms_norm(factor_tensor, variance_epsilon=self.config.rms_norm_eps)
+            factor_tensor = factor_tensor.view(batch_size, f, f)
             idx += elements
 
             if expanded is None:
