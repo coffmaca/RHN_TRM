@@ -42,3 +42,5 @@ ema_rate: 0.999 # EMA-rate
 freeze_weights: False # If True, freeze weights and only learn the embeddings
 
 gradient_clip_ema_tolerance: 4.0
+gradient_clip_warmup_fraction: 0.025
+gradient_clip_min_norm_fraction: 0.01

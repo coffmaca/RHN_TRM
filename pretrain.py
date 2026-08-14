@@ -88,45 +88,57 @@ class PretrainConfig(pydantic.BaseModel):
     freeze_weights: bool = False # If True, freeze weights and only learn the embeddings
 
     gradient_clip_ema_tolerance: float = 4.0
+    gradient_clip_warmup_fraction: float = 0.025
+    gradient_clip_min_norm_fraction: float = 0.1
 
 
 class GradientClipperEMA:
-    def __init__(self, ema_decay: float = 0.99, spike_tolerance: float = 3.0, min_ratio: float = 0.02):
+    def __init__(self, ema_decay: float = 0.99, spike_tolerance: float = 3.0,
+                 warmup_fraction: float = 0.025, min_norm_fraction: float = 0.1):
         self.ema_decay = ema_decay
         self.spike_tolerance = spike_tolerance
-        self.min_ratio = min_ratio
-        self.ema_ratios = {}
+        self.warmup_fraction = warmup_fraction
+        self.min_norm_fraction = min_norm_fraction
 
-    def __call__(self, model: nn.Module):
+        self.ema_g_norms = {}
+        self.min_norms = {}  # Stores the dynamically computed floors
+
+    def __call__(self, model: nn.Module, current_step: int, total_steps: int):
+        warmup_steps = int(total_steps * self.warmup_fraction)
+        is_warmup = current_step < warmup_steps
+        is_transition = current_step == warmup_steps
+
         with torch.no_grad():
             for name, param in model.named_parameters():
                 if param.grad is None:
                     continue
 
-                p_norm = param.norm().item()
                 g_norm = param.grad.norm().item()
 
-                if p_norm < 1e-8:
+                if name not in self.ema_g_norms:
+                    self.ema_g_norms[name] = g_norm
                     continue
 
-                current_ratio = g_norm / p_norm
+                ema = self.ema_g_norms[name]
 
-                if name not in self.ema_ratios:
-                    self.ema_ratios[name] = current_ratio
-                    continue
+                if is_transition:
+                    self.min_norms[name] = ema * self.min_norm_fraction
 
-                ema = self.ema_ratios[name]
+                if not is_warmup:
+                    # Fallback just in case the transition step was skipped (e.g., resumed from checkpoint)
+                    if name not in self.min_norms:
+                        self.min_norms[name] = ema * self.min_norm_fraction
 
-                threshold = max(self.min_ratio, ema) * self.spike_tolerance
+                    floor = self.min_norms[name]
+                    threshold = max(floor, ema) * self.spike_tolerance
 
-                if current_ratio > threshold:
-                    clip_factor = threshold / current_ratio
-                    param.grad.mul_(clip_factor)
+                    if g_norm > threshold:
+                        clip_factor = threshold / g_norm
+                        param.grad.mul_(clip_factor)
 
-                    current_ratio = threshold
+                        g_norm = threshold
 
-                # Update the EMA tracking
-                self.ema_ratios[name] = self.ema_decay * ema + (1 - self.ema_decay) * current_ratio
+                self.ema_g_norms[name] = self.ema_decay * ema + (1 - self.ema_decay) * g_norm
 
 @dataclass
 class TrainState:
@@ -279,7 +291,8 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
 
         grad_clipper_ema = GradientClipperEMA(ema_decay=0.99,
                                               spike_tolerance=config.gradient_clip_ema_tolerance,
-                                              min_ratio=0.02)
+                                              warmup_fraction=config.gradient_clip_warmup_fraction,
+                                              min_norm_fraction=config.gradient_clip_min_norm_fraction)
     )
 
 
@@ -369,7 +382,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
                 dist.all_reduce(param.grad)
 
     if train_state.grad_clipper_ema is not None:
-        train_state.grad_clipper_ema(train_state.model)
+        train_state.grad_clipper_ema(train_state.model, train_state.step, train_state.total_steps)
 
     captured_metrics = {}
     if rank == 0 and log_deep_metrics:
@@ -485,7 +498,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
                             reduced_metrics[f"telemetry/static_abs_mean/{name}"] = param.abs().mean().item()
                             reduced_metrics[f"telemetry/static_std/{name}"] = param.std().item()
 
-                            p_sum = param.sum().item()
+                            p_sum = param.abs().sum().item()
                             p_sq_sum = (param ** 2).sum().item()
                             p_count = param.numel()
 
