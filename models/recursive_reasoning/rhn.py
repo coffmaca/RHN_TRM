@@ -251,8 +251,6 @@ class RHN_Hypernetwork(nn.Module):
 
         outputs_by_layer = {}
 
-        gen_norm_sq = torch.zeros(batch_size, device=outputs.device)
-
         for i, (layer_name, layer_info) in enumerate(self.config_per_layer.items()):
             shape = layer_info["shape"]
 
