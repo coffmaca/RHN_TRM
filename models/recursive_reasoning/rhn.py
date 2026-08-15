@@ -243,15 +243,13 @@ class RHN_Hypernetwork(nn.Module):
 
         outputs = self.hypernet_base(inputs)
         outputs = self.output_head(outputs)
-        outputs = rms_norm(outputs, variance_epsilon=self.config.rms_norm_eps)
+        # outputs = rms_norm(outputs, variance_epsilon=self.config.rms_norm_eps)
         outputs_list = self._expand_output(outputs)
 
         flat_expanded = torch.cat(outputs_list, dim=1)
         step_l2 = flat_expanded.pow(2).sum(dim=1)
 
         outputs_by_layer = {}
-
-        gen_norm_sq = torch.zeros(batch_size, device=outputs.device)
 
         for i, (layer_name, layer_info) in enumerate(self.config_per_layer.items()):
             shape = layer_info["shape"]
