@@ -375,7 +375,7 @@ class RHN_Hypernetwork(nn.Module):
                 elements = f ** 2
 
                 factor_tensor = outputs[:, current_idx : current_idx + elements]
-                factor_tensor = rms_norm(factor_tensor, variance_epsilon=self.config.rms_norm_eps)
+                # factor_tensor = rms_norm(factor_tensor, variance_epsilon=self.config.rms_norm_eps)
                 factor_tensor = factor_tensor.view(batch_size, f, f)
                 current_idx += elements
 
