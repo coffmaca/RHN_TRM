@@ -261,14 +261,14 @@ class RHN_Hypernetwork(nn.Module):
 
             size_a = shape[0] * self.config.hypernet_rank
             outputs_a = layer_params[:, output_index: output_index + size_a]
-            outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
+            # outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
             outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
             output_index += size_a
 
             if layer_info["type"] == "matrix":
                 size_b = shape[1] * self.config.hypernet_rank
                 outputs_b = layer_params[:, output_index: output_index + size_b]
-                outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
+                # outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
                 outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
 
                 output_index += size_b
