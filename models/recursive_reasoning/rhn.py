@@ -243,7 +243,7 @@ class RHN_Hypernetwork(nn.Module):
 
         outputs = self.hypernet_base(inputs)
         outputs = self.output_head(outputs)
-        # outputs = rms_norm(outputs, variance_epsilon=self.config.rms_norm_eps)
+        outputs = rms_norm(outputs.flatten(start_dim=1), variance_epsilon=self.config.rms_norm_eps).view(outputs.shape)
         outputs_list = self._expand_output(outputs)
 
         flat_expanded = torch.cat(outputs_list, dim=1)
