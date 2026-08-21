@@ -75,26 +75,29 @@ class RHN_ACTV1Config(BaseModel):
     hypernet_relative_scale: int
     hypernet_l2_lambda: float = 1e-4
     hypernet_kl_lambda: float = 1e-4
+    hypernet_attn: bool
 
 class RHN_ACTV1Block(nn.Module):
-    def __init__(self, config: RHN_ACTV1Config) -> None:
+    def __init__(self, config: RHN_ACTV1Config, attn: bool) -> None:
         super().__init__()
 
         self.config = config
-        if self.config.mlp_t:
-            self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
-            self.mlp_t = SwiGLU(
-                hidden_size=self.config.seq_len + self.puzzle_emb_len, # L # TODO - Confirm reasoning for these values
-                expansion=config.expansion,
-            )
-        else:
-            self.self_attn = Attention(
-                hidden_size=config.hidden_size,
-                head_dim=config.hidden_size // config.num_heads,
-                num_heads=config.num_heads,
-                num_key_value_heads=config.num_heads,
-                causal=False
-            )
+        self.attn = attn
+        if attn:
+            if self.config.mlp_t:
+                self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
+                self.mlp_t = SwiGLU(
+                    hidden_size=self.config.seq_len + self.puzzle_emb_len, # L # TODO - Confirm reasoning for these values
+                    expansion=config.expansion,
+                )
+            else:
+                self.self_attn = Attention(
+                    hidden_size=config.hidden_size,
+                    head_dim=config.hidden_size // config.num_heads,
+                    num_heads=config.num_heads,
+                    num_key_value_heads=config.num_heads,
+                    causal=False
+                )
         self.mlp = SwiGLU(
             hidden_size=config.hidden_size,
             expansion=config.expansion,
@@ -104,15 +107,16 @@ class RHN_ACTV1Block(nn.Module):
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
         # B, L, D = hidden_states.shape
         # Post Norm
-        if self.config.mlp_t:
-            hidden_states = hidden_states.transpose(1,2)
-            att_out = self.mlp_t(hidden_states)
-            hidden_states = rms_norm(hidden_states + att_out, variance_epsilon=self.norm_eps)
-            hidden_states = hidden_states.transpose(1,2)
-        else:
-            # Self Attention
-            att_out = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
-            hidden_states = rms_norm(hidden_states + att_out, variance_epsilon=self.norm_eps)
+        if self.attn:
+            if self.config.mlp_t:
+                hidden_states = hidden_states.transpose(1,2)
+                att_out = self.mlp_t(hidden_states)
+                hidden_states = rms_norm(hidden_states + att_out, variance_epsilon=self.norm_eps)
+                hidden_states = hidden_states.transpose(1,2)
+            else:
+                # Self Attention
+                att_out = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
+                hidden_states = rms_norm(hidden_states + att_out, variance_epsilon=self.norm_eps)
         # Fully Connected
         out = self.mlp(hidden_states)
         hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
@@ -207,25 +211,25 @@ class RHN_Hypernetwork(nn.Module):
         else:
             self.num_queries = self.config.kron_dims
 
+        self.perceiver_attn = nn.MultiheadAttention(
+            embed_dim=self.config.hypernet_hidden_size,
+            num_heads=self.config.perceiver_heads,
+            batch_first=True,
+            kdim=self.input_size,
+            vdim=self.input_size,
+        ).to(dtype=self.forward_dtype)
+
         self.input_queries = nn.Parameter(
             trunc_normal_init_(
-                torch.empty((1, self.num_queries, self.input_size), dtype=self.forward_dtype),
-                std=1.0 / math.sqrt(self.input_size),
+                torch.empty((1, self.num_queries, self.config.hypernet_hidden_size), dtype=self.forward_dtype),
+                std=1.0 / math.sqrt(self.config.hypernet_hidden_size),
             )
         )
 
         # TODO - Consider alternative initialization to 0's.  Classes below have built-in LeCun Normal initialization.
-        module_list = nn.ModuleList(
-            [CastedLinear(self.input_size,
-                          self.config.hypernet_hidden_size,
-                          bias=False)] + \
-            [nn.SiLU()]
-        )
-        for _ in range(self.config.hypernet_hidden_depth):
-            module_list.append(SwiGLU(self.config.hypernet_hidden_size, self.config.expansion))
-            module_list.append(torch.nn.RMSNorm(self.config.hypernet_hidden_size,
-                                                eps=self.config.rms_norm_eps,
-                                                dtype=self.forward_dtype))
+        module_list = nn.ModuleList()
+        for _ in range(self.config.H_layers):
+            module_list.append(RHN_ACTV1Block(config=self.config, attn=False))
 
         self.hypernet_base = nn.Sequential(*module_list)
 
@@ -234,15 +238,17 @@ class RHN_Hypernetwork(nn.Module):
                                          self.output_dim,
                                          bias=False)
 
-    def forward(self, activations: torch.Tensor) -> Tuple[dict, torch.Tensor]:
+    def forward(self, activations: torch.Tensor, **seq_info) -> Tuple[dict, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
 
         inputs = self._attention(activations)
+        inputs = inputs + self.input_queries
 
-        inputs = rms_norm(inputs, variance_epsilon=self.config.rms_norm_eps)
+        hidden_states = rms_norm(inputs, variance_epsilon=self.config.rms_norm_eps)
 
-        outputs = self.hypernet_base(inputs)
-        outputs = self.output_head(outputs)
+        for i, layer in enumerate(self.hypernet_base):
+            hidden_states = layer(hidden_states=hidden_states, **seq_info)
+        outputs = self.output_head(hidden_states)
         # outputs = rms_norm(outputs, variance_epsilon=self.config.rms_norm_eps)
         outputs_list = self._expand_output(outputs)
 
@@ -344,21 +350,15 @@ class RHN_Hypernetwork(nn.Module):
         return output_dim
 
     def _attention(self, inputs) -> torch.Tensor:
-        B, S, D = inputs.shape
-        H = self.config.perceiver_heads
-        Q = self.num_queries
-        head_dim = D // H
+        batch_size = inputs.shape[0]
+        queries = self.input_queries.expand(batch_size, -1, -1)  # .to(dtype=inputs.dtype)
+        attn_output, _ = self.perceiver_attn(
+            query=queries,
+            key=inputs,
+            value=inputs
+        )
 
-        q = self.input_queries.view(1, Q, H, head_dim).transpose(1, 2)
-        k = inputs.view(B, S, H, head_dim).transpose(1, 2)
-        v = inputs.view(B, S, H, head_dim).transpose(1, 2)
-
-        attn_logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
-        attn_weights = F.softmax(attn_logits, dim=-1)
-        pooled_inputs = torch.matmul(attn_weights, v)
-        pooled_inputs = pooled_inputs.transpose(1, 2).contiguous().view(B, Q, D)
-
-        return pooled_inputs
+        return attn_output
 
     def _expand_output(self, outputs: torch.Tensor) -> list:
         batch_size = outputs.shape[0]
@@ -602,7 +602,7 @@ class RHN_ACTV1_Inner(nn.Module):
 
         # Dynamic weight output
         h_dyn = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
-        dynamic_weights, step_l2 = self.hypernet(activations)
+        dynamic_weights, step_l2 = self.hypernet(activations, **seq_info)
 
         step_metrics = {}
         with torch.no_grad():
