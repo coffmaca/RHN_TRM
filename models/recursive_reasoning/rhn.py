@@ -249,7 +249,7 @@ class RHN_Hypernetwork(nn.Module):
         for i, layer in enumerate(self.hypernet_base):
             hidden_states = layer(hidden_states=hidden_states, **seq_info)
         outputs = self.output_head(hidden_states)
-        # outputs = rms_norm(outputs, variance_epsilon=self.config.rms_norm_eps)
+        outputs = rms_norm(outputs.flatten(start_dim=1), variance_epsilon=self.config.rms_norm_eps).view(outputs.shape)
         outputs_list = self._expand_output(outputs)
 
         flat_expanded = torch.cat(outputs_list, dim=1)
@@ -267,14 +267,14 @@ class RHN_Hypernetwork(nn.Module):
 
             size_a = shape[0] * self.config.hypernet_rank
             outputs_a = layer_params[:, output_index: output_index + size_a]
-            outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
+            # outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
             outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
             output_index += size_a
 
             if layer_info["type"] == "matrix":
                 size_b = shape[1] * self.config.hypernet_rank
                 outputs_b = layer_params[:, output_index: output_index + size_b]
-                outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
+                # outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
                 outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
 
                 output_index += size_b
