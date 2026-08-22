@@ -200,8 +200,8 @@ class RHN_Hypernetwork(nn.Module):
                 "type": "vector" if self._is_vector_like(shape) else "matrix",
             }
 
-        self.embed_scale = math.sqrt(self.config.hypernet_hidden_size)
-        embed_init_std = 1.0 / self.embed_scale
+        # self.embed_scale = math.sqrt(self.config.hypernet_hidden_size)
+        # embed_init_std = 1.0 / self.embed_scale
 
         self.input_size = self.config.hidden_size * self.config.L_layers
         self.num_layers = len(self.layer_specs)
@@ -211,23 +211,28 @@ class RHN_Hypernetwork(nn.Module):
         else:
             self.num_queries = self.config.kron_dims
 
-        self.perceiver_attn = nn.MultiheadAttention(
-            embed_dim=self.config.hypernet_hidden_size,
-            num_heads=self.config.perceiver_heads,
-            batch_first=True,
-            kdim=self.input_size,
-            vdim=self.input_size,
-        ).to(dtype=self.forward_dtype)
+        # self.perceiver_attn = nn.MultiheadAttention(
+        #     embed_dim=self.config.hypernet_hidden_size,
+        #     num_heads=self.config.perceiver_heads,
+        #     batch_first=True,
+        #     kdim=self.input_size,
+        #     vdim=self.input_size,
+        # ).to(dtype=self.forward_dtype)
 
         self.input_queries = nn.Parameter(
             trunc_normal_init_(
-                torch.empty((1, self.num_queries, self.config.hypernet_hidden_size), dtype=self.forward_dtype),
-                std=1.0 / math.sqrt(self.config.hypernet_hidden_size),
+                torch.empty((1, self.num_queries, self.input_size), dtype=self.forward_dtype),
+                std=1.0 / math.sqrt(self.input_size),
             )
         )
 
         # TODO - Consider alternative initialization to 0's.  Classes below have built-in LeCun Normal initialization.
-        module_list = nn.ModuleList()
+        module_list = nn.ModuleList(
+            [CastedLinear(self.input_size,
+                          self.config.hypernet_hidden_size,
+                          bias=False)] + \
+            [nn.SiLU()]
+        )
         for _ in range(self.config.H_layers):
             module_list.append(RHN_ACTV1Block(config=self.config, attn=False))
 
@@ -247,7 +252,10 @@ class RHN_Hypernetwork(nn.Module):
         hidden_states = rms_norm(inputs, variance_epsilon=self.config.rms_norm_eps)
 
         for i, layer in enumerate(self.hypernet_base):
-            hidden_states = layer(hidden_states=hidden_states, **seq_info)
+            if i < 2:
+                hidden_states = layer(hidden_states)
+            else:
+                hidden_states = layer(hidden_states=hidden_states, **seq_info)
         outputs = self.output_head(hidden_states)
         outputs = rms_norm(outputs.flatten(start_dim=1), variance_epsilon=self.config.rms_norm_eps).view(outputs.shape)
         outputs_list = self._expand_output(outputs)
@@ -350,13 +358,27 @@ class RHN_Hypernetwork(nn.Module):
         return output_dim
 
     def _attention(self, inputs) -> torch.Tensor:
-        batch_size = inputs.shape[0]
-        queries = self.input_queries.expand(batch_size, -1, -1)  # .to(dtype=inputs.dtype)
-        attn_output, _ = self.perceiver_attn(
-            query=queries,
-            key=inputs,
-            value=inputs
-        )
+        B, S, D = inputs.shape
+        H = self.config.perceiver_heads
+        Q = self.num_queries
+        head_dim = D // H
+
+        q = self.input_queries.view(1, Q, H, head_dim).transpose(1, 2)
+        k = inputs.view(B, S, H, head_dim).transpose(1, 2)
+        v = inputs.view(B, S, H, head_dim).transpose(1, 2)
+
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
+        attn_weights = F.softmax(attn_logits, dim=-1)
+        attn_output = torch.matmul(attn_weights, v)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, Q, D)
+
+        # batch_size = inputs.shape[0]
+        # queries = self.input_queries.expand(batch_size, -1, -1)  # .to(dtype=inputs.dtype)
+        # attn_output, _ = self.perceiver_attn(
+        #     query=queries,
+        #     key=inputs,
+        #     value=inputs
+        # )
 
         return attn_output
 
