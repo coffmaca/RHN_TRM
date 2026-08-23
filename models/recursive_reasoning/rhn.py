@@ -229,7 +229,10 @@ class RHN_Hypernetwork(nn.Module):
         # TODO - Consider alternative initialization to 0's.  Classes below have built-in LeCun Normal initialization.
         module_list = nn.ModuleList()
         for _ in range(self.config.H_layers):
-            module_list.append(RHN_ACTV1Block(config=self.config, attn=False))
+            module_list.append(SwiGLU(self.config.hypernet_hidden_size, self.config.expansion))
+            module_list.append(torch.nn.RMSNorm(self.config.hypernet_hidden_size,
+                                                eps=self.config.rms_norm_eps,
+                                                dtype=self.forward_dtype))
 
         self.hypernet_base = nn.Sequential(*module_list)
 
@@ -247,7 +250,7 @@ class RHN_Hypernetwork(nn.Module):
         hidden_states = rms_norm(inputs, variance_epsilon=self.config.rms_norm_eps)
 
         for i, layer in enumerate(self.hypernet_base):
-            hidden_states = layer(hidden_states=hidden_states, **seq_info)
+            hidden_states = layer(hidden_states)
         outputs = self.output_head(hidden_states)
         outputs = rms_norm(outputs.flatten(start_dim=1), variance_epsilon=self.config.rms_norm_eps).view(outputs.shape)
         outputs_list = self._expand_output(outputs)
@@ -602,7 +605,7 @@ class RHN_ACTV1_Inner(nn.Module):
 
         # Dynamic weight output
         h_dyn = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
-        dynamic_weights, step_l2 = self.hypernet(activations, **seq_info)
+        dynamic_weights, step_l2 = self.hypernet(activations)
 
         step_metrics = {}
         with torch.no_grad():
