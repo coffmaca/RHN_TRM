@@ -221,7 +221,7 @@ class RHN_Hypernetwork(nn.Module):
                           bias=False)] + \
             [nn.SiLU()]
         )
-        for _ in range(self.config.hypernet_hidden_depth):
+        for _ in range(self.config.H_layers):
             module_list.append(SwiGLU(self.config.hypernet_hidden_size, self.config.expansion))
             module_list.append(torch.nn.RMSNorm(self.config.hypernet_hidden_size,
                                                 eps=self.config.rms_norm_eps,

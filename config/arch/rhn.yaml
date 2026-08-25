@@ -9,7 +9,7 @@ halt_max_steps: 16
 H_cycles: 3
 L_cycles: 6
 
-H_layers: 0
+H_layers: 2
 L_layers: 2
 
 hidden_size: 512
