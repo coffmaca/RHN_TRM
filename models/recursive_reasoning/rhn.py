@@ -243,7 +243,6 @@ class RHN_Hypernetwork(nn.Module):
         activations = self.dropout(activations)
 
         inputs = self._attention(activations)
-        inputs = inputs + self.input_queries
 
         inputs = rms_norm(inputs, variance_epsilon=self.config.rms_norm_eps)
 
