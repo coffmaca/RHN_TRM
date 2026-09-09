@@ -46,10 +46,17 @@ class DynamicCastedLinear(nn.Module):
     def __init__(self,
                  in_features: int,
                  out_features: int,
-                 bias: bool):
+                 bias: bool,
+                 base_param_rank: int):
         super().__init__()
-        # Truncated LeCun normal init
-        self.weight = nn.Parameter(trunc_normal_init_(torch.empty((out_features, in_features)), std=1.0 / (in_features ** 0.5)))
+        self.in_features = in_features
+        self.out_features = out_features
+        self.base_param_rank = base_param_rank
+
+        # Low-rank static base parameters instead of full-rank
+        self.weight_A = nn.Parameter(trunc_normal_init_(torch.empty((base_param_rank, in_features)), std=1.0 / (in_features ** 0.5)))
+        self.weight_B = nn.Parameter(trunc_normal_init_(torch.empty((out_features, base_param_rank)), std=1.0 / (base_param_rank ** 0.5)))
+
         self.bias = None
         if bias:
             # Zero init bias
@@ -64,9 +71,12 @@ class DynamicCastedLinear(nn.Module):
         self.dynamic_adapter = None
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if self.dynamic_adapter is None: # Base Out
-            return F.linear(input, self.weight.to(input.dtype), bias=self.bias.to(input.dtype) if self.bias is not None else None)
-        else: # Dynamic Out (using low-rank matrices)
+        if self.dynamic_adapter is None:
+            # Base Out (via sequential low-rank projections)
+            out = F.linear(input, self.weight_A.to(input.dtype))
+            return F.linear(out, self.weight_B.to(input.dtype), bias=self.bias.to(input.dtype) if self.bias is not None else None)
+        else:
+            # Dynamic Out (using low-rank matrices)
             A, B = self.dynamic_adapter
 
             if input.dim() == 2:
@@ -170,7 +180,7 @@ class RotaryEmbedding(nn.Module):
 
 
 class DynamicAttention(nn.Module):
-    def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False, attn_dropout=0.0):
+    def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, base_param_rank, causal=False, attn_dropout=0.0):
         super().__init__()
 
         self.hidden_size = hidden_size
@@ -180,8 +190,8 @@ class DynamicAttention(nn.Module):
         self.num_key_value_heads = num_key_value_heads
         self.causal = causal
 
-        self.qkv_proj = DynamicCastedLinear(self.hidden_size, (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim, bias=False)
-        self.o_proj = DynamicCastedLinear(self.output_size, self.hidden_size, bias=False)
+        self.qkv_proj = DynamicCastedLinear(self.hidden_size, (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim, bias=False, base_param_rank=base_param_rank)
+        self.o_proj = DynamicCastedLinear(self.output_size, self.hidden_size, bias=False, base_param_rank=base_param_rank)
 
     def set_dynamic_adapter(self, A_qkv, B_qkv, A_o, B_o):
         self.qkv_proj.set_dynamic_adapter(A_qkv, B_qkv)
@@ -271,12 +281,12 @@ class LinearSwish(nn.Module):
 
 
 class DynamicSwiGLU(nn.Module):
-    def __init__(self, hidden_size: int, expansion: float):
+    def __init__(self, hidden_size: int, expansion: float, base_param_rank: int):
         super().__init__()
 
         inter = _find_multiple(round(expansion * hidden_size * 2 / 3), 256)
-        self.gate_up_proj = DynamicCastedLinear(hidden_size, inter * 2, bias=False)
-        self.down_proj    = DynamicCastedLinear(inter, hidden_size, bias=False)
+        self.gate_up_proj = DynamicCastedLinear(hidden_size, inter * 2, bias=False, base_param_rank=base_param_rank)
+        self.down_proj    = DynamicCastedLinear(inter, hidden_size, bias=False, base_param_rank=base_param_rank)
 
     def set_dynamic_adapter(self, A_up, B_up, A_down, B_down):
         self.gate_up_proj.set_dynamic_adapter(A_up, B_up)
