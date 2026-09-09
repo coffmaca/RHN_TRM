@@ -64,8 +64,6 @@ class RHN_ACTV1Config(BaseModel):
     puzzle_emb_len: int = 16 # if non-zero, its specified to this value
     no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
 
-    base_param_rank: int = 32
-
     hypernet_hidden_size: int
     hypernet_hidden_depth: int
     hypernet_rank: int
@@ -132,7 +130,6 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
             self.mlp_t = DynamicSwiGLU(
                 hidden_size=self.config.seq_len + self.puzzle_emb_len,
                 expansion=config.expansion,
-                base_param_rank=config.base_param_rank
             )
         else:
             self.self_attn = DynamicAttention(
@@ -140,13 +137,11 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
                 head_dim=config.hidden_size // config.num_heads,
                 num_heads=config.num_heads,
                 num_key_value_heads=config.num_heads,
-                base_param_rank=config.base_param_rank,
                 causal=False
             )
         self.mlp = DynamicSwiGLU(
             hidden_size=config.hidden_size,
             expansion=config.expansion,
-            base_param_rank=config.base_param_rank
         )
         self.norm_eps = config.rms_norm_eps
 
@@ -622,7 +617,8 @@ class RHN_ACTV1_Inner(nn.Module):
                 # Reconstruct full-rank norm equivalent via get_submodule since original full-rank weight parameter was split
                 module_name = k.rsplit(".", 1)[0]
                 base_module = self.get_submodule(module_name)
-                base_param_norm = (base_module.weight_B @ base_module.weight_A).norm()
+                # Compute telemetry against the fully expanded representation
+                base_param = base_module.get_full_weight()
 
                 if isinstance(v, tuple) and len(v) == 2:
                     A, B = v
@@ -633,7 +629,7 @@ class RHN_ACTV1_Inner(nn.Module):
                         delta_W = torch.matmul(A[0], B[0]).float()
                         S = torch.linalg.svdvals(delta_W)
                         svd_ratio += (S[0] / (S.sum() + 1e-6))
-                        gen_base_l2_ratio += delta_W.norm() / (base_param_norm + 1e-8)
+                        gen_base_l2_ratio += delta_W.norm() / (base_param.norm() + 1e-8)
                     count += 1
                 else:
                     A = v
@@ -641,7 +637,7 @@ class RHN_ACTV1_Inner(nn.Module):
 
                     if log_deep_metrics:
                         delta_W = A[0].float()
-                        gen_base_l2_ratio += delta_W.norm() / (base_param_norm + 1e-8)
+                        gen_base_l2_ratio += delta_W.norm() / (base_param.norm() + 1e-8)
                     count += 1
 
             step_metrics["gen_norm"] = (gen_norm / count) if count > 0 else torch.tensor(0.0, device=h_base.device)
