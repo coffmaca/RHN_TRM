@@ -11,7 +11,7 @@ from pydantic import BaseModel
 import random
 from models.common import trunc_normal_init_
 from models.layers import (rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding,
-                           CastedParameter, CastedLinear, DynamicSwiGLU, DynamicAttention)
+                           CastedParameter, CastedLinear, DynamicSwiGLU, DynamicAttention, DynamicCastedLinear)
 from models.sparse_embedding import CastedSparseEmbedding
 
 IGNORE_LABEL_ID = -100
@@ -68,11 +68,9 @@ class RHN_ACTV1Config(BaseModel):
     hypernet_hidden_depth: int
     hypernet_rank: int
     layer_emb_dim: int
-    hypernet_relative_scale: float
     kron_dims: int
     kron_dims_mult: bool
     perceiver_heads: int
-    hypernet_relative_scale: int
     hypernet_l2_lambda: float = 1e-4
     hypernet_kl_lambda: float = 1e-4
 
@@ -199,7 +197,7 @@ class RHN_Hypernetwork(nn.Module):
         self.embed_scale = math.sqrt(self.config.hypernet_hidden_size)
         embed_init_std = 1.0 / self.embed_scale
 
-        self.input_size = self.config.hidden_size * self.config.L_layers
+        self.input_size = self.config.hidden_size
         self.num_layers = len(self.layer_specs)
 
         if self.config.kron_dims_mult:
@@ -441,11 +439,12 @@ class RHN_ACTV1_Inner(nn.Module):
 
         # Hypernetwork
         self.layer_specs = []
-        for name, param in self.named_parameters():
+        for name, module in self.named_modules():
             name_tag = name.split(".")[0]
             if name_tag != "L_level":
                 continue
-            self.layer_specs.append((name, param.shape))
+            if isinstance(module, DynamicCastedLinear):
+                self.layer_specs.append((name + ".weight", (module.out_features, module.in_features)))
 
         self.hypernet = RHN_Hypernetwork(self.config, self.layer_specs)
 
@@ -592,60 +591,38 @@ class RHN_ACTV1_Inner(nn.Module):
     def _dynamic_forward(self, z_L, z_H, input_embeddings=None, log_deep_metrics=False, **seq_info) -> Tuple[
         torch.Tensor, torch.Tensor, dict
     ]:
-        h_base = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
-        activations = torch.tensor([], dtype=h_base.dtype, device=h_base.device)
-        # Base model output
-        for layer in self.L_level:
-            layer.clear_dynamic_adapter()
-            h_base = layer(hidden_states=h_base, **seq_info)
-            activations = torch.cat((activations, h_base.detach()),
-                                    dim=2)  # TODO - Determine whether detaching is preferable here.
-
-        # Dynamic weight output
         h_dyn = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
-        dynamic_weights, step_l2 = self.hypernet(activations)
+
+        dynamic_weights, step_l2 = self.hypernet(h_dyn)
 
         step_metrics = {}
         with torch.no_grad():
-            step_metrics["sparsity"] = (h_base.abs() < 1e-3).float().mean()
-            step_metrics["saturation"] = (h_base.abs() > 5.0).float().mean()
+            step_metrics["sparsity"] = (h_dyn.abs() < 1e-3).float().mean()
+            step_metrics["saturation"] = (h_dyn.abs() > 5.0).float().mean()
 
             gen_norm = 0.0
             svd_ratio = 0.0
-            gen_base_l2_ratio = 0.0
             count = 0
 
             for k, v in dynamic_weights.items():
-                base_param = self.get_parameter(k)
                 if isinstance(v, tuple) and len(v) == 2:
                     A, B = v
-
                     gen_norm += (A[0].norm() + B[0].norm())
 
                     if log_deep_metrics:
                         delta_W = torch.matmul(A[0], B[0]).float()
                         S = torch.linalg.svdvals(delta_W)
                         svd_ratio += (S[0] / (S.sum() + 1e-6))
-
-                        gen_base_l2_ratio += delta_W.norm() / (base_param.norm() + 1e-8)
-
                     count += 1
                 else:
                     A = v
                     gen_norm += A[0].norm()
-
-                    if log_deep_metrics:
-                        delta_W = A[0].float()
-                        gen_base_l2_ratio += delta_W.norm() / (base_param.norm() + 1e-8)
-
                     count += 1
 
-            step_metrics["gen_norm"] = (gen_norm / count) if count > 0 else torch.tensor(0.0, device=h_base.device)
+            step_metrics["gen_norm"] = (gen_norm / count) if count > 0 else torch.tensor(0.0, device=h_dyn.device)
             if log_deep_metrics:
-                step_metrics["svd_ratio"] = (svd_ratio / count) if count > 0 else torch.tensor(0.0,
-                                                                                               device=h_base.device)
-                step_metrics["gen_base_l2_ratio"] = (gen_base_l2_ratio / count) if count > 0 else torch.tensor(0.0,
-                                                                                                         device=h_base.device)
+                step_metrics["svd_ratio"] = (svd_ratio / count) if count > 0 else torch.tensor(0.0, device=h_dyn.device)
+                step_metrics["gen_base_l2_ratio"] = torch.tensor(0.0, device=h_dyn.device) # Base passed bypassed; setting explicitly for telemetry format
 
         for i, layer in enumerate(self.L_level):
             layer_weights = [dynamic_weights[layer_name] for layer_name in dynamic_weights if
@@ -653,8 +630,7 @@ class RHN_ACTV1_Inner(nn.Module):
             layer.set_dynamic_adapter(*layer_weights)
             h_dyn = layer(hidden_states=h_dyn, **seq_info)
 
-        return h_base + h_dyn, step_l2, step_metrics #, step_kl
-
+        return h_dyn, step_l2, step_metrics #, step_kl
 
 
 class RHN_ACTV1(nn.Module):

@@ -48,8 +48,11 @@ class DynamicCastedLinear(nn.Module):
                  out_features: int,
                  bias: bool):
         super().__init__()
-        # Truncated LeCun normal init
-        self.weight = nn.Parameter(trunc_normal_init_(torch.empty((out_features, in_features)), std=1.0 / (in_features ** 0.5)))
+
+        self.in_features = in_features
+        self.out_features = out_features
+
+        # Static base weights bypassed/removed
         self.bias = None
         if bias:
             # Zero init bias
@@ -64,29 +67,29 @@ class DynamicCastedLinear(nn.Module):
         self.dynamic_adapter = None
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if self.dynamic_adapter is None: # Base Out
-            return F.linear(input, self.weight.to(input.dtype), bias=self.bias.to(input.dtype) if self.bias is not None else None)
-        else: # Dynamic Out (using low-rank matrices)
-            A, B = self.dynamic_adapter
+        if self.dynamic_adapter is None:
+            raise RuntimeError("Static base weights bypassed: Dynamic adapter must be set before forward pass.")
 
-            if input.dim() == 2:
-                input_reshaped = input.unsqueeze(1)  # [Batch, 1, In]
-            else:
-                input_reshaped = input
+        A, B = self.dynamic_adapter
 
-            out = torch.einsum('abc,adc->abd', input, B.to(input.dtype)) # torch.matmul(input, B)
-            out = torch.einsum('abd,aed->abe', out, A.to(input.dtype)) # torch.matmul(out, A)
+        if input.dim() == 2:
+            input_reshaped = input.unsqueeze(1)  # [Batch, 1, In]
+        else:
+            input_reshaped = input
 
-            in_features = input_reshaped.shape[-1]
-            rank = B.shape[1]
-            var_scale = math.sqrt(in_features * rank)
+        out = torch.einsum('abc,adc->abd', input, B.to(input.dtype)) # torch.matmul(input, B)
+        out = torch.einsum('abd,aed->abe', out, A.to(input.dtype)) # torch.matmul(out, A)
 
-            out = out / var_scale
+        in_features = input_reshaped.shape[-1]
+        rank = B.shape[1]
+        var_scale = math.sqrt(in_features * rank)
 
-            if input.dim() == 2:
-                out = out.squeeze(1)
+        out = out / var_scale
 
-            return out
+        if input.dim() == 2:
+            out = out.squeeze(1)
+
+        return out
 
     def __getstate__(self):
         state = self.__dict__.copy()
