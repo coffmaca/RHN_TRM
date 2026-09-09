@@ -35,3 +35,4 @@ kron_dims_mult: False
 perceiver_heads: 8
 hypernet_l2_lambda: 1e-4
 hypernet_kl_lambda: 1e-4
+hypernet_dropout: 0.2

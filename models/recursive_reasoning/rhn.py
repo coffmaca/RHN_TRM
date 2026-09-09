@@ -75,6 +75,7 @@ class RHN_ACTV1Config(BaseModel):
     hypernet_relative_scale: int
     hypernet_l2_lambda: float = 1e-4
     hypernet_kl_lambda: float = 1e-4
+    hypernet_dropout: float = 0.2
 
 class RHN_ACTV1Block(nn.Module):
     def __init__(self, config: RHN_ACTV1Config) -> None:
@@ -227,6 +228,8 @@ class RHN_Hypernetwork(nn.Module):
                                                 eps=self.config.rms_norm_eps,
                                                 dtype=self.forward_dtype))
 
+        self.dropout = nn.Dropout(p=self.config.hypernet_dropout)
+
         self.hypernet_base = nn.Sequential(*module_list)
 
         self.output_dim = self._output_dim(layer_specs)
@@ -236,6 +239,8 @@ class RHN_Hypernetwork(nn.Module):
 
     def forward(self, activations: torch.Tensor) -> Tuple[dict, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
+
+        activations = self.dropout(activations)
 
         inputs = self._attention(activations)
         inputs = inputs + self.input_queries
