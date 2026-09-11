@@ -64,6 +64,7 @@ class RHN_ACTV1Config(BaseModel):
     puzzle_emb_len: int = 16 # if non-zero, its specified to this value
     no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
 
+    dynamic_hidden_size: int  # Decoupled dynamic dimension
     hypernet_hidden_size: int
     hypernet_hidden_depth: int
     hypernet_rank: int
@@ -72,7 +73,6 @@ class RHN_ACTV1Config(BaseModel):
     kron_dims: int
     kron_dims_mult: bool
     perceiver_heads: int
-    hypernet_relative_scale: int
     hypernet_l2_lambda: float = 1e-4
     hypernet_kl_lambda: float = 1e-4
 
@@ -84,7 +84,7 @@ class RHN_ACTV1Block(nn.Module):
         if self.config.mlp_t:
             self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
             self.mlp_t = SwiGLU(
-                hidden_size=self.config.seq_len + self.puzzle_emb_len, # L # TODO - Confirm reasoning for these values
+                hidden_size=self.config.seq_len + self.puzzle_emb_len,
                 expansion=config.expansion,
             )
         else:
@@ -124,23 +124,24 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
         super().__init__()
 
         self.config = config
+        d_hid = self.config.dynamic_hidden_size
+
         if self.config.mlp_t:
-            self.puzzle_emb_len = -(
-                        self.config.puzzle_emb_ndim // -self.config.hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
+            self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -d_hid) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
             self.mlp_t = DynamicSwiGLU(
                 hidden_size=self.config.seq_len + self.puzzle_emb_len,
                 expansion=config.expansion,
             )
         else:
             self.self_attn = DynamicAttention(
-                hidden_size=config.hidden_size,
-                head_dim=config.hidden_size // config.num_heads,
+                hidden_size=d_hid,
+                head_dim=d_hid // config.num_heads,
                 num_heads=config.num_heads,
                 num_key_value_heads=config.num_heads,
                 causal=False
             )
         self.mlp = DynamicSwiGLU(
-            hidden_size=config.hidden_size,
+            hidden_size=d_hid,
             expansion=config.expansion,
         )
         self.norm_eps = config.rms_norm_eps
@@ -197,8 +198,8 @@ class RHN_Hypernetwork(nn.Module):
             }
 
         self.embed_scale = math.sqrt(self.config.hypernet_hidden_size)
-        embed_init_std = 1.0 / self.embed_scale
 
+        # Hypernetwork scans the static base model's activations
         self.input_size = self.config.hidden_size * self.config.L_layers
         self.num_layers = len(self.layer_specs)
 
@@ -214,14 +215,13 @@ class RHN_Hypernetwork(nn.Module):
             )
         )
 
-        # TODO - Consider alternative initialization to 0's.  Classes below have built-in LeCun Normal initialization.
         module_list = nn.ModuleList(
             [CastedLinear(self.input_size,
                           self.config.hypernet_hidden_size,
                           bias=False)] + \
             [nn.SiLU()]
         )
-        for _ in range(self.config.hypernet_hidden_depth):
+        for _ in range(self.config.H_layers):
             module_list.append(SwiGLU(self.config.hypernet_hidden_size, self.config.expansion))
             module_list.append(torch.nn.RMSNorm(self.config.hypernet_hidden_size,
                                                 eps=self.config.rms_norm_eps,
@@ -253,10 +253,7 @@ class RHN_Hypernetwork(nn.Module):
 
         for i, (layer_name, layer_info) in enumerate(self.config_per_layer.items()):
             shape = layer_info["shape"]
-
-            # Retrieve the specific expanded tensor for this layer
             layer_params = outputs_list[i]
-
             output_index = 0
 
             size_a = shape[0] * self.config.hypernet_rank
@@ -270,9 +267,7 @@ class RHN_Hypernetwork(nn.Module):
                 outputs_b = layer_params[:, output_index: output_index + size_b]
                 # outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
                 outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
-
                 output_index += size_b
-
                 outputs_by_layer[layer_name] = (outputs_a, outputs_b)
             else:
                 outputs_by_layer[layer_name] = outputs_a
@@ -331,11 +326,9 @@ class RHN_Hypernetwork(nn.Module):
             else:
                 params = (shape[0] + shape[1]) * self.config.hypernet_rank
 
-            # Fetch and store factors tailored specifically to this layer
             factors = self.get_low_rank_factors(params)
             self.layer_kron_factors[name] = factors
 
-            # Accumulate the elements needed dynamically
             layer_elements = sum(f ** 2 for f in factors)
             total_elements_needed += layer_elements
 
@@ -373,7 +366,6 @@ class RHN_Hypernetwork(nn.Module):
 
             for f in factors:
                 elements = f ** 2
-
                 factor_tensor = outputs[:, current_idx : current_idx + elements]
                 factor_tensor = rms_norm(factor_tensor, variance_epsilon=self.config.rms_norm_eps)
                 factor_tensor = factor_tensor.view(batch_size, f, f)
@@ -392,65 +384,56 @@ class RHN_Hypernetwork(nn.Module):
         return expanded_per_layer
 
 
-# class RHN_ACTV1ReasoningModule(nn.Module):
-#     def __init__(self, layers: List[RHN_ACTV1Block_Dynamic]):
-#         super().__init__()
-#         self.layers = torch.nn.ModuleList(layers)
-#
-#     def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs) -> torch.Tensor:
-#         hidden_states = hidden_states + input_injection
-#         for layer in self.layers:
-#             hidden_states = layer(hidden_states=hidden_states, **kwargs)
-#         return hidden_states
-
-
 class RHN_ACTV1_Inner(nn.Module):
     def __init__(self, config: RHN_ACTV1Config) -> None:
         super().__init__()
         self.config = config
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
+        d_hid = self.config.dynamic_hidden_size
 
-        # I/O
-
-        self.embed_scale = math.sqrt(self.config.hidden_size)
+        self.embed_scale = math.sqrt(d_hid)
         embed_init_std = 1.0 / self.embed_scale
 
-        self.embed_tokens = CastedEmbedding(self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
-        self.lm_head      = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
-        self.q_head       = CastedLinear(self.config.hidden_size, 2, bias=True)
+        self.embed_tokens = CastedEmbedding(self.config.vocab_size, d_hid, init_std=embed_init_std, cast_to=self.forward_dtype)
+        self.lm_head      = CastedLinear(d_hid, self.config.vocab_size, bias=False)
+        self.q_head       = CastedLinear(d_hid, 2, bias=True)
 
-        self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)  if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len  # ceil div
+        self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -d_hid) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
         if self.config.puzzle_emb_ndim > 0:
-            # Zero init puzzle embeddings
             self.puzzle_emb = CastedSparseEmbedding(self.config.num_puzzle_identifiers, self.config.puzzle_emb_ndim,
                                                     batch_size=self.config.batch_size, init_std=0, cast_to=self.forward_dtype)
 
-        # LM Blocks
+        # Isolated RoPE Embeddings prevent dimension broadcasting crashes
         if self.config.pos_encodings == "rope":
-            self.rotary_emb = RotaryEmbedding(dim=self.config.hidden_size // self.config.num_heads,
+            self.rotary_emb_base = RotaryEmbedding(dim=self.config.hidden_size // self.config.num_heads,
+                                              max_position_embeddings=self.config.seq_len + self.puzzle_emb_len,
+                                              base=self.config.rope_theta)
+            self.rotary_emb_dyn = RotaryEmbedding(dim=d_hid // self.config.num_heads,
                                               max_position_embeddings=self.config.seq_len + self.puzzle_emb_len,
                                               base=self.config.rope_theta)
         elif self.config.pos_encodings == "learned":
-            self.embed_pos = CastedEmbedding(self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
-        else:
-            pass
+            self.embed_pos = CastedEmbedding(self.config.seq_len + self.puzzle_emb_len, d_hid, init_std=embed_init_std, cast_to=self.forward_dtype)
 
-        # Reasoning Layers
-        self.L_level = torch.nn.ModuleList([RHN_ACTV1Block_Dynamic(self.config) for _i in range(self.config.L_layers)])
+        # Base and Dynamic Lanes
+        self.L_level_base = torch.nn.ModuleList([RHN_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
+        self.L_level_dyn = torch.nn.ModuleList([RHN_ACTV1Block_Dynamic(self.config) for _i in range(self.config.L_layers)])
 
-        # Hypernetwork
+        # Dimensional bridging projections into/out of static base model
+        self.base_proj_in = CastedLinear(d_hid, self.config.hidden_size, bias=False)
+        self.base_proj_out = CastedLinear(self.config.hidden_size, d_hid, bias=False)
+
+        # Hypernetwork maps exactly to the dynamic lane
         self.layer_specs = []
         for name, param in self.named_parameters():
             name_tag = name.split(".")[0]
-            if name_tag != "L_level":
+            if name_tag != "L_level_dyn":
                 continue
             self.layer_specs.append((name, param.shape))
 
         self.hypernet = RHN_Hypernetwork(self.config, self.layer_specs)
 
-        # Initial states
-        self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
-        self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(d_hid, dtype=self.forward_dtype), std=1), persistent=True)
+        self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(d_hid, dtype=self.forward_dtype), std=1), persistent=True)
 
         # Q head special init
         # Init Q to (almost) zero for faster learning during bootstrapping
@@ -465,14 +448,11 @@ class RHN_ACTV1_Inner(nn.Module):
         # Puzzle embeddings
         if self.config.puzzle_emb_ndim > 0:
             puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
-            
-            pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
+            pad_count = self.puzzle_emb_len * self.config.dynamic_hidden_size - puzzle_embedding.shape[-1]
             if pad_count > 0:
                 puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
+            embedding = torch.cat((puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.dynamic_hidden_size), embedding), dim=-2)
 
-            embedding = torch.cat((puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size), embedding), dim=-2)
-
-        # Position embeddings
         if self.config.pos_encodings == "learned":
             # scale by 1/sqrt(2) to maintain forward variance
             embedding = 0.707106781 * (embedding + self.embed_pos.embedding_weight.to(self.forward_dtype))
@@ -481,9 +461,10 @@ class RHN_ACTV1_Inner(nn.Module):
         return self.embed_scale * embedding
 
     def empty_carry(self, batch_size: int):
+        d_hid = self.config.dynamic_hidden_size
         return RHN_ACTV1InnerCarry(
-            z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
-            z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, d_hid, dtype=self.forward_dtype),
+            z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, d_hid, dtype=self.forward_dtype),
         )
         
     def reset_carry(self, reset_flag: torch.Tensor, carry: RHN_ACTV1InnerCarry):
@@ -496,9 +477,8 @@ class RHN_ACTV1_Inner(nn.Module):
                 log_deep_metrics: bool = False, **kwargs) -> Tuple[
         RHN_ACTV1InnerCarry,torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor, dict
     ]:
-        seq_info = dict(
-            cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
-        )
+        seq_info_base = dict(cos_sin=self.rotary_emb_base() if hasattr(self, "rotary_emb_base") else None)
+        seq_info_dyn = dict(cos_sin=self.rotary_emb_dyn() if hasattr(self, "rotary_emb_dyn") else None)
 
         # Input encoding
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
@@ -544,14 +524,16 @@ class RHN_ACTV1_Inner(nn.Module):
                                                 z_H=z_H,
                                                 input_embeddings=input_embeddings,
                                                 log_deep_metrics=log_deep_metrics,
-                                                **seq_info)
+                                                seq_info_base=seq_info_base,
+                                                seq_info_dyn=seq_info_dyn)
                     track_metrics(prev_z_L, z_L, step_m)
                 prev_z_H = z_H
                 z_H, _, step_m = self._dynamic_forward(z_L=z_L,
                                             z_H=z_H,
                                             input_embeddings=None,
                                             log_deep_metrics=log_deep_metrics,
-                                            **seq_info)
+                                            seq_info_base=seq_info_base,
+                                            seq_info_dyn=seq_info_dyn)
                 track_metrics(prev_z_H, z_H, step_m)
 
         for _L_step in range(self.config.L_cycles):
@@ -560,7 +542,8 @@ class RHN_ACTV1_Inner(nn.Module):
                                         z_H=z_H,
                                         input_embeddings=input_embeddings,
                                         log_deep_metrics=log_deep_metrics,
-                                        **seq_info)
+                                        seq_info_base=seq_info_base,
+                                        seq_info_dyn=seq_info_dyn)
             track_metrics(prev_z_L, z_L, step_m)
 
         prev_z_H = z_H
@@ -568,14 +551,11 @@ class RHN_ACTV1_Inner(nn.Module):
                                     z_H=z_H,
                                     input_embeddings=None,
                                     log_deep_metrics=log_deep_metrics,
-                                    **seq_info)
+                                    seq_info_base=seq_info_base,
+                                    seq_info_dyn=seq_info_dyn)
 
         total_l2 += step_l2
-        # total_kl += step_kl
-
         avg_l2 = total_l2 / (self.config.L_cycles + 1)
-        # avg_kl = total_kl / (self.config.L_cycles + 1)
-
         track_metrics(prev_z_H, z_H, step_m)
 
         if metric_calls > 0:
@@ -588,26 +568,31 @@ class RHN_ACTV1_Inner(nn.Module):
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), avg_l2, total_metrics #, avg_kl
 
-    def _dynamic_forward(self, z_L, z_H, input_embeddings=None, log_deep_metrics=False, **seq_info) -> Tuple[
+    def _dynamic_forward(self, z_L, z_H, input_embeddings=None, log_deep_metrics=False, seq_info_base=None, seq_info_dyn=None) -> Tuple[
         torch.Tensor, torch.Tensor, dict
     ]:
-        h_base = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
-        activations = torch.tensor([], dtype=h_base.dtype, device=h_base.device)
-        # Base model output
-        for layer in self.L_level:
-            layer.clear_dynamic_adapter()
-            h_base = layer(hidden_states=h_base, **seq_info)
-            activations = torch.cat((activations, h_base.detach()),
-                                    dim=2)  # TODO - Determine whether detaching is preferable here.
+        if seq_info_base is None: seq_info_base = {}
+        if seq_info_dyn is None: seq_info_dyn = {}
 
-        # Dynamic weight output
-        h_dyn = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
+        h_in = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
+
+        # Base Model (Static Execution via Projections)
+        h_base_in = self.base_proj_in(h_in)
+        activations = torch.tensor([], dtype=h_base_in.dtype, device=h_base_in.device)
+        for layer in self.L_level_base:
+            h_base_in = layer(hidden_states=h_base_in, **seq_info_base)
+            activations = torch.cat((activations, h_base_in.detach()), dim=2)
+
+        h_base_out = self.base_proj_out(h_base_in)
+
+        # Dynamic Model (Native Baseline Execution)
+        h_dyn = h_in
         dynamic_weights, step_l2 = self.hypernet(activations)
 
         step_metrics = {}
         with torch.no_grad():
-            step_metrics["sparsity"] = (h_base.abs() < 1e-3).float().mean()
-            step_metrics["saturation"] = (h_base.abs() > 5.0).float().mean()
+            step_metrics["sparsity"] = (h_base_out.abs() < 1e-3).float().mean()
+            step_metrics["saturation"] = (h_base_out.abs() > 5.0).float().mean()
 
             gen_norm = 0.0
             svd_ratio = 0.0
@@ -639,21 +624,18 @@ class RHN_ACTV1_Inner(nn.Module):
 
                     count += 1
 
-            step_metrics["gen_norm"] = (gen_norm / count) if count > 0 else torch.tensor(0.0, device=h_base.device)
+            step_metrics["gen_norm"] = (gen_norm / count) if count > 0 else torch.tensor(0.0, device=h_base_out.device)
             if log_deep_metrics:
-                step_metrics["svd_ratio"] = (svd_ratio / count) if count > 0 else torch.tensor(0.0,
-                                                                                               device=h_base.device)
-                step_metrics["gen_base_l2_ratio"] = (gen_base_l2_ratio / count) if count > 0 else torch.tensor(0.0,
-                                                                                                         device=h_base.device)
+                step_metrics["svd_ratio"] = (svd_ratio / count) if count > 0 else torch.tensor(0.0, device=h_base_out.device)
+                step_metrics["gen_base_l2_ratio"] = (gen_base_l2_ratio / count) if count > 0 else torch.tensor(0.0, device=h_base_out.device)
 
-        for i, layer in enumerate(self.L_level):
+        for i, layer in enumerate(self.L_level_dyn):
             layer_weights = [dynamic_weights[layer_name] for layer_name in dynamic_weights if
-                             f"L_level.{i}" in layer_name]
+                             f"L_level_dyn.{i}" in layer_name]
             layer.set_dynamic_adapter(*layer_weights)
-            h_dyn = layer(hidden_states=h_dyn, **seq_info)
+            h_dyn = layer(hidden_states=h_dyn, **seq_info_dyn)
 
-        return h_base + h_dyn, step_l2, step_metrics #, step_kl
-
+        return h_base_out + h_dyn, step_l2, step_metrics
 
 
 class RHN_ACTV1(nn.Module):
