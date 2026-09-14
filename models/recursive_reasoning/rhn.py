@@ -234,7 +234,7 @@ class RHN_Hypernetwork(nn.Module):
                                          self.output_dim,
                                          bias=False)
 
-    def forward(self, activations: torch.Tensor) -> Tuple[dict, torch.Tensor]:
+    def forward(self, activations: torch.Tensor) -> Tuple[dict, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = activations.shape
 
         inputs = self._attention(activations)
@@ -248,6 +248,8 @@ class RHN_Hypernetwork(nn.Module):
 
         flat_expanded = torch.cat(outputs_list, dim=1)
         step_l2 = flat_expanded.pow(2).sum(dim=1)
+
+        hypernet_output_state = flat_expanded.detach()
 
         outputs_by_layer = {}
 
@@ -272,7 +274,7 @@ class RHN_Hypernetwork(nn.Module):
             else:
                 outputs_by_layer[layer_name] = outputs_a
 
-        return outputs_by_layer, step_l2
+        return outputs_by_layer, step_l2, hypernet_output_state
 
     def _is_vector_like(self, shape:list) -> bool:
         if len(shape) < 2:
@@ -490,7 +492,8 @@ class RHN_ACTV1_Inner(nn.Module):
             "telemetry/act_sparsity": torch.tensor(0.0, device=z_H.device),
             "telemetry/act_saturation": torch.tensor(0.0, device=z_H.device),
             "telemetry/gen_l2_norm": torch.tensor(0.0, device=z_H.device),
-            "telemetry/state_drift": torch.tensor(0.0, device=z_H.device)
+            "telemetry/state_drift": torch.tensor(0.0, device=z_H.device),
+            "telemetry/hypernet_output_drift": torch.tensor(0.0, device=z_H.device)
         }
 
         if log_deep_metrics:
@@ -499,13 +502,16 @@ class RHN_ACTV1_Inner(nn.Module):
 
         metric_calls = 0
 
-        def track_metrics(prev_state, new_state, step_metrics):
+        def track_metrics(prev_state, new_state, prev_hypernet, new_hypernet, step_metrics):
             nonlocal metric_calls
             total_metrics["telemetry/act_sparsity"] += step_metrics["sparsity"]
             total_metrics["telemetry/act_saturation"] += step_metrics["saturation"]
             total_metrics["telemetry/gen_l2_norm"] += step_metrics["gen_norm"]
             total_metrics["telemetry/state_drift"] += F.cosine_similarity(prev_state, new_state, dim=-1).mean()
 
+            if prev_hypernet is not None and new_hypernet is not None:
+                total_metrics["telemetry/hypernet_output_drift"] += F.cosine_similarity(prev_hypernet, new_hypernet,
+                                                                                        dim=-1).mean()
             # Low-Frequency (Every 100 Steps)
             if log_deep_metrics:
                 total_metrics["telemetry/gen_svd_ratio"] += step_metrics["svd_ratio"]
@@ -515,39 +521,44 @@ class RHN_ACTV1_Inner(nn.Module):
         total_l2 = torch.zeros(z_L.shape[0], device=z_L.device, dtype=z_L.dtype)
         # total_kl = torch.zeros(z_L.shape[0], device=z_L.device, dtype=z_L.dtype)
 
+        prev_hypernet_state = None
+
         # H_cycles-1 without grad
         with torch.no_grad():
             for _H_step in range(self.config.H_cycles-1):
                 for _L_step in range(self.config.L_cycles):
                     prev_z_L = z_L
-                    z_L, _, step_m = self._dynamic_forward(z_L=z_L,
+                    z_L, _, hypernet_state, step_m = self._dynamic_forward(z_L=z_L,
                                                 z_H=z_H,
                                                 input_embeddings=input_embeddings,
                                                 log_deep_metrics=log_deep_metrics,
                                                 seq_info_base=seq_info_base,
                                                 seq_info_dyn=seq_info_dyn)
-                    track_metrics(prev_z_L, z_L, step_m)
+                    track_metrics(prev_z_L, z_L, prev_hypernet_state, hypernet_state, step_m)
+                    prev_hypernet_state = hypernet_state
                 prev_z_H = z_H
-                z_H, _, step_m = self._dynamic_forward(z_L=z_L,
+                z_H, _, hypernet_state, step_m = self._dynamic_forward(z_L=z_L,
                                             z_H=z_H,
                                             input_embeddings=None,
                                             log_deep_metrics=log_deep_metrics,
                                             seq_info_base=seq_info_base,
                                             seq_info_dyn=seq_info_dyn)
-                track_metrics(prev_z_H, z_H, step_m)
+                track_metrics(prev_z_H, z_H, prev_hypernet_state, hypernet_state, step_m)
+                prev_hypernet_state = hypernet_state
 
         for _L_step in range(self.config.L_cycles):
             prev_z_L = z_L
-            z_L, step_l2, step_m = self._dynamic_forward(z_L=z_L,
+            z_L, step_l2, hypernet_state, step_m = self._dynamic_forward(z_L=z_L,
                                         z_H=z_H,
                                         input_embeddings=input_embeddings,
                                         log_deep_metrics=log_deep_metrics,
                                         seq_info_base=seq_info_base,
                                         seq_info_dyn=seq_info_dyn)
-            track_metrics(prev_z_L, z_L, step_m)
+            track_metrics(prev_z_L, z_L, prev_hypernet_state, hypernet_state, step_m)
+            prev_hypernet_state = hypernet_state
 
         prev_z_H = z_H
-        z_H, step_l2, step_m = self._dynamic_forward(z_L=z_L,
+        z_H, step_l2, hypernet_state, step_m = self._dynamic_forward(z_L=z_L,
                                     z_H=z_H,
                                     input_embeddings=None,
                                     log_deep_metrics=log_deep_metrics,
@@ -556,7 +567,7 @@ class RHN_ACTV1_Inner(nn.Module):
 
         total_l2 += step_l2
         avg_l2 = total_l2 / (self.config.L_cycles + 1)
-        track_metrics(prev_z_H, z_H, step_m)
+        track_metrics(prev_z_H, z_H, prev_hypernet_state, hypernet_state, step_m)
 
         if metric_calls > 0:
             for k in total_metrics:
@@ -569,7 +580,7 @@ class RHN_ACTV1_Inner(nn.Module):
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), avg_l2, total_metrics #, avg_kl
 
     def _dynamic_forward(self, z_L, z_H, input_embeddings=None, log_deep_metrics=False, seq_info_base=None, seq_info_dyn=None) -> Tuple[
-        torch.Tensor, torch.Tensor, dict
+        torch.Tensor, torch.Tensor, torch.Tensor, dict
     ]:
         if seq_info_base is None: seq_info_base = {}
         if seq_info_dyn is None: seq_info_dyn = {}
@@ -587,7 +598,7 @@ class RHN_ACTV1_Inner(nn.Module):
 
         # Dynamic Model (Native Baseline Execution)
         h_dyn = h_in
-        dynamic_weights, step_l2 = self.hypernet(activations)
+        dynamic_weights, step_l2, hypernet_output_state = self.hypernet(activations)
 
         step_metrics = {}
         with torch.no_grad():
@@ -635,7 +646,7 @@ class RHN_ACTV1_Inner(nn.Module):
             layer.set_dynamic_adapter(*layer_weights)
             h_dyn = layer(hidden_states=h_dyn, **seq_info_dyn)
 
-        return h_base_out + h_dyn, step_l2, step_metrics
+        return h_base_out + h_dyn, step_l2, hypernet_output_state, step_metrics
 
 
 class RHN_ACTV1(nn.Module):
