@@ -144,17 +144,12 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
         self.norm_eps = config.rms_norm_eps
 
     def set_dynamic_adapter(self, attn_1, attn_2, up, down):
-        A_up, B_up = up
-        A_down, B_down = down
-        self.mlp.set_dynamic_adapter(A_up, B_up, A_down, B_down)
-
-        A_attn_1, B_attn_1 = attn_1
-        A_attn_2, B_attn_2 = attn_2
+        self.mlp.set_dynamic_adapter(up, down)
 
         if self.config.mlp_t:
-            self.mlp_t.set_dynamic_adapter(A_attn_1, B_attn_1, A_attn_2, B_attn_2)
+            self.mlp_t.set_dynamic_adapter(attn_1, attn_2)
         else:
-            self.self_attn.set_dynamic_adapter(A_attn_1, B_attn_1, A_attn_2, B_attn_2)
+            self.self_attn.set_dynamic_adapter(attn_1, attn_2)
 
 
     def clear_dynamic_adapter(self):
@@ -251,29 +246,21 @@ class RHN_Hypernetwork(nn.Module):
 
         for i, (layer_name, layer_info) in enumerate(self.config_per_layer.items()):
             shape = layer_info["shape"]
-
-            # Retrieve the specific expanded tensor for this layer
             layer_params = outputs_list[i]
-
             output_index = 0
 
-            size_a = shape[0] * self.config.hypernet_rank
-            outputs_a = layer_params[:, output_index: output_index + size_a]
-            # outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
-            outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
-            output_index += size_a
-
             if layer_info["type"] == "matrix":
-                size_b = shape[1] * self.config.hypernet_rank
-                outputs_b = layer_params[:, output_index: output_index + size_b]
-                # outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
-                outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
-
-                output_index += size_b
-
-                outputs_by_layer[layer_name] = (outputs_a, outputs_b)
+                size_w = shape[0] * shape[1]
+                outputs_w = layer_params[:, output_index: output_index + size_w]
+                outputs_w = outputs_w.view(batch_size, shape[0], shape[1])
+                output_index += size_w
+                outputs_by_layer[layer_name] = outputs_w
             else:
-                outputs_by_layer[layer_name] = outputs_a
+                size_w = shape[0]
+                outputs_w = layer_params[:, output_index: output_index + size_w]
+                outputs_w = outputs_w.view(batch_size, shape[0])
+                output_index += size_w
+                outputs_by_layer[layer_name] = outputs_w
 
         return outputs_by_layer, step_l2
 
@@ -325,9 +312,9 @@ class RHN_Hypernetwork(nn.Module):
 
         for name, shape in layer_specs:
             if self._is_vector_like(shape):
-                params = shape[0] * self.config.hypernet_rank
+                params = shape[0]
             else:
-                params = (shape[0] + shape[1]) * self.config.hypernet_rank
+                params = shape[0] * shape[1]
 
             # Fetch and store factors tailored specifically to this layer
             factors = self.get_low_rank_factors(params)
@@ -603,20 +590,14 @@ class RHN_ACTV1_Inner(nn.Module):
             svd_ratio = 0.0
             count = 0
 
-            for k, v in dynamic_weights.items():
-                if isinstance(v, tuple) and len(v) == 2:
-                    A, B = v
-                    gen_norm += (A[0].norm() + B[0].norm())
+            for k, W in dynamic_weights.items():
+                gen_norm += W[0].norm()
 
-                    if log_deep_metrics:
-                        delta_W = torch.matmul(A[0], B[0]).float()
-                        S = torch.linalg.svdvals(delta_W)
-                        svd_ratio += (S[0] / (S.sum() + 1e-6))
-                    count += 1
-                else:
-                    A = v
-                    gen_norm += A[0].norm()
-                    count += 1
+                if log_deep_metrics:
+                    delta_W = W[0].float()
+                    S = torch.linalg.svdvals(delta_W)
+                    svd_ratio += (S[0] / (S.sum() + 1e-6))
+                count += 1
 
             step_metrics["gen_norm"] = (gen_norm / count) if count > 0 else torch.tensor(0.0, device=h_dyn.device)
             if log_deep_metrics:
