@@ -732,24 +732,23 @@ class RHN_ACTV1(nn.Module):
         with torch.no_grad():
             # Step
             new_steps = new_steps + 1
-
             is_last_step = new_steps >= self.config.halt_max_steps
             
             halted = is_last_step
 
-            # if training, and ACT is enabled
-            if self.training and (self.config.halt_max_steps > 1):
-
-                # Halt signal
+            # --- MOVED OUTSIDE self.training ---
+            # Dynamic Halt signal (Active for both Train and Eval)
+            if self.config.halt_max_steps > 1:
                 if self.config.no_ACT_continue:
                     halted = halted | (q_halt_logits > 0)
                 else:
                     halted = halted | (q_halt_logits > q_continue_logits)
 
+            # if training, apply exploration and Q-targets
+            if self.training and (self.config.halt_max_steps > 1):
                 # Exploration (Training Only)
-                if self.training:
-                    min_halt_steps = (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
-                    halted = halted & (new_steps >= min_halt_steps)
+                min_halt_steps = (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
+                halted = halted & (new_steps >= min_halt_steps)
 
                 if not self.config.no_ACT_continue:
                     # Compute target Q
