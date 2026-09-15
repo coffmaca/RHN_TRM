@@ -294,70 +294,69 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
             new_inference_active_indices = None
 
         with torch.no_grad():
-            # Step
-            new_steps = new_steps + 1
-            is_last_step = new_steps >= self.config.halt_max_steps
-            
-            halted = is_last_step
+        # Step
+        new_steps = new_steps + 1
+        is_last_step = new_steps >= self.config.halt_max_steps
 
-            # If ACT is enabled
-            if self.config.halt_max_steps > 1:
+        halted = is_last_step
 
-                # Halt signal
-                # NOTE: During evaluation, always use max steps, this is to guarantee the same halting steps inside a batch for batching purposes
-                
-                if self.config.no_ACT_continue:
-                    halted = halted | (q_halt_logits > 0)
-                else:
-                    halted = halted | (q_halt_logits > q_continue_logits)
+        # If ACT is enabled
+        if self.config.halt_max_steps > 1:
 
-                # Exploration (Training Only)
-                if self.training:
-                    min_halt_steps = (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
-                    halted = halted & (new_steps >= min_halt_steps)
+            # Dynamic Halt signal (Active for both Train and Eval)
+            if self.config.no_ACT_continue:
+                halted = halted | (q_halt_logits > 0)
+            else:
+                halted = halted | (q_halt_logits > q_continue_logits)
 
-                if not self.config.no_ACT_continue:
-                    # Compute target Q
-                    # NOTE: No replay buffer and target networks for computing target Q-value.
-                    # As batch_size is large, there're many parallel envs.
-                    # Similar concept as PQN https://arxiv.org/abs/2407.04811
-                    _, _, (next_q_halt_logits, next_q_continue_logits), _, _ = self.inner(new_inner_carry, new_current_data)
-                    outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
+            # Training-only logic: Exploration and Target Q computation
+            if self.training:
+                # Exploration
+                min_halt_steps = (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
+                halted = halted & (new_steps >= min_halt_steps)
 
-                # Freeze halted samples in separate tensor during inference
-                if not self.training:
-                    new_halted_indices = new_inference_active_indices[halted]
-                    active = ~halted
+            if not self.config.no_ACT_continue:
+                # Compute target Q
+                # NOTE: No replay buffer and target networks for computing target Q-value.
+                # As batch_size is large, there're many parallel envs.
+                # Similar concept as PQN https://arxiv.org/abs/2407.04811
+                _, _, (next_q_halt_logits, next_q_continue_logits) = self.inner(new_inner_carry, new_current_data)
+                outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
 
-                    # Save halted sample data to inference_carry and restore prior saved to outputs
-                    new_inference_carry["halted"][new_halted_indices] = halted[halted]
-                    new_inference_carry["active"][new_halted_indices] = ~halted[halted]
-                    new_inference_carry["logits"][new_halted_indices] = logits[halted]
-                    new_inference_carry["steps"][new_halted_indices] = new_steps[halted]
-                    new_inference_carry["q_halt_logits"][new_halted_indices] = q_halt_logits[halted]
-                    new_inference_carry["q_continue_logits"][new_halted_indices] = q_continue_logits[halted]
-                    output_logits = new_inference_carry["logits"]
-                    output_logits[new_inference_carry["active"]] = logits[active]
-                    outputs["logits"] = output_logits
-                    output_q_halt_logits = new_inference_carry["q_halt_logits"]
-                    output_q_halt_logits[new_inference_carry["active"]] = q_halt_logits[active]
-                    outputs["q_halt_logits"] = output_q_halt_logits
-                    output_q_continue_logits = new_inference_carry["q_continue_logits"]
-                    output_q_continue_logits[new_inference_carry["active"]] = q_continue_logits[active]
-                    outputs["q_continue_logits"] = output_q_continue_logits
+            # Freeze halted samples in separate tensor during inference
+            if not self.training:
+                new_halted_indices = new_inference_active_indices[halted]
+                active = ~halted
 
-                    # Filter halted samples from data
-                    new_inner_carry.z_H = new_inner_carry.z_H[active]
-                    new_inner_carry.z_L = new_inner_carry.z_L[active]
-                    new_current_data["inputs"] = new_current_data["inputs"][active]
-                    # new_current_data["labels"] = new_current_data["labels"][active] # Skip labels - Need full batch to test full batch accuracy
-                    new_current_data["puzzle_identifiers"] = new_current_data["puzzle_identifiers"][active]
+                # Save halted sample data to inference_carry and restore prior saved to outputs
+                new_inference_carry["halted"][new_halted_indices] = halted[halted]
+                new_inference_carry["active"][new_halted_indices] = ~halted[halted]
+                new_inference_carry["logits"][new_halted_indices] = logits[halted]
+                new_inference_carry["steps"][new_halted_indices] = new_steps[halted]
+                new_inference_carry["q_halt_logits"][new_halted_indices] = q_halt_logits[halted]
+                new_inference_carry["q_continue_logits"][new_halted_indices] = q_continue_logits[halted]
+                output_logits = new_inference_carry["logits"]
+                output_logits[new_inference_carry["active"]] = logits[active]
+                outputs["logits"] = output_logits
+                output_q_halt_logits = new_inference_carry["q_halt_logits"]
+                output_q_halt_logits[new_inference_carry["active"]] = q_halt_logits[active]
+                outputs["q_halt_logits"] = output_q_halt_logits
+                output_q_continue_logits = new_inference_carry["q_continue_logits"]
+                output_q_continue_logits[new_inference_carry["active"]] = q_continue_logits[active]
+                outputs["q_continue_logits"] = output_q_continue_logits
 
-                    new_inference_active_indices = new_inference_active_indices[active]
-                    halted = new_inference_carry["halted"]
-                    new_steps_updated = new_inference_carry["steps"]
-                    new_steps_updated[new_inference_carry["active"]] = new_steps[active]
-                    new_steps = new_steps_updated
+                # Filter halted samples from data
+                new_inner_carry.z_H = new_inner_carry.z_H[active]
+                new_inner_carry.z_L = new_inner_carry.z_L[active]
+                new_current_data["inputs"] = new_current_data["inputs"][active]
+                # new_current_data["labels"] = new_current_data["labels"][active] # Skip labels - Need full batch to test full batch accuracy
+                new_current_data["puzzle_identifiers"] = new_current_data["puzzle_identifiers"][active]
+
+                new_inference_active_indices = new_inference_active_indices[active]
+                halted = new_inference_carry["halted"]
+                new_steps_updated = new_inference_carry["steps"]
+                new_steps_updated[new_inference_carry["active"]] = new_steps[active]
+                new_steps = new_steps_updated
 
         return TinyRecursiveReasoningModel_ACTV1Carry(new_inner_carry, new_inference_carry,
                                                       new_inference_active_indices, new_steps, halted,
