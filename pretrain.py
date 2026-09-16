@@ -251,6 +251,17 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
 
         # Load state dict
         state_dict = torch.load(config.load_checkpoint, map_location="cuda")
+        is_compiled_model = hasattr(model, "_orig_mod")
+        is_compiled_checkpoint =  any(k.startswith("_orig_mod.") for k in state_dict.keys())
+        adjusted_state_dict = {}
+        for key, value in state_dict.items():
+            if is_compiled_checkpoint and not is_compiled_model:
+                new_key = key.replace("_orig_mod.", "", 1)
+            elif not is_compiled_checkpoint and is_compiled_model:
+                new_key = f"_orig_mod.{key}"
+            else:
+                new_key = key
+            adjusted_state_dict[new_key] = value
 
         # Resize and reset puzzle emb if needed
         puzzle_emb_name = "_orig_mod.model.inner.puzzle_emb.weights"
@@ -263,7 +274,7 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig):
                 state_dict[puzzle_emb_name] = (
                     torch.mean(puzzle_emb, dim=0, keepdim=True).expand(expected_shape).contiguous()
                 )
-        model.load_state_dict(state_dict, assign=True)
+        model.load_state_dict(adjusted_state_dict, assign=True)
 
 
 def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
@@ -501,6 +512,7 @@ def evaluate(
 
             if rank == 0:
                 print(f"  Completed inference in {inference_steps} steps")
+                print(f"  Average steps per sample (Batch): {metrics['steps'] / global_batch_size:.2f}")
 
             for collection in (batch, preds):
                 for k, v in collection.items():
@@ -547,19 +559,27 @@ def evaluate(
                 dist.reduce(metric_values, dst=0)
 
             if rank == 0:
-                reduced_metrics = metric_values.cpu().numpy()
-                reduced_metrics = {
+                reduced_metrics_raw = metric_values.cpu().numpy()
+                reduced_metrics_nested = {
                     set_name: {
-                        metric_name: reduced_metrics[set_id, metric_id]
+                        metric_name: reduced_metrics_raw[set_id, metric_id]
                         for metric_id, metric_name in enumerate(metric_keys)
                     }
                     for set_id, set_name in enumerate(set_ids)
                 }
 
-                # Postprocess
-                for set_name, m in reduced_metrics.items():
+                # Postprocess and Flatten for wandb compatibility
+                flat_metrics = {}
+                for set_name, m in reduced_metrics_nested.items():
                     count = m.pop("count")
-                    reduced_metrics[set_name] = {k: v / count for k, v in m.items()}
+                    for k, v in m.items():
+                        flat_metrics[f"{set_name}/{k}"] = v / count
+
+                    # Print the formalized global average step count per set
+                    if f"{set_name}/steps" in flat_metrics:
+                        print(f"  Final global average steps per sample for {set_name}: {flat_metrics[f'{set_name}/steps']:.4f}")
+
+                reduced_metrics = flat_metrics
 
         # Run evaluators
         if rank == 0:

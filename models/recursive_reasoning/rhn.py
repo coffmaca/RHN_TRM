@@ -26,7 +26,7 @@ class RHN_ACTV1InnerCarry:
 class RHN_ACTV1Carry:
     inner_carry: RHN_ACTV1InnerCarry
 
-    inference_carry: Optional[torch.Tensor]
+    inference_carry: Optional[Dict[str, torch.Tensor]]
     inference_active_indices: Optional[torch.Tensor]
 
     steps: torch.Tensor
@@ -675,14 +675,11 @@ class RHN_ACTV1(nn.Module):
         batch_size = batch["inputs"].shape[0]
 
         return RHN_ACTV1Carry(
-            inner_carry=self.inner.empty_carry(batch_size),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
-
+            inner_carry=self.inner.empty_carry(batch_size),
             inference_carry=None,
             inference_active_indices=None,
-
             steps=torch.zeros((batch_size, ), dtype=torch.int32),
-            halted=torch.ones((batch_size, ), dtype=torch.bool),  # Default to halted
-            
+            halted=torch.ones((batch_size, ), dtype=torch.bool),
             current_data={k: torch.empty_like(v) for k, v in batch.items()}
         )
         
@@ -721,7 +718,8 @@ class RHN_ACTV1(nn.Module):
                 "logits": torch.empty_like(logits),
                 "steps": torch.empty_like(new_steps),
                 "q_halt_logits": torch.empty_like(q_halt_logits),
-                "q_continue_logits": torch.empty_like(q_continue_logits)
+                "q_continue_logits": torch.empty_like(q_continue_logits),
+                "hypernet_l2": torch.empty_like(hypernet_l2)
             }
             new_inference_active_indices = (carry.inference_active_indices if carry.inference_active_indices is not None
                                             else torch.arange(logits.shape[0], device=logits.device))
@@ -736,27 +734,25 @@ class RHN_ACTV1(nn.Module):
             
             halted = is_last_step
 
-            # --- MOVED OUTSIDE self.training ---
-            # Dynamic Halt signal (Active for both Train and Eval)
+            # If ACT is enabled
             if self.config.halt_max_steps > 1:
+
+                # Dynamic Halt signal (Active for both Train and Eval)
                 if self.config.no_ACT_continue:
                     halted = halted | (q_halt_logits > 0)
                 else:
                     halted = halted | (q_halt_logits > q_continue_logits)
 
-            # if training, apply exploration and Q-targets
-            if self.training and (self.config.halt_max_steps > 1):
-                # Exploration (Training Only)
-                min_halt_steps = (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
-                halted = halted & (new_steps >= min_halt_steps)
+                # Training-only logic: Exploration and Target Q computation
+                if self.training:
+                    # Exploration
+                    min_halt_steps = (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
+                    halted = halted & (new_steps >= min_halt_steps)
 
-                if not self.config.no_ACT_continue:
-                    # Compute target Q
-                    # NOTE: No replay buffer and target networks for computing target Q-value.
-                    # As batch_size is large, there're many parallel envs.
-                    # Similar concept as PQN https://arxiv.org/abs/2407.04811
-                    _, _, (next_q_halt_logits, next_q_continue_logits), _, _ = self.inner(new_inner_carry, new_current_data)
-                    outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
+                    # Compute target Q correctly nested under training
+                    if not self.config.no_ACT_continue:
+                        _, _, (next_q_halt_logits, next_q_continue_logits), _, _ = self.inner(new_inner_carry, new_current_data)
+                        outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
 
                 # Freeze halted samples in separate tensor during inference
                 if not self.training:
@@ -770,15 +766,23 @@ class RHN_ACTV1(nn.Module):
                     new_inference_carry["steps"][new_halted_indices] = new_steps[halted]
                     new_inference_carry["q_halt_logits"][new_halted_indices] = q_halt_logits[halted]
                     new_inference_carry["q_continue_logits"][new_halted_indices] = q_continue_logits[halted]
+                    new_inference_carry["hypernet_l2"][new_halted_indices] = hypernet_l2[halted]
+
                     output_logits = new_inference_carry["logits"]
                     output_logits[new_inference_carry["active"]] = logits[active]
                     outputs["logits"] = output_logits
+
                     output_q_halt_logits = new_inference_carry["q_halt_logits"]
                     output_q_halt_logits[new_inference_carry["active"]] = q_halt_logits[active]
                     outputs["q_halt_logits"] = output_q_halt_logits
+
                     output_q_continue_logits = new_inference_carry["q_continue_logits"]
                     output_q_continue_logits[new_inference_carry["active"]] = q_continue_logits[active]
                     outputs["q_continue_logits"] = output_q_continue_logits
+
+                    output_hypernet_l2 = new_inference_carry["hypernet_l2"]
+                    output_hypernet_l2[new_inference_carry["active"]] = hypernet_l2[active]
+                    outputs["hypernet_l2"] = output_hypernet_l2
 
                     # Filter halted samples from data
                     new_inner_carry.z_H = new_inner_carry.z_H[active]
