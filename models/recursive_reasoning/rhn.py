@@ -69,13 +69,9 @@ class RHN_ACTV1Config(BaseModel):
     no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
 
     hypernet_hidden_size: int
-    hypernet_hidden_depth: int
-    hypernet_rank: int
     layer_emb_dim: int
-    hypernet_relative_scale: float
-    perceiver_rank: int
-    perceiver_heads: int
-    hypernet_relative_scale: int
+    lora_rank: int
+    hypernet_attn_heads: int
     hypernet_l2_lambda: float
     hypernet_kl_lambda: float
     hypernet_cos_lambda: float
@@ -197,7 +193,7 @@ class MultiAxisAttentionBlock(nn.Module):
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
 
         d = config.hypernet_hidden_size
-        self.num_heads = config.perceiver_heads
+        self.num_heads = config.hypernet_attn_heads
         self.head_dim = d // self.num_heads
 
         # 1. Cross-layer self-attention (SA_L)
@@ -288,10 +284,10 @@ class RHN_Hypernetwork(nn.Module):
 
         self.seq_n = self.num_layers
         # Flatten the module, A/B factor, and rank slot dimensions into the HW axis
-        self.seq_hw = self.modules_per_layer * 2 * self.config.perceiver_rank
+        self.seq_hw = self.modules_per_layer * 2 * self.config.lora_rank
 
         d_pg = self.config.hypernet_hidden_size
-        head_dim = d_pg // self.config.perceiver_heads
+        head_dim = d_pg // self.config.hypernet_attn_heads
 
         # Structural Positional Embeddings (using your CastedEmbedding for dtype safety)
         self.layer_pos = CastedEmbedding(self.seq_n, d_pg, init_std=1.0 / math.sqrt(d_pg), cast_to=self.forward_dtype)
@@ -316,7 +312,7 @@ class RHN_Hypernetwork(nn.Module):
         # Transformer Trunk
         self.blocks = nn.ModuleList([
             MultiAxisAttentionBlock(self.config, self.seq_n, self.seq_hw)
-            for _ in range(self.config.hypernet_hidden_depth)
+            for _ in range(self.config.H_layers)
         ])
 
         # Output head projects to the maximum feature dimension required across all matrices
@@ -372,7 +368,7 @@ class RHN_Hypernetwork(nn.Module):
         return outputs_by_layer, step_l2, step_cos_sim
 
     def _detokenize(self, outputs: torch.Tensor, batch_size: int) -> Tuple[dict, torch.Tensor]:
-        outputs = outputs.view(batch_size, self.num_layers, self.modules_per_layer, 2, self.config.perceiver_rank, self.max_dim)
+        outputs = outputs.view(batch_size, self.num_layers, self.modules_per_layer, 2, self.config.lora_rank, self.max_dim)
         outputs_by_layer = {}
         step_l2 = 0.0
 
