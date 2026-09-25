@@ -64,9 +64,11 @@ class DynamicCastedLinear(nn.Module):
         self.dynamic_adapter = None
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if self.dynamic_adapter is None: # Base Out
-            return F.linear(input, self.weight.to(input.dtype), bias=self.bias.to(input.dtype) if self.bias is not None else None)
-        else: # Dynamic Out (using low-rank matrices)
+        base_out = F.linear(input, self.weight.to(input.dtype), bias=self.bias.to(input.dtype) if self.bias is not None else None)
+
+        if self.dynamic_adapter is None:
+            return base_out
+        else:
             A, B = self.dynamic_adapter
 
             if input.dim() == 2:
@@ -74,8 +76,8 @@ class DynamicCastedLinear(nn.Module):
             else:
                 input_reshaped = input
 
-            out = torch.einsum('abc,adc->abd', input, B.to(input.dtype)) # torch.matmul(input, B)
-            out = torch.einsum('abd,aed->abe', out, A.to(input.dtype)) # torch.matmul(out, A)
+            out = torch.einsum('abc,adc->abd', input_reshaped, B.to(input.dtype))
+            out = torch.einsum('abd,aed->abe', out, A.to(input.dtype))
 
             in_features = input_reshaped.shape[-1]
             rank = B.shape[1]
@@ -86,7 +88,7 @@ class DynamicCastedLinear(nn.Module):
             if input.dim() == 2:
                 out = out.squeeze(1)
 
-            return out
+            return base_out + out
 
     def __getstate__(self):
         state = self.__dict__.copy()
