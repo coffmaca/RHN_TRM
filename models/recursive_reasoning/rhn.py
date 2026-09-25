@@ -11,7 +11,7 @@ from pydantic import BaseModel
 import random
 from models.common import trunc_normal_init_
 from models.layers import (rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding,
-                           CastedParameter, CastedLinear, DynamicSwiGLU, DynamicAttention)
+                           CastedParameter, CastedLinear, DynamicSwiGLU, DynamicAttention, apply_rotary_pos_emb)
 from models.sparse_embedding import CastedSparseEmbedding
 
 IGNORE_LABEL_ID = -100
@@ -187,6 +187,93 @@ class RHN_ACTV1Block_Dynamic(nn.Module):
         return hidden_states
 
 
+class MultiAxisAttentionBlock(nn.Module):
+    def __init__(self, config: RHN_ACTV1Config, seq_l: int, seq_hw: int):
+        super().__init__()
+        self.config = config
+        self.seq_l = seq_l
+        self.seq_hw = seq_hw
+
+        self.forward_dtype = getattr(torch, self.config.forward_dtype)
+
+        d = config.hypernet_hidden_size
+        self.num_heads = config.perceiver_heads
+        self.head_dim = d // self.num_heads
+
+        # 1. Cross-layer self-attention (SA_L)
+        self.norm_l = torch.nn.RMSNorm(d, eps=config.rms_norm_eps, dtype=self.forward_dtype)
+        self.qkv_l = CastedLinear(d, 3 * d, bias=False)
+        self.o_l = CastedLinear(d, d, bias=False)
+
+        # 2. Intra-layer self-attention (SA_HW)
+        self.norm_hw = torch.nn.RMSNorm(d, eps=config.rms_norm_eps, dtype=self.forward_dtype)
+        self.qkv_hw = CastedLinear(d, 3 * d, bias=False)
+        self.o_hw = CastedLinear(d, d, bias=False)
+
+        # 3. Conditioning cross-attention (CA)
+        self.norm_ca = torch.nn.RMSNorm(d, eps=config.rms_norm_eps, dtype=self.forward_dtype)
+        self.q_ca = CastedLinear(d, d, bias=False)
+        self.kv_ca = CastedLinear(d, 2 * d, bias=False)
+        self.o_ca = CastedLinear(d, d, bias=False)
+
+        # 4. Feed-Forward Network
+        self.norm_ffn = torch.nn.RMSNorm(d, eps=config.rms_norm_eps, dtype=self.forward_dtype)
+        self.ffn = SwiGLU(d, config.expansion)
+
+    def forward(self, grid, cond, rope_l, rope_hw, rope_cond_q, rope_cond_k):
+        # grid: [B, L, HW, D]
+        B, L, HW, D = grid.shape
+
+        # 1. SA_L (batch over HW axis)
+        z_l = self.norm_l(grid).transpose(1, 2).reshape(B * HW, L, D)
+        qkv = self.qkv_l(z_l).view(B * HW, L, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(2)
+        if rope_l is not None:
+            q, k = apply_rotary_pos_emb(q, k, rope_l[0], rope_l[1])
+        q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # [B*HW, H, L, head_dim]
+        out_l = F.scaled_dot_product_attention(q, k, v)
+        out_l = out_l.transpose(1, 2).reshape(B * HW, L, D)
+        out_l = self.o_l(out_l).view(B, HW, L, D).transpose(1, 2)
+        grid = grid + out_l
+
+        # 2. SA_HW (batch over L axis)
+        z_hw = self.norm_hw(grid).reshape(B * L, HW, D)
+        qkv = self.qkv_hw(z_hw).view(B * L, HW, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(2)
+        if rope_hw is not None:
+            q, k = apply_rotary_pos_emb(q, k, rope_hw[0], rope_hw[1])
+        q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))
+        out_hw = F.scaled_dot_product_attention(q, k, v)
+        out_hw = out_hw.transpose(1, 2).reshape(B * L, HW, D)
+        out_hw = self.o_hw(out_hw).view(B, L, HW, D)
+        grid = grid + out_hw
+
+        # 3. CA (Conditioning on prior activations)
+        z_ca = self.norm_ca(grid).reshape(B, L * HW, D)
+        q = self.q_ca(z_ca).view(B, L * HW, self.num_heads, self.head_dim)
+
+        # cond: [B, S_cond, D]
+        kv = self.kv_ca(cond).view(B, -1, 2, self.num_heads, self.head_dim)
+        k, v = kv.unbind(2)
+
+        if rope_cond_q is not None and rope_cond_k is not None:
+            q, _ = apply_rotary_pos_emb(q, q, rope_cond_q[0], rope_cond_q[1])
+            k, _ = apply_rotary_pos_emb(k, k, rope_cond_k[0], rope_cond_k[1])
+
+        q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))
+        out_ca = F.scaled_dot_product_attention(q, k, v)
+        out_ca = out_ca.transpose(1, 2).reshape(B, L * HW, D)
+        out_ca = self.o_ca(out_ca).view(B, L, HW, D)
+        grid = grid + out_ca
+
+        # 4. FFN
+        z_ffn = self.norm_ffn(grid)
+        out_ffn = self.ffn(z_ffn)
+        grid = grid + out_ffn
+
+        return grid
+
+
 class RHN_Hypernetwork(nn.Module):
     def __init__(self, config: RHN_ACTV1Config, layer_specs) -> None:
         super().__init__()
@@ -195,80 +282,88 @@ class RHN_Hypernetwork(nn.Module):
 
         self.layer_specs = layer_specs
 
-        # Grid Dimensions (L, M*2, R)
+        # Grid Dimensions (L, M*2*R)
         self.num_layers = self.config.L_layers
         self.modules_per_layer = len(self.layer_specs) // self.num_layers
 
         self.seq_n = self.num_layers
-        self.seq_h = self.modules_per_layer * 2 # Need an A and B matrix for each module
-        self.seq_w = self.config.perceiver_rank
+        # Flatten the module, A/B factor, and rank slot dimensions into the HW axis
+        self.seq_hw = self.modules_per_layer * 2 * self.config.perceiver_rank
 
-        self.num_queries = self.seq_n * self.seq_h * self.seq_w
-        self.input_size = self.config.hidden_size
+        d_pg = self.config.hypernet_hidden_size
+        head_dim = d_pg // self.config.perceiver_heads
 
-        # Structural Positional Embeddings
-        self.layer_pos = nn.Embedding(self.seq_n, self.input_size)
-        self.hw_pos = nn.Embedding(self.seq_h * self.seq_w, self.input_size)
+        # Structural Positional Embeddings (using your CastedEmbedding for dtype safety)
+        self.layer_pos = CastedEmbedding(self.seq_n, d_pg, init_std=1.0 / math.sqrt(d_pg), cast_to=self.forward_dtype)
+        self.hw_pos = CastedEmbedding(self.seq_hw, d_pg, init_std=1.0 / math.sqrt(d_pg), cast_to=self.forward_dtype)
 
-        self.cond_token_query = nn.Parameter(
+        self.grid_query = nn.Parameter(
             trunc_normal_init_(
-                torch.empty((1, self.num_queries, self.input_size), dtype=self.forward_dtype),
-                std=1.0 / math.sqrt(self.input_size),
+                torch.empty((1, self.seq_n, self.seq_hw, d_pg), dtype=self.forward_dtype),
+                std=1.0 / math.sqrt(d_pg),
             )
         )
 
-        module_list = nn.ModuleList(
-            [CastedLinear(self.input_size,
-                          self.config.hypernet_hidden_size,
-                          bias=False),
-             nn.SiLU()]
-        )
-        for _ in range(self.config.hypernet_hidden_depth):
-            module_list.append(SwiGLU(self.config.hypernet_hidden_size, self.config.expansion))
-            module_list.append(torch.nn.RMSNorm(self.config.hypernet_hidden_size,
-                                                eps=self.config.rms_norm_eps,
-                                                dtype=self.forward_dtype))
+        # Map base model activations into the generator space
+        self.cond_proj = CastedLinear(self.config.hidden_size, d_pg, bias=False)
 
-        self.hypernet_base = nn.Sequential(*module_list)
+        # Multi-axis RoPEs
+        self.rope_l = RotaryEmbedding(head_dim, self.seq_n, self.config.rope_theta)
+        self.rope_hw = RotaryEmbedding(head_dim, self.seq_hw, self.config.rope_theta)
+        # Using a generously large max length to cover dynamic conditioning lengths
+        self.rope_cond = RotaryEmbedding(head_dim, 4096, self.config.rope_theta)
+
+        # Transformer Trunk
+        self.blocks = nn.ModuleList([
+            MultiAxisAttentionBlock(self.config, self.seq_n, self.seq_hw)
+            for _ in range(self.config.hypernet_hidden_depth)
+        ])
 
         # Output head projects to the maximum feature dimension required across all matrices
         self.max_dim = max(max(shape) for name, shape in self.layer_specs)
-        self.output_head = CastedLinear(self.config.hypernet_hidden_size,
-                                         self.max_dim,
-                                         bias=False)
+        self.output_head = CastedLinear(d_pg, self.max_dim, bias=False)
 
         self.register_buffer("v_prev", None)
 
-    def _get_raw_pos_tokens(self, batch_size):
-        hw_pos = self.hw_pos.weight.view(1, 1, self.seq_h * self.seq_w, self.input_size)
-        hw_pos = hw_pos.expand(batch_size, self.seq_n, -1, -1)
-
-        layer_pos = self.layer_pos.weight.view(1, self.seq_n, 1, self.input_size)
-        layer_pos = layer_pos.expand(batch_size, -1, self.seq_h * self.seq_w, -1)
-
-        tokens = hw_pos + layer_pos
-        return tokens.reshape(batch_size, self.num_queries, self.input_size)
-
-    def forward(self, activations: torch.Tensor) -> Tuple[dict, torch.Tensor, torch.Tensor]:
+    def forward(self, activations: torch.Tensor):
         batch_size = activations.shape[0]
 
-        inputs = self._attention(activations)
-        inputs = rms_norm(inputs, variance_epsilon=self.config.rms_norm_eps)
+        # 1. Prepare conditioning and grid representations
+        cond = self.cond_proj(activations)
+        grid = self.grid_query.expand(batch_size, -1, -1, -1)
 
-        outputs = self.hypernet_base(inputs)
-        outputs = self.output_head(outputs)
+        # Embeddings explicitly cast to match grid dtype dynamically via .to()
+        l_pos = self.layer_pos.embedding_weight.to(grid.dtype).view(1, self.seq_n, 1, -1)
+        hw_pos = self.hw_pos.embedding_weight.to(grid.dtype).view(1, 1, self.seq_hw, -1)
+        grid = grid + l_pos + hw_pos
+
+        # 2. Prepare RoPE frequencies
+        cos_l, sin_l = self.rope_l()
+        cos_hw, sin_hw = self.rope_hw()
+        cos_cond, sin_cond = self.rope_cond()
+
+        rope_l = (cos_l[:self.seq_n], sin_l[:self.seq_n])
+        rope_hw = (cos_hw[:self.seq_hw], sin_hw[:self.seq_hw])
+
+        # Flattened sequence length for CA queries and dynamic length for CA keys
+        rope_cond_q = (cos_cond[:self.seq_n * self.seq_hw], sin_cond[:self.seq_n * self.seq_hw])
+        rope_cond_k = (cos_cond[:cond.shape[1]], sin_cond[:cond.shape[1]])
+
+        # 3. Pass through Multi-axis Trunk
+        for block in self.blocks:
+            grid = block(grid, cond, rope_l, rope_hw, rope_cond_q, rope_cond_k)
+
+        # 4. Project and Normalize
+        outputs = self.output_head(grid)
         outputs = rms_norm(outputs.flatten(start_dim=1), variance_epsilon=self.config.rms_norm_eps).view(outputs.shape)
 
-        # 1. Flatten the parameters for the current input
+        # 5. Cosine Penalty Tracking
         flat_outputs = outputs.reshape(batch_size, -1)
-
-        # 2. Compute the squared cosine similarity against the detached previous step cache
         if self.training and getattr(self, "v_prev", None) is not None:
             step_cos_sim = F.cosine_similarity(flat_outputs, self.v_prev, dim=-1).pow(2)
         else:
             step_cos_sim = torch.zeros(batch_size, device=outputs.device, dtype=outputs.dtype)
 
-        # 3. Update the cache for the next optimization step
         if self.training:
             self.v_prev = flat_outputs.detach().mean(dim=0, keepdim=True)
 
@@ -276,26 +371,8 @@ class RHN_Hypernetwork(nn.Module):
 
         return outputs_by_layer, step_l2, step_cos_sim
 
-    def _attention(self, inputs):
-        B, S, D = inputs.shape
-        H = self.config.perceiver_heads
-        Q = self.num_queries
-        head_dim = D // H
-
-        q = self.cond_token_query.expand(B, -1, -1).view(B, Q, H, head_dim).transpose(1, 2)
-        k = inputs.view(B, S, H, head_dim).transpose(1, 2)
-        v = inputs.view(B, S, H, head_dim).transpose(1, 2)
-
-        attn_logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
-        attn_weights = F.softmax(attn_logits, dim=-1)
-        pooled_inputs = torch.matmul(attn_weights, v)
-        pooled_inputs = pooled_inputs.transpose(1, 2).contiguous().view(B, Q, D)
-
-        pos_tokens = self._get_raw_pos_tokens(B)
-        return pooled_inputs + pos_tokens
-
     def _detokenize(self, outputs: torch.Tensor, batch_size: int) -> Tuple[dict, torch.Tensor]:
-        outputs = outputs.view(batch_size, self.num_layers, self.modules_per_layer, 2, self.seq_w, self.max_dim)
+        outputs = outputs.view(batch_size, self.num_layers, self.modules_per_layer, 2, self.config.perceiver_rank, self.max_dim)
         outputs_by_layer = {}
         step_l2 = 0.0
 
