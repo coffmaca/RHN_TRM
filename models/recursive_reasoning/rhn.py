@@ -79,6 +79,7 @@ class RHN_ACTV1Config(BaseModel):
     hypernet_l2_lambda: float
     hypernet_kl_lambda: float
     hypernet_cos_lambda: float
+    step_penalty_lambda: float
 
 class RHN_ACTV1Block(nn.Module):
     def __init__(self, config: RHN_ACTV1Config) -> None:

@@ -45,7 +45,7 @@ class ACTLossHead(nn.Module):
         self.loss_fn = globals()[loss_type]
         self.l2_lambda = self.model.config.hypernet_l2_lambda
         self.cos_lambda = self.model.config.hypernet_cos_lambda
-        # self.kl_lambda = self.model.config.hypernet_kl_lambda
+        self.step_lambda = self.model.config.step_penalty_lambda
         
     def initial_carry(self, *args, **kwargs):
         return self.model.initial_carry(*args, **kwargs)  # type: ignore
@@ -95,33 +95,35 @@ class ACTLossHead(nn.Module):
                     metrics[k] = v.detach()
 
         # Losses
-
         lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
         q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
 
-        scaled_l2_loss = (outputs["hypernet_l2"] * valid_metrics).sum() * self.l2_lambda
+        scaled_l2_loss = (outputs["hypernet_l2"]).sum() * self.l2_lambda
         scaled_l2_loss_metric = (outputs["hypernet_l2"] * valid_metrics).sum() * self.l2_lambda
+
         scaled_cos_loss = (outputs["hypernet_cos_sim"]).sum() * self.cos_lambda
         scaled_cos_loss_metric = (outputs["hypernet_cos_sim"] * valid_metrics).sum() * self.cos_lambda
-        # scaled_kl_loss = (outputs["hypernet_kl"] * valid_metrics).sum() * self.kl_lambda
+
+        penalty_steps = torch.clamp(new_carry.steps - 1, min=0).to(torch.float32)
+        step_penalty_loss = penalty_steps.sum() * self.step_lambda
+        step_penalty_loss_metric = (penalty_steps * valid_metrics).sum() * self.step_lambda
 
         metrics.update({
             "lm_loss": lm_loss.detach(),
             "q_halt_loss": q_halt_loss.detach(),
             "hypernet_l2_loss": scaled_l2_loss_metric.detach(),
             "hypernet_cos_loss": scaled_cos_loss_metric.detach(),
-            # "hypernet_kl_loss": scaled_kl_loss.detach()
+            "step_penalty_loss": step_penalty_loss_metric.detach(),
         })
         # Q continue (bootstrapping target loss); Alexia: This fits Q-learning, but seems totally unecessary
         q_continue_loss = 0
         if "target_q_continue" in outputs:
             q_continue_loss = F.binary_cross_entropy_with_logits(outputs["q_continue_logits"], outputs["target_q_continue"], reduction="sum")
-
             metrics["q_continue_loss"] = q_continue_loss.detach()
-        # Filter outputs for return
+
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
-        final_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss) + scaled_cos_loss + scaled_l2_loss # + scaled_kl_loss
+        final_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss) + scaled_cos_loss + scaled_l2_loss + step_penalty_loss
 
         return new_carry, final_loss, metrics, detached_outputs, new_carry.halted.all()
 
