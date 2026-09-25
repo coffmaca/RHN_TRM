@@ -443,11 +443,15 @@ class RHN_ACTV1_Inner(nn.Module):
 
         # Hypernetwork
         self.layer_specs = []
+        valid_proj_names = ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]
+
         for name, param in self.named_parameters():
-            name_tag = name.split(".")[0]
-            if name_tag != "L_level":
+            if not name.startswith("L_level."):
                 continue
-            self.layer_specs.append((name, param.shape))
+            if not name.endswith(".weight"):
+                continue
+            if any(proj in name for proj in valid_proj_names):
+                self.layer_specs.append((name, param.shape))
 
         self.hypernet = RHN_Hypernetwork(self.config, self.layer_specs)
 
