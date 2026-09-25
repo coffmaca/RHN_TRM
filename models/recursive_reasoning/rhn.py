@@ -73,12 +73,11 @@ class RHN_ACTV1Config(BaseModel):
     hypernet_rank: int
     layer_emb_dim: int
     hypernet_relative_scale: float
-    kron_dims: int
-    kron_dims_mult: bool
+    perceiver_rank: int
     perceiver_heads: int
     hypernet_relative_scale: int
-    hypernet_l2_lambda: float = 1e-4
-    hypernet_kl_lambda: float = 1e-4
+    hypernet_l2_lambda: float
+    hypernet_kl_lambda: float
 
 class RHN_ACTV1Block(nn.Module):
     def __init__(self, config: RHN_ACTV1Config) -> None:
@@ -193,36 +192,34 @@ class RHN_Hypernetwork(nn.Module):
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
 
         self.layer_specs = layer_specs
-        self.config_per_layer = {}
-        for name, shape in self.layer_specs:
-            self.config_per_layer[name] = {
-                "shape": shape,
-                "type": "vector" if self._is_vector_like(shape) else "matrix",
-            }
 
-        self.embed_scale = math.sqrt(self.config.hypernet_hidden_size)
+        # Grid Dimensions (L, M*2, R)
+        self.num_layers = self.config.L_layers
+        self.modules_per_layer = len(self.layer_specs) // self.num_layers
 
+        self.seq_n = self.num_layers
+        self.seq_h = self.modules_per_layer * 2 # Need an A and B matrix for each module
+        self.seq_w = self.config.perceiver_rank
+
+        self.num_queries = self.seq_n * self.seq_h * self.seq_w
         self.input_size = self.config.hidden_size
-        self.num_layers = len(self.layer_specs)
 
-        if self.config.kron_dims_mult:
-            self.num_queries = self.num_layers * self.config.kron_dims
-        else:
-            self.num_queries = self.config.kron_dims
+        # Structural Positional Embeddings
+        self.layer_pos = nn.Embedding(self.seq_n, self.input_size)
+        self.hw_pos = nn.Embedding(self.seq_h * self.seq_w, self.input_size)
 
-        self.input_queries = nn.Parameter(
+        self.cond_token_query = nn.Parameter(
             trunc_normal_init_(
                 torch.empty((1, self.num_queries, self.input_size), dtype=self.forward_dtype),
                 std=1.0 / math.sqrt(self.input_size),
             )
         )
 
-        # TODO - Consider alternative initialization to 0's.  Classes below have built-in LeCun Normal initialization.
         module_list = nn.ModuleList(
             [CastedLinear(self.input_size,
                           self.config.hypernet_hidden_size,
-                          bias=False)] + \
-            [nn.SiLU()]
+                          bias=False),
+             nn.SiLU()]
         )
         for _ in range(self.config.hypernet_hidden_depth):
             module_list.append(SwiGLU(self.config.hypernet_hidden_size, self.config.expansion))
@@ -232,127 +229,43 @@ class RHN_Hypernetwork(nn.Module):
 
         self.hypernet_base = nn.Sequential(*module_list)
 
-        self.output_dim = self._output_dim(layer_specs)
+        # Output head projects to the maximum feature dimension required across all matrices
+        self.max_dim = max(max(shape) for name, shape in self.layer_specs)
         self.output_head = CastedLinear(self.config.hypernet_hidden_size,
-                                         self.output_dim,
+                                         self.max_dim,
                                          bias=False)
 
+    def _get_raw_pos_tokens(self, batch_size):
+        hw_pos = self.hw_pos.weight.view(1, 1, self.seq_h * self.seq_w, self.input_size)
+        hw_pos = hw_pos.expand(batch_size, self.seq_n, -1, -1)
+
+        layer_pos = self.layer_pos.weight.view(1, self.seq_n, 1, self.input_size)
+        layer_pos = layer_pos.expand(batch_size, -1, self.seq_h * self.seq_w, -1)
+
+        tokens = hw_pos + layer_pos
+        return tokens.reshape(batch_size, self.num_queries, self.input_size)
+
     def forward(self, activations: torch.Tensor) -> Tuple[dict, torch.Tensor]:
-        batch_size, seq_len, _ = activations.shape
+        batch_size = activations.shape[0]
 
         inputs = self._attention(activations)
-
         inputs = rms_norm(inputs, variance_epsilon=self.config.rms_norm_eps)
 
         outputs = self.hypernet_base(inputs)
         outputs = self.output_head(outputs)
         outputs = rms_norm(outputs.flatten(start_dim=1), variance_epsilon=self.config.rms_norm_eps).view(outputs.shape)
-        outputs_list = self._expand_output(outputs)
 
-        flat_expanded = torch.cat(outputs_list, dim=1)
-        step_l2 = flat_expanded.pow(2).sum(dim=1)
-
-        outputs_by_layer = {}
-
-        for i, (layer_name, layer_info) in enumerate(self.config_per_layer.items()):
-            shape = layer_info["shape"]
-
-            # Retrieve the specific expanded tensor for this layer
-            layer_params = outputs_list[i]
-
-            output_index = 0
-
-            size_a = shape[0] * self.config.hypernet_rank
-            outputs_a = layer_params[:, output_index: output_index + size_a]
-            # outputs_a = rms_norm(outputs_a, variance_epsilon=self.config.rms_norm_eps)
-            outputs_a = outputs_a.view(batch_size, shape[0], self.config.hypernet_rank)
-            output_index += size_a
-
-            if layer_info["type"] == "matrix":
-                size_b = shape[1] * self.config.hypernet_rank
-                outputs_b = layer_params[:, output_index: output_index + size_b]
-                # outputs_b = rms_norm(outputs_b, variance_epsilon=self.config.rms_norm_eps)
-                outputs_b = outputs_b.view(batch_size, self.config.hypernet_rank, shape[1])
-
-                output_index += size_b
-
-                outputs_by_layer[layer_name] = (outputs_a, outputs_b)
-            else:
-                outputs_by_layer[layer_name] = outputs_a
+        outputs_by_layer, step_l2 = self._detokenize(outputs, batch_size)
 
         return outputs_by_layer, step_l2
 
-    def _is_vector_like(self, shape:list) -> bool:
-        if len(shape) < 2:
-            return True
-
-        num_large_dims = 0
-        for dim in shape:
-            if dim >= 1:
-                num_large_dims += 1
-
-        if num_large_dims >= 2:
-            return False
-        else:
-            return True
-
-    def get_low_rank_factors(self, base_param_total_low_rank: int) -> list:
-        if base_param_total_low_rank < 4:
-            return [2, 2]
-
-        def get_factors_if_valid(d):
-            factors = []
-            n = d
-            while n % 2 == 0:
-                factors.append(2)
-                n //= 2
-            while n % 3 == 0:
-                factors.append(3)
-                n //= 3
-            if n > 1:
-                if 3 < n < 10:
-                    factors.append(n)
-                else:
-                    return None
-            return factors
-
-        target_dim = math.ceil(math.sqrt(base_param_total_low_rank))
-
-        while True:
-            factors = get_factors_if_valid(target_dim)
-            if factors is not None:
-                return factors
-            target_dim += 1
-
-    def _output_dim(self, layer_specs) -> int:
-        self.layer_kron_factors = {}
-        total_elements_needed = 0
-
-        for name, shape in layer_specs:
-            if self._is_vector_like(shape):
-                params = shape[0] * self.config.hypernet_rank
-            else:
-                params = (shape[0] + shape[1]) * self.config.hypernet_rank
-
-            # Fetch and store factors tailored specifically to this layer
-            factors = self.get_low_rank_factors(params)
-            self.layer_kron_factors[name] = factors
-
-            # Accumulate the elements needed dynamically
-            layer_elements = sum(f ** 2 for f in factors)
-            total_elements_needed += layer_elements
-
-        output_dim = int(math.ceil(total_elements_needed / self.num_queries))
-
-        return output_dim
-
-    def _attention(self, inputs) -> torch.Tensor:
+    def _attention(self, inputs):
         B, S, D = inputs.shape
         H = self.config.perceiver_heads
         Q = self.num_queries
         head_dim = D // H
 
-        q = self.input_queries.view(1, Q, H, head_dim).transpose(1, 2)
+        q = self.cond_token_query.expand(B, -1, -1).view(B, Q, H, head_dim).transpose(1, 2)
         k = inputs.view(B, S, H, head_dim).transpose(1, 2)
         v = inputs.view(B, S, H, head_dim).transpose(1, 2)
 
@@ -361,38 +274,33 @@ class RHN_Hypernetwork(nn.Module):
         pooled_inputs = torch.matmul(attn_weights, v)
         pooled_inputs = pooled_inputs.transpose(1, 2).contiguous().view(B, Q, D)
 
-        return pooled_inputs
+        pos_tokens = self._get_raw_pos_tokens(B)
+        return pooled_inputs + pos_tokens
 
-    def _expand_output(self, outputs: torch.Tensor) -> list:
-        batch_size = outputs.shape[0]
-        outputs = outputs.flatten(start_dim=1)
+    def _detokenize(self, outputs: torch.Tensor, batch_size: int) -> Tuple[dict, torch.Tensor]:
+        outputs = outputs.view(batch_size, self.num_layers, self.modules_per_layer, 2, self.seq_w, self.max_dim)
+        outputs_by_layer = {}
+        step_l2 = 0.0
 
-        expanded_per_layer = []
-        current_idx = 0
+        spec_idx = 0
+        for l in range(self.num_layers):
+            for m in range(self.modules_per_layer):
+                name, shape = self.layer_specs[spec_idx]
+                out_features, in_features = shape
 
-        for name, _ in self.layer_specs:
-            factors = self.layer_kron_factors[name]
-            expanded = None
+                # B matrix (first projection): [B, Rank, In]
+                B_tokens = outputs[:, l, m, 0, :, :in_features]
+                # A matrix (second projection): [B, Out, Rank]
+                A_tokens = outputs[:, l, m, 1, :, :out_features].transpose(1, 2)
 
-            for f in factors:
-                elements = f ** 2
+                outputs_by_layer[name] = (A_tokens, B_tokens)
 
-                factor_tensor = outputs[:, current_idx : current_idx + elements]
-                factor_tensor = rms_norm(factor_tensor, variance_epsilon=self.config.rms_norm_eps)
-                factor_tensor = factor_tensor.view(batch_size, f, f)
-                current_idx += elements
+                # Penalize only the active parameters
+                step_l2 = step_l2 + B_tokens.pow(2).sum(dim=(1, 2)) + A_tokens.pow(2).sum(dim=(1, 2))
 
-                if expanded is None:
-                    expanded = factor_tensor
-                else:
-                    expanded = torch.einsum('bij,bkl->bikjl', expanded, factor_tensor)
-                    H1, H2 = expanded.shape[1], expanded.shape[2]
-                    W1, W2 = expanded.shape[3], expanded.shape[4]
-                    expanded = expanded.reshape(batch_size, H1 * H2, W1 * W2)
+                spec_idx += 1
 
-            expanded_per_layer.append(expanded.flatten(start_dim=1))
-
-        return expanded_per_layer
+        return outputs_by_layer, step_l2
 
 
 # class RHN_ACTV1ReasoningModule(nn.Module):
