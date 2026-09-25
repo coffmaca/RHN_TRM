@@ -78,6 +78,7 @@ class RHN_ACTV1Config(BaseModel):
     hypernet_relative_scale: int
     hypernet_l2_lambda: float
     hypernet_kl_lambda: float
+    hypernet_cos_lambda: float
 
 class RHN_ACTV1Block(nn.Module):
     def __init__(self, config: RHN_ACTV1Config) -> None:
@@ -235,6 +236,8 @@ class RHN_Hypernetwork(nn.Module):
                                          self.max_dim,
                                          bias=False)
 
+        self.register_buffer("v_prev", None)
+
     def _get_raw_pos_tokens(self, batch_size):
         hw_pos = self.hw_pos.weight.view(1, 1, self.seq_h * self.seq_w, self.input_size)
         hw_pos = hw_pos.expand(batch_size, self.seq_n, -1, -1)
@@ -245,7 +248,7 @@ class RHN_Hypernetwork(nn.Module):
         tokens = hw_pos + layer_pos
         return tokens.reshape(batch_size, self.num_queries, self.input_size)
 
-    def forward(self, activations: torch.Tensor) -> Tuple[dict, torch.Tensor]:
+    def forward(self, activations: torch.Tensor) -> Tuple[dict, torch.Tensor, torch.Tensor]:
         batch_size = activations.shape[0]
 
         inputs = self._attention(activations)
@@ -255,9 +258,22 @@ class RHN_Hypernetwork(nn.Module):
         outputs = self.output_head(outputs)
         outputs = rms_norm(outputs.flatten(start_dim=1), variance_epsilon=self.config.rms_norm_eps).view(outputs.shape)
 
+        # 1. Flatten the parameters for the current input
+        flat_outputs = outputs.reshape(batch_size, -1)
+
+        # 2. Compute the squared cosine similarity against the detached previous step cache
+        if self.training and getattr(self, "v_prev", None) is not None:
+            step_cos_sim = F.cosine_similarity(flat_outputs, self.v_prev, dim=-1).pow(2)
+        else:
+            step_cos_sim = torch.zeros(batch_size, device=outputs.device, dtype=outputs.dtype)
+
+        # 3. Update the cache for the next optimization step
+        if self.training:
+            self.v_prev = flat_outputs.detach().mean(dim=0, keepdim=True)
+
         outputs_by_layer, step_l2 = self._detokenize(outputs, batch_size)
 
-        return outputs_by_layer, step_l2
+        return outputs_by_layer, step_l2, step_cos_sim
 
     def _attention(self, inputs):
         B, S, D = inputs.shape
@@ -415,7 +431,7 @@ class RHN_ACTV1_Inner(nn.Module):
 
     def forward(self, carry: RHN_ACTV1InnerCarry, batch: Dict[str, torch.Tensor],
                 log_deep_metrics: bool = False, **kwargs) -> Tuple[
-        RHN_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor, dict
+        RHN_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, dict
     ]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
@@ -451,39 +467,47 @@ class RHN_ACTV1_Inner(nn.Module):
             metric_calls += 1
 
         total_l2 = torch.zeros(z_L.shape[0], device=z_L.device, dtype=z_L.dtype)
+        total_cos_sim = torch.zeros(z_L.shape[0], device=z_L.device, dtype=z_L.dtype)
 
         with torch.no_grad():
             for _H_step in range(self.config.H_cycles-1):
                 for _L_step in range(self.config.L_cycles):
                     prev_z_L = z_L
-                    z_L, prev_activations, _, step_m = self._dynamic_forward(
+                    z_L, prev_activations, _, step_cos, step_m = self._dynamic_forward(
                         z_L=z_L, z_H=z_H, prev_activations=prev_activations,
                         input_embeddings=input_embeddings, log_deep_metrics=log_deep_metrics, **seq_info
                     )
                     track_metrics(prev_z_L, z_L, step_m)
+                    total_cos_sim += step_cos
                 prev_z_H = z_H
-                z_H, prev_activations, _, step_m = self._dynamic_forward(
+                z_H, prev_activations, _, step_cos, step_m = self._dynamic_forward(
                     z_L=z_L, z_H=z_H, prev_activations=prev_activations,
                     input_embeddings=None, log_deep_metrics=log_deep_metrics, **seq_info
                 )
                 track_metrics(prev_z_H, z_H, step_m)
+                total_cos_sim += step_cos
 
         for _L_step in range(self.config.L_cycles):
             prev_z_L = z_L
-            z_L, prev_activations, step_l2, step_m = self._dynamic_forward(
+            z_L, prev_activations, step_l2, step_cos, step_m = self._dynamic_forward(
                 z_L=z_L, z_H=z_H, prev_activations=prev_activations,
                 input_embeddings=input_embeddings, log_deep_metrics=log_deep_metrics, **seq_info
             )
             track_metrics(prev_z_L, z_L, step_m)
+            total_l2 += step_l2
+            total_cos_sim += step_cos
 
         prev_z_H = z_H
-        z_H, prev_activations, step_l2, step_m = self._dynamic_forward(
+        z_H, prev_activations, step_l2, step_cos, step_m = self._dynamic_forward(
             z_L=z_L, z_H=z_H, prev_activations=prev_activations,
             input_embeddings=None, log_deep_metrics=log_deep_metrics, **seq_info
         )
 
         total_l2 += step_l2
-        avg_l2 = total_l2 / (self.config.L_cycles + 1)
+        total_cos_sim += step_cos
+
+        avg_l2 = total_l2 / (self.config.H_cycles * (self.config.L_cycles + 1))
+        avg_cos_sim = total_cos_sim / (self.config.H_cycles * (self.config.L_cycles + 1))
         track_metrics(prev_z_H, z_H, step_m)
 
         if metric_calls > 0:
@@ -495,10 +519,10 @@ class RHN_ACTV1_Inner(nn.Module):
 
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
-        return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), avg_l2, total_metrics
+        return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), avg_l2, avg_cos_sim, total_metrics
 
     def _dynamic_forward(self, z_L, z_H, prev_activations, input_embeddings=None, log_deep_metrics=False, **seq_info) -> Tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor, dict
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict
     ]:
         h_input = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
 
@@ -513,7 +537,7 @@ class RHN_ACTV1_Inner(nn.Module):
             # Concatenate on sequence dimension (dim=1)
             prev_activations = torch.cat(activations_list, dim=1)
 
-        dynamic_weights, step_l2 = self.hypernet(prev_activations)
+        dynamic_weights, step_l2, step_cos_sim = self.hypernet(prev_activations)
 
         step_metrics = {}
         with torch.no_grad():
@@ -563,7 +587,7 @@ class RHN_ACTV1_Inner(nn.Module):
             step_metrics["sparsity"] = (h_out.abs() < 1e-3).float().mean()
             step_metrics["saturation"] = (h_out.abs() > 5.0).float().mean()
 
-        return h_out, new_activations, step_l2, step_metrics
+        return h_out, new_activations, step_l2, step_cos_sim, step_metrics
 
 
 
@@ -607,15 +631,15 @@ class RHN_ACTV1(nn.Module):
             new_current_data = carry.current_data
 
         # Forward inner model
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits), hypernet_l2, deep_metrics = self.inner(new_inner_carry, new_current_data, log_deep_metrics)
+        new_inner_carry, logits, (q_halt_logits, q_continue_logits), hypernet_l2, hypernet_cos_sim, deep_metrics = self.inner(new_inner_carry, new_current_data, log_deep_metrics)
 
         outputs = {
             "logits": logits,
             "q_halt_logits": q_halt_logits,
             "q_continue_logits": q_continue_logits,
             "hypernet_l2": hypernet_l2,
+            "hypernet_cos_sim": hypernet_cos_sim, # Add to outputs
         }
-
         outputs.update(deep_metrics)
 
         # Initialize inference carries
@@ -627,7 +651,8 @@ class RHN_ACTV1(nn.Module):
                 "steps": torch.empty_like(new_steps),
                 "q_halt_logits": torch.empty_like(q_halt_logits),
                 "q_continue_logits": torch.empty_like(q_continue_logits),
-                "hypernet_l2": torch.empty_like(hypernet_l2)
+                "hypernet_l2": torch.empty_like(hypernet_l2),
+                "hypernet_cos_sim": torch.empty_like(hypernet_cos_sim) # New cache
             }
             new_inference_active_indices = (carry.inference_active_indices if carry.inference_active_indices is not None
                                             else torch.arange(logits.shape[0], device=logits.device))
@@ -675,6 +700,7 @@ class RHN_ACTV1(nn.Module):
                     new_inference_carry["q_halt_logits"][new_halted_indices] = q_halt_logits[halted]
                     new_inference_carry["q_continue_logits"][new_halted_indices] = q_continue_logits[halted]
                     new_inference_carry["hypernet_l2"][new_halted_indices] = hypernet_l2[halted]
+                    new_inference_carry["hypernet_cos_sim"][new_halted_indices] = hypernet_cos_sim[halted] # Save halted
 
                     output_logits = new_inference_carry["logits"]
                     output_logits[new_inference_carry["active"]] = logits[active]
@@ -691,6 +717,10 @@ class RHN_ACTV1(nn.Module):
                     output_hypernet_l2 = new_inference_carry["hypernet_l2"]
                     output_hypernet_l2[new_inference_carry["active"]] = hypernet_l2[active]
                     outputs["hypernet_l2"] = output_hypernet_l2
+
+                    output_hypernet_cos = new_inference_carry["hypernet_cos_sim"]
+                    output_hypernet_cos[new_inference_carry["active"]] = hypernet_cos_sim[active]
+                    outputs["hypernet_cos_sim"] = output_hypernet_cos # Restore to output
 
                     # Filter halted samples from data
                     new_inner_carry.z_H = new_inner_carry.z_H[active]
