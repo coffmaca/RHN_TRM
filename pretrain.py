@@ -573,11 +573,11 @@ def evaluate(
                 for set_name, m in reduced_metrics_nested.items():
                     count = m.pop("count")
                     for k, v in m.items():
-                        flat_metrics[f"{set_name}/{k}"] = v / count
+                        flat_metrics[f"{set_name}.{k}"] = v / count
 
                     # Print the formalized global average step count per set
-                    if f"{set_name}/steps" in flat_metrics:
-                        print(f"  Final global average steps per sample for {set_name}: {flat_metrics[f'{set_name}/steps']:.4f}")
+                    if f"{set_name}.steps" in flat_metrics:
+                        print(f"  Final global average steps per sample for {set_name}: {flat_metrics[f'{set_name}.steps']:.4f}")
 
                 reduced_metrics = flat_metrics
 
