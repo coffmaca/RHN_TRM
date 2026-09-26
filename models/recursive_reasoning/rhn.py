@@ -190,7 +190,7 @@ class MultiAxisAttentionBlock(nn.Module):
         self.seq_l = seq_l
         self.seq_hw = seq_hw
 
-        self.forward_dtype = getattr(torch, self.config.forward_dtype)
+        self.forward_dtype = getattr(torch, config.forward_dtype) if isinstance(config.forward_dtype, str) else config.forward_dtype
 
         d = config.hypernet_hidden_size
         self.num_heads = config.hypernet_attn_heads
@@ -220,28 +220,28 @@ class MultiAxisAttentionBlock(nn.Module):
         # grid: [B, L, HW, D]
         B, L, HW, D = grid.shape
 
-        # 1. SA_L (batch over HW axis)
-        z_l = self.norm_l(grid).transpose(1, 2).reshape(B * HW, L, D)
-        qkv = self.qkv_l(z_l).view(B * HW, L, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.unbind(2)
+        # 1. SA_L (attend over L axis) - Uses 5D tensors to prevent CUDA grid limit crashes
+        z_l = self.norm_l(grid).transpose(1, 2) # [B, HW, L, D]
+        qkv = self.qkv_l(z_l).view(B, HW, L, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(3)
         if rope_l is not None:
             q, k = apply_rotary_pos_emb(q, k, rope_l[0], rope_l[1])
-        q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # [B*HW, H, L, head_dim]
+        q, k, v = map(lambda t: t.transpose(2, 3), (q, k, v)) # [B, HW, H, L, head_dim]
         out_l = F.scaled_dot_product_attention(q, k, v)
-        out_l = out_l.transpose(1, 2).reshape(B * HW, L, D)
-        out_l = self.o_l(out_l).view(B, HW, L, D).transpose(1, 2)
+        out_l = out_l.transpose(2, 3).reshape(B, HW, L, D)
+        out_l = self.o_l(out_l).transpose(1, 2) # [B, L, HW, D]
         grid = grid + out_l
 
-        # 2. SA_HW (batch over L axis)
-        z_hw = self.norm_hw(grid).reshape(B * L, HW, D)
-        qkv = self.qkv_hw(z_hw).view(B * L, HW, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.unbind(2)
+        # 2. SA_HW (attend over HW axis) - Uses 5D tensors to prevent CUDA grid limit crashes
+        z_hw = self.norm_hw(grid) # [B, L, HW, D]
+        qkv = self.qkv_hw(z_hw).view(B, L, HW, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(3)
         if rope_hw is not None:
             q, k = apply_rotary_pos_emb(q, k, rope_hw[0], rope_hw[1])
-        q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))
+        q, k, v = map(lambda t: t.transpose(2, 3), (q, k, v)) # [B, L, H, HW, head_dim]
         out_hw = F.scaled_dot_product_attention(q, k, v)
-        out_hw = out_hw.transpose(1, 2).reshape(B * L, HW, D)
-        out_hw = self.o_hw(out_hw).view(B, L, HW, D)
+        out_hw = out_hw.transpose(2, 3).reshape(B, L, HW, D)
+        out_hw = self.o_hw(out_hw)
         grid = grid + out_hw
 
         # 3. CA (Conditioning on prior activations)
