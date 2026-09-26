@@ -20,7 +20,6 @@ IGNORE_LABEL_ID = -100
 class RHN_ACTV1InnerCarry:
     z_H: torch.Tensor
     z_L: torch.Tensor
-    prev_activations: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -489,18 +488,12 @@ class RHN_ACTV1_Inner(nn.Module):
         return RHN_ACTV1InnerCarry(
             z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
             z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
-            prev_activations=None
         )
         
     def reset_carry(self, reset_flag: torch.Tensor, carry: RHN_ACTV1InnerCarry):
-        new_prev = carry.prev_activations
-        if new_prev is not None:
-            new_prev = torch.where(reset_flag.view(-1, 1, 1), torch.zeros_like(new_prev), new_prev)
-
         return RHN_ACTV1InnerCarry(
             z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
-            prev_activations=new_prev
         )
 
     def forward(self, carry: RHN_ACTV1InnerCarry, batch: Dict[str, torch.Tensor],
@@ -512,9 +505,7 @@ class RHN_ACTV1_Inner(nn.Module):
         )
 
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
-
         z_H, z_L = carry.z_H, carry.z_L
-        prev_activations = carry.prev_activations
 
         total_metrics = {
             "telemetry/act_sparsity": torch.tensor(0.0, device=z_H.device),
@@ -547,15 +538,15 @@ class RHN_ACTV1_Inner(nn.Module):
             for _H_step in range(self.config.H_cycles-1):
                 for _L_step in range(self.config.L_cycles):
                     prev_z_L = z_L
-                    z_L, prev_activations, _, step_cos, step_m = self._dynamic_forward(
-                        z_L=z_L, z_H=z_H, prev_activations=prev_activations,
+                    z_L, _, step_cos, step_m = self._dynamic_forward(
+                        z_L=z_L, z_H=z_H,
                         input_embeddings=input_embeddings, log_deep_metrics=log_deep_metrics, **seq_info
                     )
                     track_metrics(prev_z_L, z_L, step_m)
                     total_cos_sim += step_cos
                 prev_z_H = z_H
-                z_H, prev_activations, _, step_cos, step_m = self._dynamic_forward(
-                    z_L=z_L, z_H=z_H, prev_activations=prev_activations,
+                z_H, _, step_cos, step_m = self._dynamic_forward(
+                    z_L=z_L, z_H=z_H,
                     input_embeddings=None, log_deep_metrics=log_deep_metrics, **seq_info
                 )
                 track_metrics(prev_z_H, z_H, step_m)
@@ -563,8 +554,8 @@ class RHN_ACTV1_Inner(nn.Module):
 
         for _L_step in range(self.config.L_cycles):
             prev_z_L = z_L
-            z_L, prev_activations, step_l2, step_cos, step_m = self._dynamic_forward(
-                z_L=z_L, z_H=z_H, prev_activations=prev_activations,
+            z_L, step_l2, step_cos, step_m = self._dynamic_forward(
+                z_L=z_L, z_H=z_H,
                 input_embeddings=input_embeddings, log_deep_metrics=log_deep_metrics, **seq_info
             )
             track_metrics(prev_z_L, z_L, step_m)
@@ -572,15 +563,15 @@ class RHN_ACTV1_Inner(nn.Module):
             total_cos_sim += step_cos
 
         prev_z_H = z_H
-        z_H, prev_activations, step_l2, step_cos, step_m = self._dynamic_forward(
-            z_L=z_L, z_H=z_H, prev_activations=prev_activations,
+        z_H, step_l2, step_cos, step_m = self._dynamic_forward(
+            z_L=z_L, z_H=z_H,
             input_embeddings=None, log_deep_metrics=log_deep_metrics, **seq_info
         )
 
         total_l2 += step_l2
         total_cos_sim += step_cos
 
-        avg_l2 = total_l2 / (self.config.H_cycles * (self.config.L_cycles + 1))
+        avg_l2 = total_l2 / (self.config.L_cycles + 1)
         avg_cos_sim = total_cos_sim / (self.config.H_cycles * (self.config.L_cycles + 1))
         track_metrics(prev_z_H, z_H, step_m)
 
@@ -588,30 +579,27 @@ class RHN_ACTV1_Inner(nn.Module):
             for k in total_metrics:
                 total_metrics[k] /= metric_calls
 
-        prev_activations_detached = prev_activations.detach() if prev_activations is not None else None
-        new_carry = RHN_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach(), prev_activations=prev_activations_detached)
+        new_carry = RHN_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
 
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), avg_l2, avg_cos_sim, total_metrics
 
-    def _dynamic_forward(self, z_L, z_H, prev_activations, input_embeddings=None, log_deep_metrics=False, **seq_info) -> Tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict
+    def _dynamic_forward(self, z_L, z_H, input_embeddings=None, log_deep_metrics=False, **seq_info) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, dict
     ]:
         h_input = z_L + z_H + input_embeddings if input_embeddings is not None else z_L + z_H
 
-        if prev_activations is None:
-            activations_list = []
-            h_temp = h_input
-            for layer in self.L_level:
-                layer.clear_dynamic_adapter()
-                h_temp = layer(hidden_states=h_temp, **seq_info)
-                activations_list.append(h_temp.detach())
+        activations_list = []
+        h_temp = h_input
+        for layer in self.L_level:
+            layer.clear_dynamic_adapter()
+            h_temp = layer(hidden_states=h_temp, **seq_info)
+            activations_list.append(h_temp.detach())
 
-            # Concatenate on sequence dimension (dim=1)
-            prev_activations = torch.cat(activations_list, dim=1)
+        activations = torch.cat(activations_list, dim=1)
 
-        dynamic_weights, step_l2, step_cos_sim = self.hypernet(prev_activations)
+        dynamic_weights, step_l2, step_cos_sim = self.hypernet(activations)
 
         step_metrics = {}
         with torch.no_grad():
@@ -649,19 +637,14 @@ class RHN_ACTV1_Inner(nn.Module):
             layer.set_dynamic_adapter(*layer_weights)
 
         h_out = h_input
-        new_activations_list = []
         for layer in self.L_level:
             h_out = layer(hidden_states=h_out, **seq_info)
-            new_activations_list.append(h_out.detach())
-
-        # 5. Extract current activations for the next iteration (Sequence dimension)
-        new_activations = torch.cat(new_activations_list, dim=1)
 
         with torch.no_grad():
             step_metrics["sparsity"] = (h_out.abs() < 1e-3).float().mean()
             step_metrics["saturation"] = (h_out.abs() > 5.0).float().mean()
 
-        return h_out, new_activations, step_l2, step_cos_sim, step_metrics
+        return h_out, step_l2, step_cos_sim, step_metrics
 
 
 
@@ -799,8 +782,6 @@ class RHN_ACTV1(nn.Module):
                     # Filter halted samples from data
                     new_inner_carry.z_H = new_inner_carry.z_H[active]
                     new_inner_carry.z_L = new_inner_carry.z_L[active]
-                    if new_inner_carry.prev_activations is not None:
-                        new_inner_carry.prev_activations = new_inner_carry.prev_activations[active]
 
                     new_current_data["inputs"] = new_current_data["inputs"][active]
                     # new_current_data["labels"] = new_current_data["labels"][active] # Skip labels - Need full batch to test full batch accuracy
