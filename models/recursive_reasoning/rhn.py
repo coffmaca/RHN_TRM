@@ -11,7 +11,8 @@ from pydantic import BaseModel
 import random
 from models.common import trunc_normal_init_
 from models.layers import (rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding,
-                           CastedParameter, CastedLinear, DynamicSwiGLU, DynamicAttention, apply_rotary_pos_emb)
+                           CastedParameter, CastedLinear, DynamicSwiGLU, DynamicAttention, apply_rotary_pos_emb,
+                           LowRankCastedLinear, LowRankSwiGLU)
 from models.sparse_embedding import CastedSparseEmbedding
 
 IGNORE_LABEL_ID = -100
@@ -71,6 +72,7 @@ class RHN_ACTV1Config(BaseModel):
     hypernet_hidden_size: int
     layer_emb_dim: int
     lora_rank: int
+    hypernet_rank: int
     hypernet_attn_heads: int
     hypernet_l2_lambda: float
     hypernet_kl_lambda: float
@@ -195,26 +197,27 @@ class MultiAxisAttentionBlock(nn.Module):
         d = config.hypernet_hidden_size
         self.num_heads = config.hypernet_attn_heads
         self.head_dim = d // self.num_heads
+        r = config.hypernet_rank # Rank for factorization
 
         # 1. Cross-layer self-attention (SA_L)
         self.norm_l = torch.nn.RMSNorm(d, eps=config.rms_norm_eps, dtype=self.forward_dtype)
-        self.qkv_l = CastedLinear(d, 3 * d, bias=False)
-        self.o_l = CastedLinear(d, d, bias=False)
+        self.qkv_l = LowRankCastedLinear(d, 3 * d, rank=r, bias=False)
+        self.o_l = LowRankCastedLinear(d, d, rank=r, bias=False)
 
         # 2. Intra-layer self-attention (SA_HW)
         self.norm_hw = torch.nn.RMSNorm(d, eps=config.rms_norm_eps, dtype=self.forward_dtype)
-        self.qkv_hw = CastedLinear(d, 3 * d, bias=False)
-        self.o_hw = CastedLinear(d, d, bias=False)
+        self.qkv_hw = LowRankCastedLinear(d, 3 * d, rank=r, bias=False)
+        self.o_hw = LowRankCastedLinear(d, d, rank=r, bias=False)
 
         # 3. Conditioning cross-attention (CA)
         self.norm_ca = torch.nn.RMSNorm(d, eps=config.rms_norm_eps, dtype=self.forward_dtype)
-        self.q_ca = CastedLinear(d, d, bias=False)
-        self.kv_ca = CastedLinear(d, 2 * d, bias=False)
-        self.o_ca = CastedLinear(d, d, bias=False)
+        self.q_ca = LowRankCastedLinear(d, d, rank=r, bias=False)
+        self.kv_ca = LowRankCastedLinear(d, 2 * d, rank=r, bias=False)
+        self.o_ca = LowRankCastedLinear(d, d, rank=r, bias=False)
 
         # 4. Feed-Forward Network
         self.norm_ffn = torch.nn.RMSNorm(d, eps=config.rms_norm_eps, dtype=self.forward_dtype)
-        self.ffn = SwiGLU(d, config.expansion)
+        self.ffn = LowRankSwiGLU(d, config.expansion, rank=r)
 
     def forward(self, grid, cond, rope_l, rope_hw, rope_cond_q, rope_cond_k):
         # grid: [B, L, HW, D]
@@ -288,6 +291,7 @@ class RHN_Hypernetwork(nn.Module):
 
         d_pg = self.config.hypernet_hidden_size
         head_dim = d_pg // self.config.hypernet_attn_heads
+        r = self.config.hypernet_rank # Rank for factorization
 
         # Structural Positional Embeddings (using your CastedEmbedding for dtype safety)
         self.layer_pos = CastedEmbedding(self.seq_n, d_pg, init_std=1.0 / math.sqrt(d_pg), cast_to=self.forward_dtype)
@@ -301,7 +305,7 @@ class RHN_Hypernetwork(nn.Module):
         )
 
         # Map base model activations into the generator space
-        self.cond_proj = CastedLinear(self.config.hidden_size, d_pg, bias=False)
+        self.cond_proj = LowRankCastedLinear(self.config.hidden_size, d_pg, rank=r, bias=False)
 
         # Multi-axis RoPEs
         self.rope_l = RotaryEmbedding(head_dim, self.seq_n, self.config.rope_theta)
@@ -317,7 +321,7 @@ class RHN_Hypernetwork(nn.Module):
 
         # Output head projects to the maximum feature dimension required across all matrices
         self.max_dim = max(max(shape) for name, shape in self.layer_specs)
-        self.output_head = CastedLinear(d_pg, self.max_dim, bias=False)
+        self.output_head = LowRankCastedLinear(d_pg, self.max_dim, rank=r, bias=False)
 
         self.register_buffer("v_prev", None)
 

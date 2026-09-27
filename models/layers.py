@@ -118,6 +118,32 @@ class CastedLinear(nn.Module):
         return F.linear(input, self.weight.to(input.dtype), bias=self.bias.to(input.dtype) if self.bias is not None else None)
 
 
+class LowRankCastedLinear(nn.Module):
+    """A factorized linear layer to constrain capacity."""
+
+    def __init__(self, in_features: int, out_features: int, rank: int, bias: bool):
+        super().__init__()
+        self.rank = rank
+
+        # Factor A: (rank, in_features)
+        self.weight_A = nn.Parameter(
+            trunc_normal_init_(torch.empty((rank, in_features)), std=1.0 / (in_features ** 0.5))
+        )
+        # Factor B: (out_features, rank)
+        self.weight_B = nn.Parameter(
+            trunc_normal_init_(torch.empty((out_features, rank)), std=1.0 / (rank ** 0.5))
+        )
+
+        self.bias = None
+        if bias:
+            self.bias = nn.Parameter(torch.zeros((out_features,)))
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        x = F.linear(input, self.weight_A.to(input.dtype))
+        return F.linear(x, self.weight_B.to(input.dtype),
+                        bias=self.bias.to(input.dtype) if self.bias is not None else None)
+
+
 class CastedParameter(nn.Module):
     def __init__(self,
                  size: tuple,
@@ -304,6 +330,21 @@ class SwiGLU(nn.Module):
     def forward(self, x):
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
         return self.down_proj(F.silu(gate) * up)
+
+
+class LowRankSwiGLU(nn.Module):
+    """A factorized version of SwiGLU for the hypernetwork FFNs."""
+    def __init__(self, hidden_size: int, expansion: float, rank: int):
+        super().__init__()
+        inter = _find_multiple(round(expansion * hidden_size * 2 / 3), 256)
+
+        self.gate_up_proj = LowRankCastedLinear(hidden_size, inter * 2, rank=rank, bias=False)
+        self.down_proj    = LowRankCastedLinear(inter, hidden_size, rank=rank, bias=False)
+
+    def forward(self, x):
+        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+        return self.down_proj(F.silu(gate) * up)
+
 
 def rms_norm(hidden_states: torch.Tensor, variance_epsilon: float) -> torch.Tensor:
     input_dtype = hidden_states.dtype

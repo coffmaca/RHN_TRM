@@ -28,6 +28,7 @@ no_ACT_continue: True # No continue ACT loss, only use the sigmoid of the halt w
 hypernet_hidden_size: 512
 layer_emb_dim: 32
 lora_rank: 4
+hypernet_rank: 256
 hypernet_attn_heads: 8
 hypernet_l2_lambda: 1e-4
 hypernet_kl_lambda: 1e-4
