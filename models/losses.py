@@ -99,5 +99,17 @@ class ACTLossHead(nn.Module):
         # Filter outputs for return
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
-        return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss), metrics, detached_outputs, new_carry.halted.all()
+        moe_aux_loss = 0.0
+        if "moe_aux_loss" in outputs:
+            moe_aux_loss = outputs["moe_aux_loss"]
+            metrics["moe_aux_loss"] = moe_aux_loss.detach()
+            if "moe_balance_loss" in outputs:
+                metrics["moe_balance_loss"] = outputs["moe_balance_loss"]
+            if "moe_z_loss" in outputs:
+                metrics["moe_z_loss"] = outputs["moe_z_loss"]
+            if "moe_max_expert_load" in outputs:
+                metrics["moe_max_expert_load"] = outputs["moe_max_expert_load"]
+
+        total_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss) + moe_aux_loss
+        return new_carry, total_loss, metrics, detached_outputs, new_carry.halted.all()
 

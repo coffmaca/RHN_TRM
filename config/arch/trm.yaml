@@ -24,3 +24,19 @@ forward_dtype: bfloat16
 mlp_t: False # use mlp on L instead of transformer
 puzzle_emb_len: 16 # if non-zero, its specified to this value
 no_ACT_continue: True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
+
+# Mixture of Experts (MoE) Configuration
+use_moe: False
+moe_num_experts: 8
+moe_top_k: 2
+moe_expert_expansion: 1.5
+moe_num_shared_experts: 1
+moe_shared_expert_expansion: 1.0
+moe_gate_type: softmax
+moe_norm_topk_prob: True
+moe_router_temperature: 1.0
+moe_jitter_noise: 0.01
+moe_dropout: 0.05
+moe_aux_loss_coef: 0.01
+moe_z_loss_coef: 0.001
+moe_apply_to_mlp_t: False

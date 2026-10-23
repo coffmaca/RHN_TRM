@@ -8,7 +8,9 @@ from torch import nn
 from pydantic import BaseModel
 import random
 from models.common import trunc_normal_init_
-from models.layers import rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
+from models.layers import (
+    rms_norm, LinearSwish, SwiGLU, MoESwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
+)
 from models.sparse_embedding import CastedSparseEmbedding
 
 IGNORE_LABEL_ID = -100
@@ -62,29 +64,83 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     puzzle_emb_len: int = 16 # if non-zero, its specified to this value
     no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
 
+    # Mixture of Experts (MoE) Configuration
+    use_moe: bool = False
+    moe_num_experts: int = 8
+    moe_top_k: int = 2
+    moe_expert_expansion: Optional[float] = None
+    moe_num_shared_experts: int = 0
+    moe_shared_expert_expansion: Optional[float] = None
+    moe_gate_type: str = "softmax"
+    moe_norm_topk_prob: bool = True
+    moe_router_temperature: float = 1.0
+    moe_jitter_noise: float = 0.0
+    moe_dropout: float = 0.0
+    moe_aux_loss_coef: float = 0.01
+    moe_z_loss_coef: float = 0.001
+    moe_apply_to_mlp_t: bool = False
+
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
         super().__init__()
-
         self.config = config
+
         if self.config.mlp_t:
-            self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size) if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len
-            self.mlp_t = SwiGLU(
-                hidden_size=self.config.seq_len + self.puzzle_emb_len, # L # TODO - Confirm reasoning for these values
-                expansion=config.expansion,
+            self.puzzle_emb_len = (
+                -(self.config.puzzle_emb_ndim // -self.config.hidden_size)
+                if self.config.puzzle_emb_len == 0
+                else self.config.puzzle_emb_len
             )
+            seq_dim = self.config.seq_len + self.puzzle_emb_len
+            if self.config.use_moe and self.config.moe_apply_to_mlp_t:
+                self.mlp_t = MoESwiGLU(
+                    hidden_size=seq_dim,
+                    expansion=config.expansion,
+                    num_experts=config.moe_num_experts,
+                    top_k=config.moe_top_k,
+                    expert_expansion=config.moe_expert_expansion,
+                    num_shared_experts=config.moe_num_shared_experts,
+                    shared_expert_expansion=config.moe_shared_expert_expansion,
+                    gate_type=config.moe_gate_type,
+                    norm_topk_prob=config.moe_norm_topk_prob,
+                    router_temperature=config.moe_router_temperature,
+                    jitter_noise=config.moe_jitter_noise,
+                    moe_dropout=config.moe_dropout,
+                )
+            else:
+                self.mlp_t = SwiGLU(
+                    hidden_size=seq_dim,
+                    expansion=config.expansion,
+                )
         else:
             self.self_attn = Attention(
                 hidden_size=config.hidden_size,
                 head_dim=config.hidden_size // config.num_heads,
                 num_heads=config.num_heads,
                 num_key_value_heads=config.num_heads,
-                causal=False
+                causal=False,
             )
-        self.mlp = SwiGLU(
-            hidden_size=config.hidden_size,
-            expansion=config.expansion,
-        )
+
+        if self.config.use_moe:
+            self.mlp = MoESwiGLU(
+                hidden_size=config.hidden_size,
+                expansion=config.expansion,
+                num_experts=config.moe_num_experts,
+                top_k=config.moe_top_k,
+                expert_expansion=config.moe_expert_expansion,
+                num_shared_experts=config.moe_num_shared_experts,
+                shared_expert_expansion=config.moe_shared_expert_expansion,
+                gate_type=config.moe_gate_type,
+                norm_topk_prob=config.moe_norm_topk_prob,
+                router_temperature=config.moe_router_temperature,
+                jitter_noise=config.moe_jitter_noise,
+                moe_dropout=config.moe_dropout,
+            )
+        else:
+            self.mlp = SwiGLU(
+                hidden_size=config.hidden_size,
+                expansion=config.expansion,
+            )
         self.norm_eps = config.rms_norm_eps
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -107,6 +163,32 @@ class TinyRecursiveReasoningModel_ACTV1ReasoningModule(nn.Module):
     def __init__(self, layers: List[TinyRecursiveReasoningModel_ACTV1Block]):
         super().__init__()
         self.layers = torch.nn.ModuleList(layers)
+
+    def reset_moe_buffers(self) -> None:
+        for layer in self.layers:
+            if isinstance(layer.mlp, MoESwiGLU):
+                layer.mlp.reset_moe_Buffer()
+            if hasattr(layer, "mlp_t") and isinstance(layer.mlp_t, MoESwiGLU):
+                layer.mlp_t.reset_moe_Buffer()
+
+    def collect_moe_metrics(self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        balance_losses, z_losses, max_loads = [], [], []
+        for layer in self.layers:
+            for submod_name in ("mlp", "mlp_t"):
+                submod = getattr(layer, submod_name, None)
+                if isinstance(submod, MoESwiGLU):
+                    b_loss, z_loss, m_load = submod.pop_moe_metrics(device)
+                    balance_losses.append(b_loss)
+                    z_losses.append(z_loss)
+                    max_loads.append(m_load)
+        if not balance_losses:
+            zero = torch.tensor(0.0, dtype=torch.float32, device=device)
+            return zero, zero, zero
+        return (
+            torch.stack(balance_losses).mean(),
+            torch.stack(z_losses).mean(),
+            torch.stack(max_loads).mean(),
+        )
 
     def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs) -> torch.Tensor:
         hidden_states = hidden_states + input_injection
@@ -210,7 +292,11 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                 for _L_step in range(self.config.L_cycles):
                     z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
                 z_H = self.L_level(z_H, z_L, **seq_info)
-        # 1 with grad
+
+        if self.config.use_moe:
+            self.L_level.reset_moe_buffers()
+
+        # 1 with grad (existing TRM code)
         for _L_step in range(self.config.L_cycles):
             z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
         z_H = self.L_level(z_H, z_L, **seq_info)
@@ -263,6 +349,18 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
             "q_halt_logits": q_halt_logits,
             "q_continue_logits": q_continue_logits
         }
+
+        if self.config.use_moe:
+            balance_loss, z_loss, max_load = self.inner.L_level.collect_moe_metrics(logits.device)
+            # Scale by batch size to match sum-reduced loss convention in ACTLossHead
+            batch_scale = float(logits.shape[0])
+            outputs["moe_aux_loss"] = batch_scale * (
+                self.config.moe_aux_loss_coef * balance_loss +
+                self.config.moe_z_loss_coef * z_loss
+            )
+            outputs["moe_balance_loss"] = balance_loss.detach()
+            outputs["moe_z_loss"] = z_loss.detach()
+            outputs["moe_max_expert_load"] = max_load.detach()
 
         with torch.no_grad():
             # Step

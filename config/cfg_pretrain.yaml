@@ -1,7 +1,7 @@
 # ARC training config
 
 defaults:
-  - arch: rhn
+  - arch: trm
   - _self_
 
 hydra:

@@ -1,5 +1,6 @@
-from typing import Tuple
+from typing import List, Optional, Tuple
 import einops
+import math
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -270,6 +271,156 @@ class SwiGLU(nn.Module):
     def forward(self, x):
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
         return self.down_proj(F.silu(gate) * up)
+
+
+class MoESwiGLU(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        expansion: float,
+        num_experts: int = 8,
+        top_k: int = 2,
+        expert_expansion: Optional[float] = None,
+        num_shared_experts: int = 0,
+        shared_expert_expansion: Optional[float] = None,
+        gate_type: str = "softmax",
+        norm_topk_prob: bool = True,
+        router_temperature: float = 1.0,
+        jitter_noise: float = 0.0,
+        moe_dropout: float = 0.0,
+    ):
+        super().__init__()
+        if top_k < 1 or top_k > num_experts:
+            raise ValueError(f"moe_top_k ({top_k}) must be between 1 and moe_num_experts ({num_experts}).")
+        if gate_type not in ("softmax", "sigmoid"):
+            raise ValueError(f"moe_gate_type must be 'softmax' or 'sigmoid', got '{gate_type}'.")
+
+        self.hidden_size = hidden_size
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.gate_type = gate_type
+        # For Top-1 (Switch), normalizing by the single selected weight would yield 1.0 and sever router gradients
+        self.norm_topk_prob = norm_topk_prob if top_k > 1 else False
+        self.router_temperature = router_temperature
+        self.jitter_noise = jitter_noise
+        self.moe_dropout = nn.Dropout(moe_dropout) if moe_dropout > 0.0 else nn.Identity()
+
+        routed_exp = expert_expansion if expert_expansion is not None else expansion
+        shared_exp = shared_expert_expansion if shared_expert_expansion is not None else routed_exp
+
+        # Router linear projection (initialized with small std for near-uniform initial routing)
+        self.gate = nn.Linear(hidden_size, num_experts, bias=False)
+        trunc_normal_init_(self.gate.weight, std=1.0 / math.sqrt(hidden_size))
+
+        # Bank of Routed SwiGLU Experts
+        self.experts = nn.ModuleList([
+            SwiGLU(hidden_size=hidden_size, expansion=routed_exp)
+            for _ in range(num_experts)
+        ])
+
+        # Optional Always-Active Shared Expert(s)
+        self.num_shared_experts = num_shared_experts
+        if num_shared_experts > 0:
+            self.shared_experts = nn.ModuleList([
+                SwiGLU(hidden_size=hidden_size, expansion=shared_exp)
+                for _ in range(num_shared_experts)
+            ])
+        else:
+            self.shared_experts = None
+
+        # Accumulators for recursive gradient-enabled steps
+        self._aux_losses: List[torch.Tensor] = []
+        self._z_losses: List[torch.Tensor] = []
+        self._expert_max_loads: List[torch.Tensor] = []
+
+    def reset_moe_Buffer(self) -> None:
+        """Clears accumulated auxiliary losses at the start of a forward pass."""
+        self._aux_losses.clear()
+        self._z_losses.clear()
+        self._expert_max_loads.clear()
+
+    def pop_moe_metrics(self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns mean (balance_loss, z_loss, max_expert_load) across recursive steps and resets buffers."""
+        if len(self._aux_losses) == 0:
+            zero = torch.tensor(0.0, dtype=torch.float32, device=device)
+            return zero, zero, zero
+        balance_loss = torch.stack(self._aux_losses).mean()
+        z_loss = torch.stack(self._z_losses).mean()
+        max_load = torch.stack(self._expert_max_loads).mean()
+        self.reset_moe_Buffer()
+        return balance_loss, z_loss, max_load
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_shape = x.shape  # [B, S, D]
+        orig_dtype = x.dtype
+        x_flat = x.reshape(-1, self.hidden_size)  # [N_tokens, D]
+
+        # 1. Compute Router Logits in FP32 for numerical stability
+        router_input = x_flat.to(torch.float32)
+        if self.training and self.jitter_noise > 0.0:
+            noise = torch.empty_like(router_input).uniform_(
+                1.0 - self.jitter_noise, 1.0 + self.jitter_noise
+            )
+            router_input = router_input * noise
+
+        router_logits = F.linear(router_input, self.gate.weight.to(torch.float32))
+        if self.router_temperature != 1.0:
+            router_logits = router_logits / self.router_temperature
+
+        # 2. Compute Routing Probabilities
+        if self.gate_type == "softmax":
+            routing_probs = F.softmax(router_logits, dim=-1)
+        else:
+            routing_probs = torch.sigmoid(router_logits)
+
+        # 3. Select Top-K Experts per Token
+        topk_weights, topk_indices = torch.topk(routing_probs, k=self.top_k, dim=-1)  # [N_tokens, K]
+
+        if self.norm_topk_prob:
+            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-9)
+
+        # 4. Accumulate Load-Balancing & Z-Loss during gradient-enabled recursive passes
+        if self.training and torch.is_grad_enabled():
+            # Router Z-Loss: penalizes large logits
+            z_loss = torch.logsumexp(router_logits, dim=-1).square().mean()
+
+            # Switch / Mixtral Load-Balancing Loss: N * sum(f_i * P_i)
+            # P_i: mean router probability per expert across tokens
+            if self.gate_type == "sigmoid":
+                prob_for_balance = routing_probs / (routing_probs.sum(dim=-1, keepdim=True) + 1e-9)
+            else:
+                prob_for_balance = routing_probs
+            P_i = prob_for_balance.mean(dim=0)  # [num_experts]
+
+            # f_i: fraction of tokens routed to each expert across Top-K selections
+            expert_mask = F.one_hot(topk_indices, num_classes=self.num_experts).to(torch.float32)  # [N_tokens, K, E]
+            f_i = expert_mask.mean(dim=(0, 1))  # [num_experts]
+
+            balance_loss = self.num_experts * torch.sum(f_i * P_i)
+
+            self._aux_losses.append(balance_loss)
+            self._z_losses.append(z_loss)
+            self._expert_max_loads.append(f_i.max().detach())
+
+        # 5. Dispatch Tokens to Active Routed Experts and Combine
+        topk_weights = topk_weights.to(orig_dtype)
+        routed_out = torch.zeros_like(x_flat)
+
+        # Token-grouped dispatch (zero token dropping)
+        for expert_idx, expert_layer in enumerate(self.experts):
+            token_indices, k_positions = torch.where(topk_indices == expert_idx)
+            if token_indices.numel() > 0:
+                selected_tokens = x_flat.index_select(0, token_indices)
+                expert_output = self.moe_dropout(expert_layer(selected_tokens))
+                weights = topk_weights[token_indices, k_positions].unsqueeze(-1)
+                routed_out.index_add_(0, token_indices, expert_output * weights)
+
+        # 6. Add Shared Expert Contribution (if enabled)
+        if self.shared_experts is not None:
+            for shared_expert in self.shared_experts:
+                routed_out = routed_out + shared_expert(x_flat)
+
+        return routed_out.view(orig_shape)
 
 def rms_norm(hidden_states: torch.Tensor, variance_epsilon: float) -> torch.Tensor:
     input_dtype = hidden_states.dtype
