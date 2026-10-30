@@ -71,16 +71,22 @@ class ACTLossHead(nn.Module):
             seq_is_correct = is_correct.sum(-1) == loss_counts
             
             # Metrics (halted)
-            valid_metrics = new_carry.halted & (loss_counts > 0)
-            metrics = {
-                "count": valid_metrics.sum(),
-                
-                "accuracy":       torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum(),
-                "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
+        valid_metrics = new_carry.halted & (loss_counts > 0)
+        metrics = {
+            "count": valid_metrics.sum(),
+            "accuracy": torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum(),
+            "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
+            "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum(),
+            "steps": torch.where(valid_metrics, new_carry.steps, 0).sum(),
+        }
 
-                "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum(),
-                "steps":          torch.where(valid_metrics, new_carry.steps, 0).sum(),
-            }
+        # Aggregate telemetry metrics across halted sequences
+        for k, v in outputs.items():
+            if k.startswith("telemetry/"):
+                if v.ndim == 0:
+                    metrics[k] = v.detach().to(torch.float32) * valid_metrics.sum()
+                else:
+                    metrics[k] = torch.where(valid_metrics, v.detach().to(torch.float32), 0.0).sum()
 
         # Losses
 

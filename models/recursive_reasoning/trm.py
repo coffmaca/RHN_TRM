@@ -193,7 +193,15 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
         )
 
-    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    def _batch_cos_sim(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Computes per-sample cosine similarity averaged across the sequence dimension [B]."""
+        return F.cosine_similarity(a.detach().float(), b.detach().float(), dim=-1).mean(dim=-1)
+
+    def forward(
+        self,
+        carry: TinyRecursiveReasoningModel_ACTV1InnerCarry,
+        batch: Dict[str, torch.Tensor],
+    ) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Dict[str, torch.Tensor]]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
@@ -202,24 +210,128 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
 
         # Forward iterations
-        it = 0
         z_H, z_L = carry.z_H, carry.z_L
+        init_z_H = z_H.detach()
+        init_z_L = z_L.detach()
+
+        # Telemetry accumulators (shape: [B])
+        B = z_H.shape[0]
+        device = z_H.device
+        zero_b = torch.zeros(B, dtype=torch.float32, device=device)
+
+        zL_lag1_sum, zL_lag1_count = zero_b.clone(), 0
+        zL_lag2_sum, zL_lag2_count = zero_b.clone(), 0
+        zL_first_L_sum, zL_first_L_count = zero_b.clone(), 0
+        zL_last_L_sum, zL_last_L_count = zero_b.clone(), 0
+        zL_H_window_sum, zL_H_window_count = zero_b.clone(), 0
+        zL_delta_cos_sum, zL_delta_cos_count = zero_b.clone(), 0
+
+        zH_step_sum, zH_step_count = zero_b.clone(), 0
+        zH_delta_cos_sum, zH_delta_cos_count = zero_b.clone(), 0
+
+        prev_z_L = z_L.detach()
+        prev2_z_L: Optional[torch.Tensor] = None
+        prev_delta_z_L: Optional[torch.Tensor] = None
+
+        prev_z_H = z_H.detach()
+        prev_delta_z_H: Optional[torch.Tensor] = None
+
+        def record_zL_step(curr_z_L: torch.Tensor, l_idx: int):
+            nonlocal prev_z_L, prev2_z_L, prev_delta_z_L
+            nonlocal zL_lag1_sum, zL_lag1_count, zL_lag2_sum, zL_lag2_count
+            nonlocal zL_first_L_sum, zL_first_L_count, zL_last_L_sum, zL_last_L_count
+            nonlocal zL_delta_cos_sum, zL_delta_cos_count
+
+            with torch.no_grad():
+                curr_det = curr_z_L.detach()
+                cos_lag1 = self._batch_cos_sim(curr_det, prev_z_L)
+                zL_lag1_sum = zL_lag1_sum + cos_lag1
+                zL_lag1_count += 1
+
+                if l_idx == 0:
+                    zL_first_L_sum = zL_first_L_sum + cos_lag1
+                    zL_first_L_count += 1
+                if l_idx == self.config.L_cycles - 1:
+                    zL_last_L_sum = zL_last_L_sum + cos_lag1
+                    zL_last_L_count += 1
+
+                if prev2_z_L is not None:
+                    zL_lag2_sum = zL_lag2_sum + self._batch_cos_sim(curr_det, prev2_z_L)
+                    zL_lag2_count += 1
+
+                delta_z_L = curr_det.float() - prev_z_L.float()
+                if prev_delta_z_L is not None:
+                    zL_delta_cos_sum = zL_delta_cos_sum + self._batch_cos_sim(delta_z_L, prev_delta_z_L)
+                    zL_delta_cos_count += 1
+
+                prev_delta_z_L = delta_z_L
+                prev2_z_L = prev_z_L
+                prev_z_L = curr_det
+
+        def record_zH_step(curr_z_H: torch.Tensor):
+            nonlocal prev_z_H, prev_delta_z_H
+            nonlocal zH_step_sum, zH_step_count, zH_delta_cos_sum, zH_delta_cos_count
+
+            with torch.no_grad():
+                curr_det = curr_z_H.detach()
+                zH_step_sum = zH_step_sum + self._batch_cos_sim(curr_det, prev_z_H)
+                zH_step_count += 1
+
+                delta_z_H = curr_det.float() - prev_z_H.float()
+                if prev_delta_z_H is not None:
+                    zH_delta_cos_sum = zH_delta_cos_sum + self._batch_cos_sim(delta_z_H, prev_delta_z_H)
+                    zH_delta_cos_count += 1
+
+                prev_delta_z_H = delta_z_H
+                prev_z_H = curr_det
+
         # H_cycles-1 without grad
         with torch.no_grad():
-            for _H_step in range(self.config.H_cycles-1):
+            for _H_step in range(self.config.H_cycles - 1):
+                cycle_start_z_L = z_L.detach()
                 for _L_step in range(self.config.L_cycles):
                     z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+                    record_zL_step(z_L, _L_step)
+
+                zL_H_window_sum = zL_H_window_sum + self._batch_cos_sim(z_L, cycle_start_z_L)
+                zL_H_window_count += 1
+
                 z_H = self.L_level(z_H, z_L, **seq_info)
+                record_zH_step(z_H)
+
         # 1 with grad
+        cycle_start_z_L = z_L.detach()
         for _L_step in range(self.config.L_cycles):
             z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+            record_zL_step(z_L, _L_step)
+
+        with torch.no_grad():
+            zL_H_window_sum = zL_H_window_sum + self._batch_cos_sim(z_L, cycle_start_z_L)
+            zL_H_window_count += 1
+
         z_H = self.L_level(z_H, z_L, **seq_info)
+        record_zH_step(z_H)
+
+        with torch.no_grad():
+            telemetry_metrics = {
+                "telemetry/zL_cos_sim_lag1": zL_lag1_sum / max(zL_lag1_count, 1),
+                "telemetry/zL_cos_sim_lag2": zL_lag2_sum / max(zL_lag2_count, 1),
+                "telemetry/zL_cos_sim_first_L": zL_first_L_sum / max(zL_first_L_count, 1),
+                "telemetry/zL_cos_sim_last_L": zL_last_L_sum / max(zL_last_L_count, 1),
+                "telemetry/zL_cos_sim_H_window": zL_H_window_sum / max(zL_H_window_count, 1),
+                "telemetry/zL_cos_sim_macro_step": self._batch_cos_sim(z_L, init_z_L),
+                "telemetry/zH_cos_sim_H_step": zH_step_sum / max(zH_step_count, 1),
+                "telemetry/zH_cos_sim_macro_step": self._batch_cos_sim(z_H, init_z_H),
+                "telemetry/zL_delta_cos_sim": zL_delta_cos_sum / max(zL_delta_cos_count, 1),
+                "telemetry/zH_delta_cos_sim": zH_delta_cos_sum / max(zH_delta_cos_count, 1),
+                "telemetry/zL_zH_cos_sim": self._batch_cos_sim(z_L, z_H),
+            }
 
         # LM Outputs
         new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
-        q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
-        return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
+        q_logits = self.q_head(z_H[:, 0]).to(torch.float32)  # Q-head; uses the first puzzle_emb position
+        return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), telemetry_metrics
 
 
 class TinyRecursiveReasoningModel_ACTV1(nn.Module):
@@ -256,12 +368,13 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
         new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
 
         # Forward inner model
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
+        new_inner_carry, logits, (q_halt_logits, q_continue_logits), telemetry_metrics = self.inner(new_inner_carry, new_current_data)
 
         outputs = {
             "logits": logits,
             "q_halt_logits": q_halt_logits,
-            "q_continue_logits": q_continue_logits
+            "q_continue_logits": q_continue_logits,
+            **telemetry_metrics,
         }
 
         with torch.no_grad():
