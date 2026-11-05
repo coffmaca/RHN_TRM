@@ -24,3 +24,11 @@ forward_dtype: bfloat16
 mlp_t: False # use mlp on L instead of transformer
 puzzle_emb_len: 16 # if non-zero, its specified to this value
 no_ACT_continue: True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
+
+# Autoregressive Decoder Config (for generative / chat / coding benchmarks)
+use_ar_decoder: True
+ar_decoder_layers: 2
+pad_token_id: 0
+bos_token_id: 1
+eos_token_id: 2
+halt_acc_threshold: 0.90  # 1.0 for exact sequence match; <1.0 for token accuracy threshold on text/code tasks

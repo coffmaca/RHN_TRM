@@ -58,9 +58,18 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     forward_dtype: str = "bfloat16"
 
     # Alexia: added
-    mlp_t: bool = False # use mlp on L instead of transformer
-    puzzle_emb_len: int = 16 # if non-zero, its specified to this value
-    no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
+    mlp_t: bool = False  # use mlp on L instead of transformer
+    puzzle_emb_len: int = 16  # if non-zero, its specified to this value
+    no_ACT_continue: bool = True  # No continue ACT loss, only use the sigmoid of the halt
+
+    # Autoregressive Decoder config (for generative / chat / coding benchmarks)
+    use_ar_decoder: bool = False
+    ar_decoder_layers: int = 2
+    pad_token_id: int = 0
+    bos_token_id: int = 1
+    eos_token_id: int = 2
+    halt_acc_threshold: float = 1.0  # 1.0 = exact sequence match; <1.0 = token accuracy threshold for Q-halt
+
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
@@ -115,6 +124,183 @@ class TinyRecursiveReasoningModel_ACTV1ReasoningModule(nn.Module):
         return hidden_states
 
 
+class CrossAttention(nn.Module):
+    """Multi-head Cross-Attention projecting queries from decoder states and keys/values from halted z_H."""
+    def __init__(self, hidden_size: int, num_heads: int) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+
+        self.q_proj = CastedLinear(hidden_size, hidden_size, bias=False)
+        self.k_proj = CastedLinear(hidden_size, hidden_size, bias=False)
+        self.v_proj = CastedLinear(hidden_size, hidden_size, bias=False)
+        self.o_proj = CastedLinear(hidden_size, hidden_size, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+        B, T_tgt, D = hidden_states.shape
+        T_mem = memory.shape[1]
+
+        q = self.q_proj(hidden_states).view(B, T_tgt, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(memory).view(B, T_mem, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(memory).view(B, T_mem, self.num_heads, self.head_dim).transpose(1, 2)
+
+        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, T_tgt, D)
+        return self.o_proj(attn_out)
+
+
+class AutoregressiveDecoderBlock(nn.Module):
+    """Causal Self-Attention + Cross-Attention to z_H + SwiGLU MLP with RMS Post-Norm."""
+    def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
+        super().__init__()
+        self.self_attn = Attention(
+            hidden_size=config.hidden_size,
+            head_dim=config.hidden_size // config.num_heads,
+            num_heads=config.num_heads,
+            num_key_value_heads=config.num_heads,
+            causal=True,
+        )
+        self.cross_attn = CrossAttention(
+            hidden_size=config.hidden_size,
+            num_heads=config.num_heads,
+        )
+        self.mlp = SwiGLU(
+            hidden_size=config.hidden_size,
+            expansion=config.expansion,
+        )
+        self.norm_eps = config.rms_norm_eps
+
+    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+        hidden_states = rms_norm(
+            hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states),
+            variance_epsilon=self.norm_eps,
+        )
+        hidden_states = rms_norm(
+            hidden_states + self.cross_attn(hidden_states=hidden_states, memory=memory),
+            variance_epsilon=self.norm_eps,
+        )
+        hidden_states = rms_norm(
+            hidden_states + self.mlp(hidden_states),
+            variance_epsilon=self.norm_eps,
+        )
+        return hidden_states
+
+
+class AutoregressiveDecoderHead(nn.Module):
+    """
+    Translates the TRM's latent solution state z_H into output tokens.
+    - Uses parallel causal teacher forcing during training.
+    - Uses greedy token-by-token autoregressive generation on halted evaluation steps.
+    """
+    def __init__(
+        self,
+        config: TinyRecursiveReasoningModel_ACTV1Config,
+        shared_embed_tokens: CastedEmbedding,
+        shared_lm_head: CastedLinear,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.forward_dtype = getattr(torch, self.config.forward_dtype)
+        self.embed_scale = math.sqrt(self.config.hidden_size)
+        embed_init_std = 1.0 / self.embed_scale
+
+        # Share token embeddings and output projection with the TRM inner model
+        self.embed_tokens = shared_embed_tokens
+        self.lm_head = shared_lm_head
+
+        if self.config.pos_encodings == "rope":
+            self.rotary_emb = RotaryEmbedding(
+                dim=self.config.hidden_size // self.config.num_heads,
+                max_position_embeddings=self.config.seq_len,
+                base=self.config.rope_theta,
+            )
+        elif self.config.pos_encodings == "learned":
+            self.embed_pos = CastedEmbedding(
+                self.config.seq_len,
+                self.config.hidden_size,
+                init_std=embed_init_std,
+                cast_to=self.forward_dtype,
+            )
+
+        self.layers = nn.ModuleList(
+            [AutoregressiveDecoderBlock(self.config) for _ in range(self.config.ar_decoder_layers)]
+        )
+
+    def _slice_cos_sin(self, seq_len: int) -> CosSin:
+        if not hasattr(self, "rotary_emb"):
+            return None
+        cos, sin = self.rotary_emb()
+        return cos[:seq_len], sin[:seq_len]
+
+    def _embed_decoder_inputs(self, input_ids: torch.Tensor) -> torch.Tensor:
+        T = input_ids.shape[1]
+        embedding = self.embed_tokens(input_ids.to(torch.int32))
+        if self.config.pos_encodings == "learned":
+            pos_weight = self.embed_pos.embedding_weight[:T].to(self.forward_dtype)
+            embedding = 0.707106781 * (embedding + pos_weight)
+        return self.embed_scale * embedding
+
+    def _decode_hidden(self, decoder_input_ids: torch.Tensor, z_H_memory: torch.Tensor) -> torch.Tensor:
+        T = decoder_input_ids.shape[1]
+        cos_sin = self._slice_cos_sin(T)
+        hidden_states = self._embed_decoder_inputs(decoder_input_ids)
+        for layer in self.layers:
+            hidden_states = layer(cos_sin=cos_sin, hidden_states=hidden_states, memory=z_H_memory)
+        return hidden_states
+
+    def forward_teacher_forcing(self, z_H_memory: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """
+        Single-pass parallel causal teacher forcing for training.
+        Shifts labels right by prepending bos_token_id and replacing IGNORE_LABEL_ID (-100) with pad_token_id.
+        """
+        B, T = labels.shape
+        clean_labels = torch.where(labels == IGNORE_LABEL_ID, self.config.pad_token_id, labels)
+        bos_col = torch.full((B, 1), self.config.bos_token_id, dtype=clean_labels.dtype, device=labels.device)
+        decoder_input_ids = torch.cat([bos_col, clean_labels[:, :-1]], dim=1)
+
+        dec_hidden = self._decode_hidden(decoder_input_ids, z_H_memory)
+        return self.lm_head(dec_hidden)
+
+    @torch.no_grad()
+    def generate(self, z_H_memory: torch.Tensor, max_len: int) -> torch.Tensor:
+        """
+        Free-running autoregressive greedy decoding for evaluation once ACT halts.
+        Returns step-wise logits of shape [B, max_len, vocab_size] whose argmax is the generated token sequence.
+        """
+        B = z_H_memory.shape[0]
+        device = z_H_memory.device
+
+        decoder_input_ids = torch.full((B, 1), self.config.bos_token_id, dtype=torch.int32, device=device)
+        step_logits_list: List[torch.Tensor] = []
+        finished = torch.zeros(B, dtype=torch.bool, device=device)
+
+        for _step in range(max_len):
+            dec_hidden = self._decode_hidden(decoder_input_ids, z_H_memory)
+            next_token_logits = self.lm_head(dec_hidden[:, -1:, :])  # [B, 1, vocab_size]
+            step_logits_list.append(next_token_logits)
+
+            next_token = next_token_logits.argmax(dim=-1).to(torch.int32)  # [B, 1]
+            decoder_input_ids = torch.cat([decoder_input_ids, next_token], dim=1)
+
+            finished = finished | (next_token.squeeze(-1) == self.config.eos_token_id)
+            if bool(finished.all()):
+                # Pad remaining steps with logits peaking at pad_token_id so output length matches labels
+                remaining = max_len - (_step + 1)
+                if remaining > 0:
+                    pad_logit = torch.full(
+                        (B, remaining, self.config.vocab_size),
+                        -10.0,
+                        dtype=next_token_logits.dtype,
+                        device=device,
+                    )
+                    pad_logit[:, :, self.config.pad_token_id] = 10.0
+                    step_logits_list.append(pad_logit)
+                break
+
+        return torch.cat(step_logits_list, dim=1)
+
+
 class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
         super().__init__()
@@ -148,6 +334,14 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
         # Reasoning Layers
         self.L_level = TinyRecursiveReasoningModel_ACTV1ReasoningModule(layers=[TinyRecursiveReasoningModel_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
+
+        # Optional Autoregressive Output Head
+        if self.config.use_ar_decoder:
+            self.ar_decoder = AutoregressiveDecoderHead(
+                config=self.config,
+                shared_embed_tokens=self.embed_tokens,
+                shared_lm_head=self.lm_head,
+            )
 
         # Initial states
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
@@ -201,6 +395,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         self,
         carry: TinyRecursiveReasoningModel_ACTV1InnerCarry,
         batch: Dict[str, torch.Tensor],
+        run_ar_generate: bool = False,
     ) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Dict[str, torch.Tensor]]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
@@ -329,7 +524,16 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
         # LM Outputs
         new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
-        output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
+        z_H_seq = z_H[:, self.puzzle_emb_len:]
+
+        if self.config.use_ar_decoder:
+            if self.training or not run_ar_generate:
+                output = self.ar_decoder.forward_teacher_forcing(z_H_seq, batch["labels"])
+            else:
+                output = self.ar_decoder.generate(z_H_seq, max_len=batch["labels"].shape[1])
+        else:
+            output = self.lm_head(z_H_seq)
+
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32)  # Q-head; uses the first puzzle_emb position
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1]), telemetry_metrics
 
@@ -367,8 +571,16 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
 
         new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
 
+        # During evaluation, only run free-running autoregressive generation on the final (halting) step
+        will_be_last_step = (new_steps + 1) >= self.config.halt_max_steps
+        run_ar_generate = (not self.training) and bool(will_be_last_step.any())
+
         # Forward inner model
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits), telemetry_metrics = self.inner(new_inner_carry, new_current_data)
+        new_inner_carry, logits, (q_halt_logits, q_continue_logits), telemetry_metrics = self.inner(
+            new_inner_carry,
+            new_current_data,
+            run_ar_generate=run_ar_generate,
+        )
 
         outputs = {
             "logits": logits,
@@ -400,11 +612,7 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
                 halted = halted & (new_steps >= min_halt_steps)
 
                 if not self.config.no_ACT_continue:
-                    # Compute target Q
-                    # NOTE: No replay buffer and target networks for computing target Q-value.
-                    # As batch_size is large, there're many parallel envs.
-                    # Similar concept as PQN https://arxiv.org/abs/2407.04811
-                    _, _, (next_q_halt_logits, next_q_continue_logits), _, _ = self.inner(new_inner_carry, new_current_data)
+                    _, _, (next_q_halt_logits, next_q_continue_logits), _ = self.inner(new_inner_carry, new_current_data)
                     outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
 
         return TinyRecursiveReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs
