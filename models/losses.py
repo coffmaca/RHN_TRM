@@ -72,33 +72,42 @@ class ACTLossHead(nn.Module):
             
             # Metrics (halted)
             valid_metrics = new_carry.halted & (loss_counts > 0)
+            valid_count = valid_metrics.sum()
             metrics = {
-                "count": valid_metrics.sum(),
-                
-                "accuracy":       torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum(),
+                "count": valid_count,
+                "accuracy": torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum(),
                 "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
-
                 "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum(),
-                "steps":          torch.where(valid_metrics, new_carry.steps, 0).sum(),
+                "steps": torch.where(valid_metrics, new_carry.steps, 0).sum(),
             }
 
-        # Losses
+            # Aggregate telemetry metrics across halted sequences
+            for k, v in outputs.items():
+                if k.startswith("telemetry/"):
+                    if v.ndim == 0:
+                        metrics[k] = v.detach().to(torch.float32) * valid_count
+                    else:
+                        metrics[k] = torch.where(valid_metrics, v.detach().to(torch.float32), 0.0).sum()
 
+        # Losses
         lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
-        q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
+        q_halt_loss = F.binary_cross_entropy_with_logits(
+            outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum"
+        )
         metrics.update({
             "lm_loss": lm_loss.detach(),
             "q_halt_loss": q_halt_loss.detach(),
         })
+
         # Q continue (bootstrapping target loss); Alexia: This fits Q-learning, but seems totally unecessary
         q_continue_loss = 0
         if "target_q_continue" in outputs:
-            q_continue_loss = F.binary_cross_entropy_with_logits(outputs["q_continue_logits"], outputs["target_q_continue"], reduction="sum")
-
+            q_continue_loss = F.binary_cross_entropy_with_logits(
+                outputs["q_continue_logits"], outputs["target_q_continue"], reduction="sum"
+            )
             metrics["q_continue_loss"] = q_continue_loss.detach()
-        # Filter outputs for return
-        detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
+        # MoE auxiliary loss and diagnostics
         moe_aux_loss = 0.0
         if "moe_aux_loss" in outputs:
             moe_aux_loss = outputs["moe_aux_loss"]
@@ -108,9 +117,12 @@ class ACTLossHead(nn.Module):
             if "moe_z_loss" in outputs:
                 metrics["moe_z_loss"] = outputs["moe_z_loss"]
             if "moe_max_expert_load" in outputs:
-                metrics["moe_max_expert_load"] = outputs["moe_max_expert_load"]
+                metrics["moe_max_expert_load"] = outputs["moe_max_expert_load"].to(torch.float32) * valid_count
             if "moe_h_cycle_switch_rate" in outputs:
-                metrics["moe_h_cycle_switch_rate"] = outputs["moe_h_cycle_switch_rate"]
+                metrics["moe_h_cycle_switch_rate"] = outputs["moe_h_cycle_switch_rate"].to(torch.float32) * valid_count
+
+        # Filter outputs for return
+        detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 
         total_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss) + moe_aux_loss
         return new_carry, total_loss, metrics, detached_outputs, new_carry.halted.all()
