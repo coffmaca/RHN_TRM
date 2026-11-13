@@ -109,6 +109,8 @@ class ACTLossHead(nn.Module):
                 metrics["moe_z_loss"] = outputs["moe_z_loss"]
             if "moe_max_expert_load" in outputs:
                 metrics["moe_max_expert_load"] = outputs["moe_max_expert_load"]
+            if "moe_h_cycle_switch_rate" in outputs:
+                metrics["moe_h_cycle_switch_rate"] = outputs["moe_h_cycle_switch_rate"]
 
         total_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss) + moe_aux_loss
         return new_carry, total_loss, metrics, detached_outputs, new_carry.halted.all()

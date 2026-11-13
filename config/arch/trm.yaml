@@ -40,3 +40,5 @@ moe_dropout: 0.05
 moe_aux_loss_coef: 0.01
 moe_z_loss_coef: 0.001
 moe_apply_to_mlp_t: False
+moe_lock_gate_weights: True
+moe_route_on_H_step: False

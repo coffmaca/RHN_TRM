@@ -79,6 +79,8 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     moe_aux_loss_coef: float = 0.01
     moe_z_loss_coef: float = 0.001
     moe_apply_to_mlp_t: bool = False
+    moe_lock_gate_weights: bool = True
+    moe_route_on_H_step: bool = False
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
@@ -106,6 +108,7 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
                     router_temperature=config.moe_router_temperature,
                     jitter_noise=config.moe_jitter_noise,
                     moe_dropout=config.moe_dropout,
+                    lock_gate_weights=config.moe_lock_gate_weights,
                 )
             else:
                 self.mlp_t = SwiGLU(
@@ -135,6 +138,7 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
                 router_temperature=config.moe_router_temperature,
                 jitter_noise=config.moe_jitter_noise,
                 moe_dropout=config.moe_dropout,
+                lock_gate_weights=config.moe_lock_gate_weights,
             )
         else:
             self.mlp = SwiGLU(
@@ -143,19 +147,33 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
             )
         self.norm_eps = config.rms_norm_eps
 
-    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
-        # B, L, D = hidden_states.shape
+    def forward(
+        self,
+        cos_sin: CosSin,
+        hidden_states: torch.Tensor,
+        update_moe_routing: bool = True,
+    ) -> torch.Tensor:
         # Post Norm
         if self.config.mlp_t:
-            hidden_states = hidden_states.transpose(1,2)
-            out = self.mlp_t(hidden_states)
+            hidden_states = hidden_states.transpose(1, 2)
+            if isinstance(self.mlp_t, MoESwiGLU):
+                out = self.mlp_t(hidden_states, update_routing=update_moe_routing)
+            else:
+                out = self.mlp_t(hidden_states)
             hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
-            hidden_states = hidden_states.transpose(1,2)
+            hidden_states = hidden_states.transpose(1, 2)
         else:
             # Self Attention
-            hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states), variance_epsilon=self.norm_eps)
-        # Fully Connected
-        out = self.mlp(hidden_states)
+            hidden_states = rms_norm(
+                hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states),
+                variance_epsilon=self.norm_eps,
+            )
+
+        # Fully Connected (MoE or Dense SwiGLU)
+        if isinstance(self.mlp, MoESwiGLU):
+            out = self.mlp(hidden_states, update_routing=update_moe_routing)
+        else:
+            out = self.mlp(hidden_states)
         hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
         return hidden_states
 
@@ -164,6 +182,13 @@ class TinyRecursiveReasoningModel_ACTV1ReasoningModule(nn.Module):
         super().__init__()
         self.layers = torch.nn.ModuleList(layers)
 
+    def clear_moe_routing_cache(self) -> None:
+        for layer in self.layers:
+            if isinstance(layer.mlp, MoESwiGLU):
+                layer.mlp.clear_routing_cache()
+            if hasattr(layer, "mlp_t") and isinstance(layer.mlp_t, MoESwiGLU):
+                layer.mlp_t.clear_routing_cache()
+
     def reset_moe_buffers(self) -> None:
         for layer in self.layers:
             if isinstance(layer.mlp, MoESwiGLU):
@@ -171,29 +196,43 @@ class TinyRecursiveReasoningModel_ACTV1ReasoningModule(nn.Module):
             if hasattr(layer, "mlp_t") and isinstance(layer.mlp_t, MoESwiGLU):
                 layer.mlp_t.reset_moe_Buffer()
 
-    def collect_moe_metrics(self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        balance_losses, z_losses, max_loads = [], [], []
+    def collect_moe_metrics(
+        self, device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        balance_losses, z_losses, max_loads, switch_rates = [], [], [], []
         for layer in self.layers:
             for submod_name in ("mlp", "mlp_t"):
                 submod = getattr(layer, submod_name, None)
                 if isinstance(submod, MoESwiGLU):
-                    b_loss, z_loss, m_load = submod.pop_moe_metrics(device)
+                    b_loss, z_loss, m_load, s_rate = submod.pop_moe_metrics(device)
                     balance_losses.append(b_loss)
                     z_losses.append(z_loss)
                     max_loads.append(m_load)
+                    switch_rates.append(s_rate)
         if not balance_losses:
             zero = torch.tensor(0.0, dtype=torch.float32, device=device)
-            return zero, zero, zero
+            return zero, zero, zero, zero
         return (
             torch.stack(balance_losses).mean(),
             torch.stack(z_losses).mean(),
             torch.stack(max_loads).mean(),
+            torch.stack(switch_rates).mean(),
         )
 
-    def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        input_injection: torch.Tensor,
+        update_moe_routing: bool = True,
+        **kwargs,
+    ) -> torch.Tensor:
         hidden_states = hidden_states + input_injection
         for layer in self.layers:
-            hidden_states = layer(hidden_states=hidden_states, **kwargs)
+            hidden_states = layer(
+                hidden_states=hidden_states,
+                update_moe_routing=update_moe_routing,
+                **kwargs,
+            )
         return hidden_states
 
 
@@ -275,7 +314,11 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
         )
 
-    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    def forward(
+        self,
+        carry: TinyRecursiveReasoningModel_ACTV1InnerCarry,
+        batch: Dict[str, torch.Tensor],
+    ) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
@@ -284,27 +327,51 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
 
         # Forward iterations
-        it = 0
         z_H, z_L = carry.z_H, carry.z_L
-        # H_cycles-1 without grad
-        with torch.no_grad():
-            for _H_step in range(self.config.H_cycles-1):
-                for _L_step in range(self.config.L_cycles):
-                    z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-                z_H = self.L_level(z_H, z_L, **seq_info)
 
         if self.config.use_moe:
             self.L_level.reset_moe_buffers()
 
-        # 1 with grad (existing TRM code)
+        # H_cycles-1 without grad
+        with torch.no_grad():
+            for _H_step in range(self.config.H_cycles - 1):
+                for _L_step in range(self.config.L_cycles):
+                    z_L = self.L_level(
+                        z_L,
+                        z_H + input_embeddings,
+                        update_moe_routing=(_L_step == 0),
+                        **seq_info,
+                    )
+                z_H = self.L_level(
+                    z_H,
+                    z_L,
+                    update_moe_routing=self.config.moe_route_on_H_step,
+                    **seq_info,
+                )
+
+        # 1 H_cycle with grad
         for _L_step in range(self.config.L_cycles):
-            z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-        z_H = self.L_level(z_H, z_L, **seq_info)
+            z_L = self.L_level(
+                z_L,
+                z_H + input_embeddings,
+                update_moe_routing=(_L_step == 0),
+                **seq_info,
+            )
+        z_H = self.L_level(
+            z_H,
+            z_L,
+            update_moe_routing=self.config.moe_route_on_H_step,
+            **seq_info,
+        )
+
+        # Release cached routing tensors so no autograd references persist on the module
+        if self.config.use_moe:
+            self.L_level.clear_moe_routing_cache()
 
         # LM Outputs
-        new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
+        new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
-        q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
+        q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
 
 
@@ -351,8 +418,7 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
         }
 
         if self.config.use_moe:
-            balance_loss, z_loss, max_load = self.inner.L_level.collect_moe_metrics(logits.device)
-            # Scale by batch size to match sum-reduced loss convention in ACTLossHead
+            balance_loss, z_loss, max_load, switch_rate = self.inner.L_level.collect_moe_metrics(logits.device)
             batch_scale = float(logits.shape[0])
             outputs["moe_aux_loss"] = batch_scale * (
                 self.config.moe_aux_loss_coef * balance_loss +
@@ -361,6 +427,7 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
             outputs["moe_balance_loss"] = balance_loss.detach()
             outputs["moe_z_loss"] = z_loss.detach()
             outputs["moe_max_expert_load"] = max_load.detach()
+            outputs["moe_h_cycle_switch_rate"] = switch_rate.detach()
 
         with torch.no_grad():
             # Step

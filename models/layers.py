@@ -288,6 +288,7 @@ class MoESwiGLU(nn.Module):
         router_temperature: float = 1.0,
         jitter_noise: float = 0.0,
         moe_dropout: float = 0.0,
+        lock_gate_weights: bool = True,
     ):
         super().__init__()
         if top_k < 1 or top_k > num_experts:
@@ -303,12 +304,13 @@ class MoESwiGLU(nn.Module):
         self.norm_topk_prob = norm_topk_prob if top_k > 1 else False
         self.router_temperature = router_temperature
         self.jitter_noise = jitter_noise
+        self.lock_gate_weights = lock_gate_weights
         self.moe_dropout = nn.Dropout(moe_dropout) if moe_dropout > 0.0 else nn.Identity()
 
         routed_exp = expert_expansion if expert_expansion is not None else expansion
         shared_exp = shared_expert_expansion if shared_expert_expansion is not None else routed_exp
 
-        # Router linear projection (initialized with small std for near-uniform initial routing)
+        # Router linear projection
         self.gate = nn.Linear(hidden_size, num_experts, bias=False)
         trunc_normal_init_(self.gate.weight, std=1.0 / math.sqrt(hidden_size))
 
@@ -328,34 +330,43 @@ class MoESwiGLU(nn.Module):
         else:
             self.shared_experts = None
 
-        # Accumulators for recursive gradient-enabled steps
+        # Cached routing state for the current H_cycle
+        self._cached_topk_indices: Optional[torch.Tensor] = None
+        self._cached_topk_weights: Optional[torch.Tensor] = None
+
+        # Accumulators for gradient-enabled H_cycles
         self._aux_losses: List[torch.Tensor] = []
         self._z_losses: List[torch.Tensor] = []
         self._expert_max_loads: List[torch.Tensor] = []
+        self._switch_rates: List[torch.Tensor] = []
+
+    def clear_routing_cache(self) -> None:
+        """Clears cached H_cycle routing tensors to release autograd graph references."""
+        self._cached_topk_indices = None
+        self._cached_topk_weights = None
 
     def reset_moe_Buffer(self) -> None:
-        """Clears accumulated auxiliary losses at the start of a forward pass."""
+        """Clears accumulated auxiliary losses, switch-rate metrics, and routing cache."""
         self._aux_losses.clear()
         self._z_losses.clear()
         self._expert_max_loads.clear()
+        self._switch_rates.clear()
+        self.clear_routing_cache()
 
-    def pop_moe_metrics(self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns mean (balance_loss, z_loss, max_expert_load) across recursive steps and resets buffers."""
-        if len(self._aux_losses) == 0:
-            zero = torch.tensor(0.0, dtype=torch.float32, device=device)
-            return zero, zero, zero
-        balance_loss = torch.stack(self._aux_losses).mean()
-        z_loss = torch.stack(self._z_losses).mean()
-        max_load = torch.stack(self._expert_max_loads).mean()
+    def pop_moe_metrics(
+        self, device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns mean (balance_loss, z_loss, max_expert_load, h_cycle_switch_rate) and resets buffers."""
+        zero = torch.tensor(0.0, dtype=torch.float32, device=device)
+        balance_loss = torch.stack(self._aux_losses).mean() if self._aux_losses else zero
+        z_loss = torch.stack(self._z_losses).mean() if self._z_losses else zero
+        max_load = torch.stack(self._expert_max_loads).mean() if self._expert_max_loads else zero
+        switch_rate = torch.stack(self._switch_rates).mean() if self._switch_rates else zero
         self.reset_moe_Buffer()
-        return balance_loss, z_loss, max_load
+        return balance_loss, z_loss, max_load, switch_rate
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        orig_shape = x.shape  # [B, S, D]
-        orig_dtype = x.dtype
-        x_flat = x.reshape(-1, self.hidden_size)  # [N_tokens, D]
-
-        # 1. Compute Router Logits in FP32 for numerical stability
+    def _compute_router_scores(self, x_flat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Computes FP32 router logits and probabilities."""
         router_input = x_flat.to(torch.float32)
         if self.training and self.jitter_noise > 0.0:
             noise = torch.empty_like(router_input).uniform_(
@@ -367,55 +378,86 @@ class MoESwiGLU(nn.Module):
         if self.router_temperature != 1.0:
             router_logits = router_logits / self.router_temperature
 
-        # 2. Compute Routing Probabilities
         if self.gate_type == "softmax":
             routing_probs = F.softmax(router_logits, dim=-1)
         else:
             routing_probs = torch.sigmoid(router_logits)
 
-        # 3. Select Top-K Experts per Token
-        topk_weights, topk_indices = torch.topk(routing_probs, k=self.top_k, dim=-1)  # [N_tokens, K]
+        return router_logits, routing_probs
 
-        if self.norm_topk_prob:
-            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-9)
+    def forward(self, x: torch.Tensor, update_routing: bool = True) -> torch.Tensor:
+        orig_shape = x.shape  # [B, S, D]
+        orig_dtype = x.dtype
+        x_flat = x.reshape(-1, self.hidden_size)  # [N_tokens, D]
 
-        # 4. Accumulate Load-Balancing & Z-Loss during gradient-enabled recursive passes
-        if self.training and torch.is_grad_enabled():
-            # Router Z-Loss: penalizes large logits
-            z_loss = torch.logsumexp(router_logits, dim=-1).square().mean()
+        # 1. Select Experts (only on the first L_cycle of an H_cycle, or if cache is empty)
+        if update_routing or self._cached_topk_indices is None:
+            router_logits, routing_probs = self._compute_router_scores(x_flat)
+            topk_weights, topk_indices = torch.topk(routing_probs, k=self.top_k, dim=-1)  # [N_tokens, K]
 
-            # Switch / Mixtral Load-Balancing Loss: N * sum(f_i * P_i)
-            # P_i: mean router probability per expert across tokens
-            if self.gate_type == "sigmoid":
-                prob_for_balance = routing_probs / (routing_probs.sum(dim=-1, keepdim=True) + 1e-9)
+            if self.norm_topk_prob:
+                topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-9)
+
+            # Track fraction of tokens switching experts between consecutive H_cycles
+            with torch.no_grad():
+                curr_mask = F.one_hot(topk_indices, num_classes=self.num_experts).any(dim=1)  # [N_tokens, E]
+                if (
+                    self._cached_topk_indices is not None
+                    and self._cached_topk_indices.shape == topk_indices.shape
+                ):
+                    prev_mask = F.one_hot(self._cached_topk_indices, num_classes=self.num_experts).any(dim=1)
+                    overlap = (curr_mask & prev_mask).sum(dim=-1).to(torch.float32) / float(self.top_k)
+                    self._switch_rates.append((1.0 - overlap).mean())
+
+                f_i_detached = curr_mask.to(torch.float32).mean(dim=0) / float(self.top_k)
+                self._expert_max_loads.append(f_i_detached.max())
+
+            # Cache selection for subsequent L_cycles in this H_cycle
+            self._cached_topk_indices = topk_indices
+            self._cached_topk_weights = topk_weights
+
+            # Accumulate Load-Balancing & Z-Loss once per gradient-enabled H_cycle
+            if self.training and torch.is_grad_enabled():
+                z_loss = torch.logsumexp(router_logits, dim=-1).square().mean()
+
+                if self.gate_type == "sigmoid":
+                    prob_for_balance = routing_probs / (routing_probs.sum(dim=-1, keepdim=True) + 1e-9)
+                else:
+                    prob_for_balance = routing_probs
+                P_i = prob_for_balance.mean(dim=0)  # [num_experts]
+
+                expert_mask = F.one_hot(topk_indices, num_classes=self.num_experts).to(torch.float32)
+                f_i = expert_mask.mean(dim=(0, 1))  # [num_experts]
+
+                balance_loss = self.num_experts * torch.sum(f_i * P_i)
+
+                self._aux_losses.append(balance_loss)
+                self._z_losses.append(z_loss)
+        else:
+            # Reuse the expert indices locked at _L_step == 0 of the current H_cycle
+            topk_indices = self._cached_topk_indices
+            if self.lock_gate_weights and self._cached_topk_weights is not None:
+                topk_weights = self._cached_topk_weights
             else:
-                prob_for_balance = routing_probs
-            P_i = prob_for_balance.mean(dim=0)  # [num_experts]
+                # Optional: keep expert indices locked, but recompute gating weights for those experts
+                _, routing_probs = self._compute_router_scores(x_flat)
+                topk_weights = torch.gather(routing_probs, dim=-1, index=topk_indices)
+                if self.norm_topk_prob:
+                    topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-9)
 
-            # f_i: fraction of tokens routed to each expert across Top-K selections
-            expert_mask = F.one_hot(topk_indices, num_classes=self.num_experts).to(torch.float32)  # [N_tokens, K, E]
-            f_i = expert_mask.mean(dim=(0, 1))  # [num_experts]
-
-            balance_loss = self.num_experts * torch.sum(f_i * P_i)
-
-            self._aux_losses.append(balance_loss)
-            self._z_losses.append(z_loss)
-            self._expert_max_loads.append(f_i.max().detach())
-
-        # 5. Dispatch Tokens to Active Routed Experts and Combine
-        topk_weights = topk_weights.to(orig_dtype)
+        # 2. Dispatch Tokens to the Locked Active Experts and Combine
+        topk_weights_cast = topk_weights.to(orig_dtype)
         routed_out = torch.zeros_like(x_flat)
 
-        # Token-grouped dispatch (zero token dropping)
         for expert_idx, expert_layer in enumerate(self.experts):
             token_indices, k_positions = torch.where(topk_indices == expert_idx)
             if token_indices.numel() > 0:
                 selected_tokens = x_flat.index_select(0, token_indices)
                 expert_output = self.moe_dropout(expert_layer(selected_tokens))
-                weights = topk_weights[token_indices, k_positions].unsqueeze(-1)
+                weights = topk_weights_cast[token_indices, k_positions].unsqueeze(-1)
                 routed_out.index_add_(0, token_indices, expert_output * weights)
 
-        # 6. Add Shared Expert Contribution (if enabled)
+        # 3. Add Shared Expert Contribution (if enabled)
         if self.shared_experts is not None:
             for shared_expert in self.shared_experts:
                 routed_out = routed_out + shared_expert(x_flat)
