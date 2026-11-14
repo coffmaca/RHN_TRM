@@ -10,15 +10,15 @@ IGNORE_LABEL_ID = -100
 
 def s(x, epsilon=1e-30):
     return torch.where(
-        x<0,
-        1/(1-x+ epsilon),
+        x < 0,
+        1 / (1 - x + epsilon),
         x + 1
     )
 
 
 def log_stablemax(x, dim=-1):
     s_x = s(x)
-    return torch.log(s_x/torch.sum(s_x, dim=dim, keepdim=True))
+    return torch.log(s_x / torch.sum(s_x, dim=dim, keepdim=True))
 
 
 def stablemax_cross_entropy(logits, labels, ignore_index: int = -100, valid_mask=None):
@@ -32,10 +32,14 @@ def stablemax_cross_entropy(logits, labels, ignore_index: int = -100, valid_mask
     return -torch.where(valid_mask, prediction_logprobs, 0)
 
 
-def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
-    # Cast logits to f32
-    # Flatten logits
-    return F.cross_entropy(logits.to(torch.float32).view(-1, logits.shape[-1]), labels.to(torch.long).view(-1), ignore_index=ignore_index, reduction="none").view(labels.shape)
+def softmax_cross_entropy(logits, labels, ignore_index: int = -100, valid_mask=None):
+    # Cast logits to f32 and flatten
+    return F.cross_entropy(
+        logits.to(torch.float32).view(-1, logits.shape[-1]),
+        labels.to(torch.long).view(-1),
+        ignore_index=ignore_index,
+        reduction="none",
+    ).view(labels.shape)
 
 
 class ACTLossHead(nn.Module):
@@ -53,8 +57,7 @@ class ACTLossHead(nn.Module):
         # Model args
         **model_kwargs,
     ) -> Tuple[Any, torch.Tensor, Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]], torch.Tensor]:
-        # Model logits
-        # B x SeqLen x D
+        # Model logits: B x SeqLen x Vocab
         new_carry, outputs = self.model(**model_kwargs)
         labels = new_carry.current_data["labels"]
 
@@ -67,9 +70,16 @@ class ACTLossHead(nn.Module):
             loss_counts = mask.sum(-1)
             loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)  # Avoid NaNs in division
 
-            is_correct = mask & (torch.argmax(outputs["logits"], dim=-1) == labels)
+            is_correct = mask & (outputs["preds"] == labels)
             seq_is_correct = is_correct.sum(-1) == loss_counts
-            
+
+            halt_acc_threshold = getattr(getattr(self.model, "config", None), "halt_acc_threshold", 1.0)
+            if halt_acc_threshold < 1.0:
+                token_acc = is_correct.sum(-1).to(torch.float32) / loss_counts.clamp_min(1).to(torch.float32)
+                q_halt_target = (token_acc >= halt_acc_threshold) & (loss_counts > 0)
+            else:
+                q_halt_target = seq_is_correct
+
             # Metrics (halted)
             valid_metrics = new_carry.halted & (loss_counts > 0)
             valid_count = valid_metrics.sum()
@@ -77,7 +87,7 @@ class ACTLossHead(nn.Module):
                 "count": valid_count,
                 "accuracy": torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum(),
                 "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
-                "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum(),
+                "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == q_halt_target)).sum(),
                 "steps": torch.where(valid_metrics, new_carry.steps, 0).sum(),
             }
 
@@ -92,14 +102,14 @@ class ACTLossHead(nn.Module):
         # Losses
         lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
         q_halt_loss = F.binary_cross_entropy_with_logits(
-            outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum"
+            outputs["q_halt_logits"], q_halt_target.to(outputs["q_halt_logits"].dtype), reduction="sum"
         )
         metrics.update({
             "lm_loss": lm_loss.detach(),
             "q_halt_loss": q_halt_loss.detach(),
         })
 
-        # Q continue (bootstrapping target loss); Alexia: This fits Q-learning, but seems totally unecessary
+        # Q continue (bootstrapping target loss); Alexia: This fits Q-learning, but seems totally unnecessary
         q_continue_loss = 0
         if "target_q_continue" in outputs:
             q_continue_loss = F.binary_cross_entropy_with_logits(
@@ -126,4 +136,3 @@ class ACTLossHead(nn.Module):
 
         total_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss) + moe_aux_loss
         return new_carry, total_loss, metrics, detached_outputs, new_carry.halted.all()
-

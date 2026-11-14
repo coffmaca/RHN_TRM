@@ -42,3 +42,11 @@ moe_z_loss_coef: 0.001
 moe_apply_to_mlp_t: False
 moe_lock_gate_weights: True
 moe_route_on_H_step: False
+
+# Autoregressive Decoder Config (for generative / chat / coding benchmarks)
+use_ar_decoder: True
+ar_decoder_layers: 2
+pad_token_id: 0
+bos_token_id: 1
+eos_token_id: 2
+halt_acc_threshold: 0.90  # 1.0 for exact sequence match; <1.0 for token accuracy threshold on text/code tasks
