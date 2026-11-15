@@ -18,18 +18,21 @@ def s(x, epsilon=1e-30):
 
 def log_stablemax(x, dim=-1):
     s_x = s(x)
-    return torch.log(s_x / torch.sum(s_x, dim=dim, keepdim=True))
+    return torch.log(s_x) - torch.log(torch.sum(s_x, dim=dim, keepdim=True))
 
 
 def stablemax_cross_entropy(logits, labels, ignore_index: int = -100, valid_mask=None):
-    logprobs = log_stablemax(logits.to(torch.float64), dim=-1)
-
     if valid_mask is None:
         valid_mask = (labels != ignore_index)
-    transformed_labels = torch.where(valid_mask, labels, 0)
-    prediction_logprobs = torch.gather(logprobs, index=transformed_labels.to(torch.long).unsqueeze(-1), dim=-1).squeeze(-1)
+    transformed_labels = torch.where(valid_mask, labels, 0).to(torch.long)
 
-    return -torch.where(valid_mask, prediction_logprobs, 0)
+    # Compute in float32 and gather target before log to avoid materializing multiple [B, S, V] float64 tensors
+    s_x = s(logits.to(torch.float32))
+    log_norm = torch.log(torch.sum(s_x, dim=-1))
+    target_s = torch.gather(s_x, index=transformed_labels.unsqueeze(-1), dim=-1).squeeze(-1)
+    prediction_logprobs = torch.log(target_s) - log_norm
+
+    return -torch.where(valid_mask, prediction_logprobs, 0.0)
 
 
 def softmax_cross_entropy(logits, labels, ignore_index: int = -100, valid_mask=None):

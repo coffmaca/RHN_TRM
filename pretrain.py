@@ -304,10 +304,12 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 
     ((1 / global_batch_size) * loss).backward()
 
-    # Allreduce
+    # Allreduce (guarantee identical collective sequence and weight sync across all ranks)
     if world_size > 1:
         for param in train_state.model.parameters():
-            if param.grad is not None:
+            if param.requires_grad:
+                if param.grad is None:
+                    param.grad = torch.zeros_like(param)
                 dist.all_reduce(param.grad)
             
     # Apply optimizer
@@ -594,6 +596,9 @@ def launch(hydra_config: DictConfig):
         print('Setup EMA')
         ema_helper = EMAHelper(mu=config.ema_rate)
         ema_helper.register(train_state.model)
+
+    if dist.is_initialized():
+        dist.barrier()
 
     # Training Loop
     for _iter_id in range(total_iters):

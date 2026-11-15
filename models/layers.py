@@ -99,7 +99,11 @@ class CastedLinear(nn.Module):
             self.bias = nn.Parameter(torch.zeros((out_features, )))
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return F.linear(input, self.weight.to(input.dtype), bias=self.bias.to(input.dtype) if self.bias is not None else None)
+        return F.linear(
+            input.contiguous(),
+            self.weight.to(input.dtype),
+            bias=self.bias.to(input.dtype) if self.bias is not None else None,
+        )
 
 
 class CastedEmbedding(nn.Module):
@@ -385,6 +389,28 @@ class MoESwiGLU(nn.Module):
 
         return router_logits, routing_probs
 
+    @torch._dynamo.disable
+    def _dispatch_experts(
+        self,
+        x_flat: torch.Tensor,
+        topk_indices: torch.Tensor,
+        topk_weights_cast: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Sparse token dispatch: only evaluates each expert on the tokens actually routed to it.
+        Decorated with @torch._dynamo.disable so torch.compile does not graph-break or
+        recompile on data-dependent per-expert token counts.
+        """
+        routed_out = torch.zeros_like(x_flat)
+        for expert_idx, expert_layer in enumerate(self.experts):
+            token_indices, k_positions = torch.where(topk_indices == expert_idx)
+            if token_indices.numel() > 0:
+                selected_tokens = x_flat.index_select(0, token_indices)
+                expert_output = self.moe_dropout(expert_layer(selected_tokens))
+                weights = topk_weights_cast[token_indices, k_positions].unsqueeze(-1)
+                routed_out.index_add_(0, token_indices, expert_output * weights)
+        return routed_out
+
     def forward(self, x: torch.Tensor, update_routing: bool = True) -> torch.Tensor:
         orig_shape = x.shape  # [B, S, D]
         orig_dtype = x.dtype
@@ -445,17 +471,9 @@ class MoESwiGLU(nn.Module):
                 if self.norm_topk_prob:
                     topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-9)
 
-        # 2. Dispatch Tokens to the Locked Active Experts and Combine
+        # 2. Dispatch Tokens to the Locked Active Experts (Sparse Memory Footprint)
         topk_weights_cast = topk_weights.to(orig_dtype)
-        routed_out = torch.zeros_like(x_flat)
-
-        for expert_idx, expert_layer in enumerate(self.experts):
-            token_indices, k_positions = torch.where(topk_indices == expert_idx)
-            if token_indices.numel() > 0:
-                selected_tokens = x_flat.index_select(0, token_indices)
-                expert_output = self.moe_dropout(expert_layer(selected_tokens))
-                weights = topk_weights_cast[token_indices, k_positions].unsqueeze(-1)
-                routed_out.index_add_(0, token_indices, expert_output * weights)
+        routed_out = self._dispatch_experts(x_flat, topk_indices, topk_weights_cast)
 
         # 3. Add Shared Expert Contribution (if enabled)
         if self.shared_experts is not None:
