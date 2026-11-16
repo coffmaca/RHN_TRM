@@ -8,15 +8,21 @@ import math
 IGNORE_LABEL_ID = -100
 
 
-def s(x, epsilon=1e-30):
+def s(x: torch.Tensor) -> torch.Tensor:
+    # Clamp inputs to each branch BEFORE dividing so (1 - x_neg) is strictly >= 1.0
+    # everywhere. Without clamping, at x == 1.0 the unused (x < 0) branch evaluates
+    # 1 / (1 - 1 + eps) = 1 / eps, whose backward derivative 1 / eps^2 overflows float32
+    # to +inf and produces 0.0 * inf = NaN gradients.
+    x_neg = torch.clamp(x, max=0.0)
+    x_pos = torch.clamp(x, min=0.0)
     return torch.where(
         x < 0,
-        1 / (1 - x + epsilon),
-        x + 1
+        1.0 / (1.0 - x_neg),
+        x_pos + 1.0,
     )
 
 
-def log_stablemax(x, dim=-1):
+def log_stablemax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     s_x = s(x)
     return torch.log(s_x) - torch.log(torch.sum(s_x, dim=dim, keepdim=True))
 
@@ -30,9 +36,9 @@ def stablemax_cross_entropy(logits, labels, ignore_index: int = -100, valid_mask
     s_x = s(logits.to(torch.float32))
     log_norm = torch.log(torch.sum(s_x, dim=-1))
     target_s = torch.gather(s_x, index=transformed_labels.unsqueeze(-1), dim=-1).squeeze(-1)
-    prediction_logprobs = torch.log(target_s) - log_norm
+    prediction_logprobs = torch.log(target_s.clamp_min(1e-30)) - log_norm
 
-    return -torch.where(valid_mask, prediction_logprobs, 0.0)
+    return torch.where(valid_mask, -prediction_logprobs, torch.zeros_like(prediction_logprobs))
 
 
 def softmax_cross_entropy(logits, labels, ignore_index: int = -100, valid_mask=None):
